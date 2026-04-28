@@ -82,6 +82,7 @@ fn main() {
         ("SetDisputeParams", TAG_SET_DISPUTE_PARAMS),
         ("SetLpCollateralParams", TAG_SET_LP_COLLATERAL_PARAMS),
         ("AcceptAdmin", TAG_ACCEPT_ADMIN),
+        ("UpdateAuthority", TAG_UPDATE_AUTHORITY),
     ];
 
     let payload = json!({
