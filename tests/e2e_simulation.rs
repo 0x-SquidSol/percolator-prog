@@ -56,6 +56,12 @@ const TAG_INIT_MATCHER_CTX: u8 = 75;
 const TAG_EXECUTE_ADL: u8 = 50;
 const TAG_RECLAIM_SLAB_RENT: u8 = 52;
 
+#[cfg(all(feature = "small", not(feature = "medium")))]
+const EXPECTED_SLAB_LEN: usize = 96_760;
+
+#[cfg(not(all(feature = "small", not(feature = "medium"))))]
+const EXPECTED_SLAB_LEN: usize = 1_525_720;
+
 // ─── Encoder helpers ──────────────────────────────────────────────────────────
 
 fn encode_top_up_keeper_fund(amount: u64) -> Vec<u8> {
@@ -159,14 +165,12 @@ fn phase1_market_creation(env: &mut TestEnv) -> (Keypair, u16, Pubkey) {
     // Step 1 — verify SLAB_LEN is the SBF value (not x86)
     // The account is already allocated at SLAB_LEN in TestEnv::new().
     // If SLAB_LEN were the wrong value, InitMarket would fail with ConstraintRaw.
-    // 2026-04-17: v12.17 + Phase A (+48) + Phase E (+32) = 1_484_728 for MAX_ACCOUNTS=4096.
     println!("[1] SLAB_LEN = {} bytes", SLAB_LEN);
-    // v12.19 actual SLAB_LEN observed on the small build is 1_525_720
-    // (HEADER_LEN=136 + CONFIG_LEN=480 + engine fields + 4096-account
-    // stride 360 + bitmap shift to engine+728).
-    assert_eq!(SLAB_LEN, 1_525_720,
+    // v12.19 SBF layout; small-tier and large-tier builds differ by
+    // engine account capacity.
+    assert_eq!(SLAB_LEN, EXPECTED_SLAB_LEN,
         "SLAB_LEN mismatch: must match v12.19 SBF layout");
-    println!("    SLAB_LEN verified: v12.19 SBF layout (1_525_720)");
+    println!("    SLAB_LEN verified: v12.19 SBF layout ({})", EXPECTED_SLAB_LEN);
 
     // Step 2 — InitMarket with full 352-byte payload.
     // encode_init_market_full_v2 produces opcode(1) + admin(32) + mint(32) +
@@ -788,9 +792,8 @@ fn test_init_market_payload_size() {
 #[test]
 fn test_slab_len_is_sbf_value() {
     // v12.19 SBF layout: HEADER_LEN=136, CONFIG_LEN=480, ENGINE_OFFSET=600,
-    // engine fields shifted +16, per-account stride=360 with MAX_ACCOUNTS=4096.
+    // engine fields shifted +16, per-account stride=360, tier-dependent account count.
     // Update this constant (and common/mod.rs SLAB_LEN) if layout changes again.
-    const EXPECTED_SLAB_LEN: usize = 1_525_720;
     assert_eq!(SLAB_LEN, EXPECTED_SLAB_LEN,
         "SLAB_LEN mismatch: constant is {} but expected SBF value {}. \
          Did struct layout change? Run `cargo build-sbf` and recompute.",

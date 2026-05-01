@@ -1098,7 +1098,7 @@ fn risk_params_full_round_trip_via_init_market() {
 // ============================================================================
 
 /// Mainnet program ID. Must not change without a full upgrade cycle and SDK bump.
-const MAINNET_PROG_ID: &str = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
+const MAINNET_PROG_ID: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 
 /// Mainnet stake program ID.
 const MAINNET_STAKE_ID: &str = "DC5fovFQD5SZYsetwvEqd4Wi4PFY1Yfnc669VMe6oa7F";

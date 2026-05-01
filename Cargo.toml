@@ -14,7 +14,9 @@ path = "src/percolator.rs"
 
 [features]
 no-entrypoint = []
-test-sbf = []
+test = []      # Enables local test-only CPI/oracle bypasses. Never combine with mainnet.
+test-sbf = ["test"]
+kani = []
 cu-audit = []  # Enable compute unit checkpoints for CU auditing
 small = ["percolator/small"]    # MAX_ACCOUNTS=256 (~0.68 SOL)
 medium = ["percolator/medium"]  # MAX_ACCOUNTS=1024 (~2.7 SOL)

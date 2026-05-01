@@ -16,7 +16,7 @@ pub use solana_program_runtime::compute_budget::ComputeBudget;
 pub use spl_token::state::{Account as TokenAccount, AccountState};
 pub use std::path::PathBuf;
 
-// SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
+// SLAB_LEN for production BPF.
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
@@ -25,10 +25,16 @@ pub use std::path::PathBuf;
 // but is hardcoded here because the tests' BPF layout is a 32-bit SBF target
 // that doesn't match the host constant.
 // v12.19 sync: wrapper logs `0x1747d8 = 1_525_208` as compile-time SLAB_LEN.
-// Due to BPF runtime account-data padding (~512 bytes between Account header
-// and data start in LiteSVM serialization), the test must allocate +512 bytes
-// so the runtime data.len() lands exactly at 1_525_208 inside the program.
+// The large-tier default still needs the historical +512 byte LiteSVM padding,
+// but small-tier SBF expects the exact on-chain small slab length.
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const SLAB_LEN: usize = 96_760;
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const MAX_ACCOUNTS: usize = 256;
+
+#[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const SLAB_LEN: usize = 1_525_208 + 512;
+#[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
 // BPF-target offsets within RiskEngine — cfg-gated because the
