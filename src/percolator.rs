@@ -8934,11 +8934,34 @@ pub mod processor {
         // zero-fills never enter that branch, so no revert is needed.
         if ret.exec_size == 0 {
             let mut data = state::slab_data_mut(a_slab)?;
+            // PORT-3a (CRITICAL-4 sub-hunk 1): advance the engine market clock
+            // on the zero-fill branch so funding accrued over
+            // [engine.last_market_slot, clock.slot] is realised at the
+            // pre-oracle-read rate. Without this, repeated zero-fills (cheap
+            // for a colluding matcher) bypass funding entirely on a market
+            // with open interest.
+            {
+                let engine = zc::engine_mut(&mut data)?;
+                ensure_market_accrued_to_now_with_policy(
+                    engine, &config, clock.slot, price, funding_rate_e9_pre,
+                )?;
+            }
             let pristine = state::read_config(&data);
             // Start from pristine, then re-apply only the legitimately-advanced fields.
             let mut restored = pristine;
             restored.last_good_oracle_slot = config.last_good_oracle_slot;
             restored.last_effective_price_e6 = config.last_effective_price_e6;
+            // PORT-3a (CRITICAL-4 sub-hunk 1): preserve last_oracle_publish_time
+            // so a single Pyth update can't be replayed via repeated zero-fills.
+            // The monotonic-publish-time gate in read_price_and_stamp keys off
+            // this field; reverting it would let one update advance the
+            // baseline N times.
+            //
+            // PERCOLATOR-FORK-SPECIFIC: SKIP toly's `restored.oracle_target_price_e6`
+            // and `restored.oracle_target_publish_time`. ML12 removed these
+            // toly-only fields from fork's MarketConfig
+            // (TOLY-ONLY-DEFERRED-WITH-PARENT per SCHEMA_DELTA.md).
+            restored.last_oracle_publish_time = config.last_oracle_publish_time;
             restored.last_hyperp_index_slot = config.last_hyperp_index_slot;
             state::write_config(&mut data, &restored);
             state::write_req_nonce(&mut data, req_id);
@@ -8950,6 +8973,31 @@ pub mod processor {
         // or produce absurd PnL. Must check BEFORE engine call.
         if exec_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::OracleInvalid.into());
+        }
+        // PORT-3b (CRITICAL-4 sub-hunk 2): anti-off-market execution policy
+        // (spec §14.3). |exec_price - oracle_price| * 10_000 <= band * oracle_price
+        // where band = max(2 * trading_fee_bps, 100) (≥ 1% band).
+        // Without this, a colluding matcher can return an exec_price wildly
+        // different from the oracle (only the absolute MAX_ORACLE_PRICE
+        // ceiling above bounded it before) and split the spread with the
+        // user being a signer.
+        if exec_price > 0 && price > 0 {
+            let band_bps = {
+                let data_ref = a_slab.try_borrow_data()?;
+                let engine_ref = zc::engine_ref(&data_ref)?;
+                let fee_bps = engine_ref.params.trading_fee_bps;
+                core::cmp::max(fee_bps.saturating_mul(2), 100)
+            };
+            let diff = if exec_price > price {
+                exec_price - price
+            } else {
+                price - exec_price
+            };
+            let lhs = (diff as u128).saturating_mul(10_000);
+            let rhs = (band_bps as u128).saturating_mul(price as u128);
+            if lhs > rhs {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
         }
         {
             let mut data = state::slab_data_mut(a_slab)?;
