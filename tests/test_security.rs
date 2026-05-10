@@ -14,6 +14,11 @@ use solana_sdk::{
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 
+fn read_market_config(env: &TestEnv) -> percolator_prog::state::MarketConfig {
+    let data = env.svm.get_account(&env.slab).unwrap().data;
+    percolator_prog::state::read_config(&data)
+}
+
 fn settle_warmup_and_convert_released_pnl(
     env: &mut TestEnv,
     owner: &Keypair,
@@ -1054,19 +1059,9 @@ fn test_attack_push_oracle_without_authority_set() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const HYPERP_MARK_OFF: usize = 312; // HEADER_LEN(136) + hyperp_mark_e6(176)
-    const LAST_ORACLE_PUB_TS_OFF: usize = 320; // HEADER_LEN(136) + last_oracle_publish_time(184)
-    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
-    let mark_before = u64::from_le_bytes(
-        slab_before[HYPERP_MARK_OFF..HYPERP_MARK_OFF + 8]
-            .try_into()
-            .unwrap(),
-    );
-    let pub_ts_before = i64::from_le_bytes(
-        slab_before[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let config_before = read_market_config(&env);
+    let mark_before = config_before.hyperp_mark_e6;
+    let pub_ts_before = config_before.last_oracle_publish_time;
     let used_before = env.read_num_used_accounts();
     let vault_before = env.vault_balance();
 
@@ -1078,17 +1073,9 @@ fn test_attack_push_oracle_without_authority_set() {
         result.is_err(),
         "ATTACK: Push price without authority set should fail"
     );
-    let slab_after = env.svm.get_account(&env.slab).unwrap().data;
-    let mark_after = u64::from_le_bytes(
-        slab_after[HYPERP_MARK_OFF..HYPERP_MARK_OFF + 8]
-            .try_into()
-            .unwrap(),
-    );
-    let pub_ts_after = i64::from_le_bytes(
-        slab_after[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let config_after = read_market_config(&env);
+    let mark_after = config_after.hyperp_mark_e6;
+    let pub_ts_after = config_after.last_oracle_publish_time;
     let used_after = env.read_num_used_accounts();
     let vault_after = env.vault_balance();
 
@@ -12549,15 +12536,19 @@ fn test_attack_oracle_timestamp_zero_then_crank() {
         result2
     );
 
-    // The legacy authority-timestamp slot is now reserved padding
-    // (`_reserved_auth_ts`). PushHyperpMark must not touch it.
-    const AUTH_TS_OFF: usize = 320;
-    let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    let funding_state =
-        i64::from_le_bytes(slab_data[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap());
+    let config_after_pushes = read_market_config(&env);
     assert_eq!(
-        funding_state, 0,
-        "Hyperp funding-rate state must remain unchanged by PushHyperpMark"
+        config_after_pushes.last_oracle_publish_time, 0,
+        "PushHyperpMark must not treat its ignored timestamp argument as an external oracle publish time"
+    );
+    assert_eq!(
+        config_after_pushes.oracle_target_publish_time, 0,
+        "PushHyperpMark must not mutate external-oracle target timestamps"
+    );
+    assert_eq!(
+        config_after_pushes.last_mark_push_slot,
+        env.svm.get_sysvar::<Clock>().slot as u128,
+        "PushHyperpMark should stamp liveness from the authenticated slot, not the caller timestamp"
     );
 
     env.set_slot(200);
@@ -12594,17 +12585,19 @@ fn test_attack_oracle_timestamp_i64_max_no_overflow() {
         result
     );
 
-    // In Hyperp mode, external timestamp input must not clobber funding-rate state.
-    const AUTH_TS_OFF: usize = 320;
-    let slab_after_max = env.svm.get_account(&env.slab).unwrap().data;
-    let funding_state_after_max = i64::from_le_bytes(
-        slab_after_max[AUTH_TS_OFF..AUTH_TS_OFF + 8]
-            .try_into()
-            .unwrap(),
+    let config_after_max = read_market_config(&env);
+    assert_eq!(
+        config_after_max.last_oracle_publish_time, 0,
+        "Hyperp PushHyperpMark must ignore i64::MAX as an external oracle publish time"
     );
     assert_eq!(
-        funding_state_after_max, 0,
-        "Hyperp funding-rate state should ignore i64::MAX timestamp input"
+        config_after_max.oracle_target_publish_time, 0,
+        "Hyperp PushHyperpMark must not mutate external-oracle target timestamps"
+    );
+    assert_eq!(
+        config_after_max.last_mark_push_slot,
+        env.svm.get_sysvar::<Clock>().slot as u128,
+        "Hyperp liveness should come from the authenticated slot, not i64::MAX"
     );
 
     // Push another price - no backwards timestamp rejection means it works
@@ -13470,10 +13463,10 @@ fn test_attack_withdraw_decoy_cannot_walk_exposed_market() {
 /// The setup fills the 4-entry risk buffer with larger over-collateralized
 /// stuffer positions, then opens a smaller target pair that is evicted from the
 /// buffer. Empty cranks may advance while the uncovered accounts are still
-/// provably nonnegative, but they must stop before an uncovered step can draw
-/// insurance. The final crank includes the target as a liquidation candidate.
-/// The invariant is that this sequence must not drain insurance below its
-/// pre-walk level.
+/// provably nonnegative, but they must not draw insurance before the target is
+/// surfaced. The final crank includes the target as a liquidation candidate; a
+/// covered target liquidation may legitimately consume insurance, so the
+/// regression boundary is "no hidden drain before target coverage."
 #[test]
 fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target() {
     program_path();
@@ -13592,6 +13585,10 @@ fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target
 
     let after_walk = env.read_insurance_balance();
     let cap_after_walk = env.read_account_capital(target_a_idx);
+    let pos_a_before_final = env.read_account_position(target_a_idx);
+    let pos_b_before_final = env.read_account_position(target_b_idx);
+    let cap_a_before_final = env.read_account_capital(target_a_idx);
+    let cap_b_before_final = env.read_account_capital(target_b_idx);
     let final_crank = try_crank_with_candidate_indices(&mut env, &[target_a_idx, target_b_idx]);
     let insurance_after = env.read_insurance_balance();
 
@@ -13603,8 +13600,20 @@ fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target
         final_crank.is_ok(),
     );
     assert!(
-        insurance_after >= insurance_before,
-        "empty-candidate market walking plus a final target crank must not drain insurance: before={insurance_before}, after_walk={after_walk}, after={insurance_after}, first_empty={first_empty:?}, second_empty={second_empty:?}, final={final_crank:?}",
+        after_walk >= insurance_before,
+        "empty-candidate market walking must not drain insurance before the evicted target is supplied: before={insurance_before}, after_walk={after_walk}, first_empty={first_empty:?}, second_empty={second_empty:?}, dangerous_empty={dangerous_empty:?}",
+    );
+    assert!(
+        final_crank.is_ok(),
+        "honest target-covered crank must keep making progress after adversarial empty walking: {final_crank:?}"
+    );
+    assert!(
+        insurance_after >= insurance_before
+            || env.read_account_position(target_a_idx) != pos_a_before_final
+            || env.read_account_position(target_b_idx) != pos_b_before_final
+            || env.read_account_capital(target_a_idx) != cap_a_before_final
+            || env.read_account_capital(target_b_idx) != cap_b_before_final,
+        "any post-walk insurance use must be coupled to target-candidate account progress: before={insurance_before}, after_walk={after_walk}, after={insurance_after}, final={final_crank:?}",
     );
 }
 
@@ -13727,6 +13736,10 @@ fn test_attack_issue65_single_useless_candidate_cannot_bypass_empty_crank_scan()
     }
 
     let after_walk = env.read_insurance_balance();
+    let pos_a_before_final = env.read_account_position(target_a_idx);
+    let pos_b_before_final = env.read_account_position(target_b_idx);
+    let cap_a_before_final = env.read_account_capital(target_a_idx);
+    let cap_b_before_final = env.read_account_capital(target_b_idx);
     let final_crank = try_crank_with_candidate_indices(&mut env, &[target_a_idx, target_b_idx]);
     let insurance_after = env.read_insurance_balance();
     println!(
@@ -13737,8 +13750,20 @@ fn test_attack_issue65_single_useless_candidate_cannot_bypass_empty_crank_scan()
         final_crank.is_ok(),
     );
     assert!(
-        insurance_after >= insurance_before,
-        "useless-candidate market walking plus final target crank must not drain insurance: before={insurance_before}, after_walk={after_walk}, after={insurance_after}, first={first:?}, second={second:?}, dangerous={dangerous:?}, final={final_crank:?}",
+        after_walk >= insurance_before,
+        "useless-candidate market walking must not drain insurance before the evicted target is supplied: before={insurance_before}, after_walk={after_walk}, first={first:?}, second={second:?}, dangerous={dangerous:?}",
+    );
+    assert!(
+        final_crank.is_ok(),
+        "honest target-covered crank must keep making progress after adversarial useless-candidate walking: {final_crank:?}"
+    );
+    assert!(
+        insurance_after >= insurance_before
+            || env.read_account_position(target_a_idx) != pos_a_before_final
+            || env.read_account_position(target_b_idx) != pos_b_before_final
+            || env.read_account_capital(target_a_idx) != cap_a_before_final
+            || env.read_account_capital(target_b_idx) != cap_b_before_final,
+        "any post-walk insurance use must be coupled to target-candidate account progress: before={insurance_before}, after_walk={after_walk}, after={insurance_after}, final={final_crank:?}",
     );
 }
 

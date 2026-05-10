@@ -1464,9 +1464,6 @@ fn test_deposit_cap_tightened_blocks_further_deposits() {
 // AUTHORITY_CLOSE=3, AUTHORITY_INSURANCE_OPERATOR=4.
 
 const AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
-const INSURANCE_WITHDRAW_DEPOSITS_ONLY_SLAB_OFF: usize = 136 + 204;
-const INSURANCE_WITHDRAW_DEPOSIT_REMAINING_SLAB_OFF: usize = 136 + 264;
-
 fn encode_withdraw_insurance_limited(amount: u64) -> Vec<u8> {
     let mut data = vec![23u8]; // Tag 23
     data.extend_from_slice(&amount.to_le_bytes());
@@ -1507,7 +1504,7 @@ fn send_withdraw_limited(env: &mut TestEnv, operator: &Keypair, amount: u64) -> 
 
 /// Configure a market with bounded-withdrawal enabled: seed insurance and
 /// set `insurance_withdraw_max_bps` + `insurance_withdraw_cooldown_slots`
-/// via direct slab edits (faster than extending UpdateConfig ABI for tests).
+/// via the typed config view (faster than extending UpdateConfig ABI for tests).
 fn setup_bounded_withdrawal(env: &mut TestEnv, insurance: u64, max_bps: u16, cooldown_slots: u64) {
     env.init_market_with_invert(0);
     let insurance_payer = Keypair::new();
@@ -1518,30 +1515,11 @@ fn setup_bounded_withdrawal(env: &mut TestEnv, insurance: u64, max_bps: u16, coo
         env.top_up_insurance(&insurance_payer, insurance);
     }
 
-    // Direct slab edits for config fields that don't yet have UpdateConfig
-    // wiring. Safe in tests: we own the slab account.
-    //
-    // v12.19 MarketConfig layout (up to the insurance withdrawal fields):
-    //   offset 0..192  : collateral_mint + vault_pubkey + index_feed_id +
-    //                    max_staleness_secs + conf_filter_bps + bump + invert +
-    //                    unit_scale + funding (4×u64/i64) + hyperp_authority +
-    //                    hyperp_mark_e6 + last_oracle_publish_time
-    //   offset 192..200: last_effective_price_e6 (u64)
-    //   offset 200..202: insurance_withdraw_max_bps (u16)
-    //   offset 202..204: tvl_insurance_cap_mult (u16)
-    //   offset 204     : insurance_withdraw_deposits_only (u8)
-    //   offset 205..208: _iw_padding
-    //   offset 208..216: insurance_withdraw_cooldown_slots (u64)
-    //   offset 264..272: insurance_withdraw_deposit_remaining (u64)
-    //
-    // With HEADER_LEN = 136:
-    //   slab[336..338] = insurance_withdraw_max_bps
-    //   slab[340]      = insurance_withdraw_deposits_only
-    //   slab[344..352] = insurance_withdraw_cooldown_slots
-    //   slab[400..408] = insurance_withdraw_deposit_remaining
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    slab.data[336..338].copy_from_slice(&max_bps.to_le_bytes());
-    slab.data[344..352].copy_from_slice(&cooldown_slots.to_le_bytes());
+    let mut config = percolator_prog::state::read_config(&slab.data);
+    config.insurance_withdraw_max_bps = max_bps;
+    config.insurance_withdraw_cooldown_slots = cooldown_slots;
+    percolator_prog::state::write_config(&mut slab.data, &config);
     env.svm.set_account(env.slab, slab).unwrap();
 }
 
@@ -1585,18 +1563,15 @@ fn init_market_with_deposit_only_limited_withdrawal(
 
 fn set_withdraw_deposits_only_raw(env: &mut TestEnv, value: u8) {
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    slab.data[INSURANCE_WITHDRAW_DEPOSITS_ONLY_SLAB_OFF] = value;
+    let mut config = percolator_prog::state::read_config(&slab.data);
+    config.insurance_withdraw_deposits_only = value;
+    percolator_prog::state::write_config(&mut slab.data, &config);
     env.svm.set_account(env.slab, slab).unwrap();
 }
 
 fn read_withdraw_deposit_remaining_raw(env: &TestEnv) -> u64 {
     let slab = env.svm.get_account(&env.slab).unwrap();
-    u64::from_le_bytes(
-        slab.data[INSURANCE_WITHDRAW_DEPOSIT_REMAINING_SLAB_OFF
-            ..INSURANCE_WITHDRAW_DEPOSIT_REMAINING_SLAB_OFF + 8]
-            .try_into()
-            .unwrap(),
-    )
+    percolator_prog::state::read_config(&slab.data).insurance_withdraw_deposit_remaining
 }
 
 fn write_engine_vault_raw(env: &mut TestEnv, value: u128) {
@@ -1977,7 +1952,8 @@ fn test_withdraw_limited_deposit_only_can_be_enabled_at_init() {
 
     let slab = env.svm.get_account(&env.slab).unwrap();
     assert_eq!(
-        slab.data[INSURANCE_WITHDRAW_DEPOSITS_ONLY_SLAB_OFF], 1,
+        percolator_prog::state::read_config(&slab.data).insurance_withdraw_deposits_only,
+        1,
         "InitMarket high-bit flag must persist deposit-only mode"
     );
 
@@ -2015,8 +1991,10 @@ fn test_withdraw_limited_deposit_only_leaves_fee_growth_behind() {
     env.top_up_insurance(&insurance_payer, 1_000);
 
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    slab.data[336..338].copy_from_slice(&10_000u16.to_le_bytes());
-    slab.data[344..352].copy_from_slice(&1u64.to_le_bytes());
+    let mut config = percolator_prog::state::read_config(&slab.data);
+    config.insurance_withdraw_max_bps = 10_000;
+    config.insurance_withdraw_cooldown_slots = 1;
+    percolator_prog::state::write_config(&mut slab.data, &config);
     env.svm.set_account(env.slab, slab).unwrap();
 
     let lp = Keypair::new();
@@ -2095,8 +2073,10 @@ fn test_withdraw_limited_default_mode_not_capped_by_deposit_budget() {
     env.init_market_with_trading_fee(100); // 1% trading fee
 
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    slab.data[336..338].copy_from_slice(&10_000u16.to_le_bytes());
-    slab.data[344..352].copy_from_slice(&1u64.to_le_bytes());
+    let mut config = percolator_prog::state::read_config(&slab.data);
+    config.insurance_withdraw_max_bps = 10_000;
+    config.insurance_withdraw_cooldown_slots = 1;
+    percolator_prog::state::write_config(&mut slab.data, &config);
     env.svm.set_account(env.slab, slab).unwrap();
 
     let lp = Keypair::new();

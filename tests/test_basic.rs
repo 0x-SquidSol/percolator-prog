@@ -77,6 +77,15 @@ fn read_engine_sweep_generation(env: &TestEnv) -> u64 {
     )
 }
 
+fn clear_risk_buffer_for_test(env: &mut TestEnv) {
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    let buf_size = core::mem::size_of::<percolator_prog::risk_buffer::RiskBuffer>();
+    let gen_table_size = MAX_ACCOUNTS * 8;
+    let buf_off = SLAB_LEN - gen_table_size - buf_size;
+    slab.data[buf_off..buf_off + buf_size].fill(0);
+    env.svm.set_account(env.slab, slab).unwrap();
+}
+
 fn write_account_fee_credits(env: &mut TestEnv, idx: u16, value: i128) {
     const ACCOUNT_SIZE: usize = 416;
     const FEE_CREDITS_OFFSET: usize = 280;
@@ -455,9 +464,9 @@ fn test_keeper_crank_partial_catchup_candidate_sequence_does_not_drain_insurance
 
     env.set_slot_and_price_raw_no_walk(env.read_last_market_slot() + 50, 132_480_000);
 
+    let pos_before = env.read_account_position(user_idx);
     assert_ne!(
-        env.read_account_position(user_idx),
-        0,
+        pos_before, 0,
         "precondition: target had an open position before partial-catchup liquidation"
     );
     let insurance_before = env.read_insurance_balance();
@@ -501,7 +510,7 @@ fn test_keeper_crank_partial_catchup_uses_authenticated_slot_for_sweep_generatio
     let mut env = TestEnv::new();
     let mut init =
         encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 1_000);
-    put_u64(&mut init, 176, 2);
+    put_u64(&mut init, 168, 2);
     env.try_init_market_raw(init)
         .expect("small-capacity market should initialize");
 
@@ -521,18 +530,20 @@ fn test_keeper_crank_partial_catchup_uses_authenticated_slot_for_sweep_generatio
     env.set_slot_and_price_raw_no_walk(real_slot, target as i64);
 
     let gen_before = read_engine_sweep_generation(&env);
+    clear_risk_buffer_for_test(&mut env);
     env.try_crank_once()
         .expect("first same-slot partial crank should make progress");
     let gen_after_first = read_engine_sweep_generation(&env);
     assert!(
-        gen_after_first >= gen_before,
-        "sweep_generation must be monotonic across same-slot partial cranks"
+        gen_after_first > gen_before,
+        "test setup should force a Phase 2 cursor wrap on the first crank"
     );
     assert!(
         env.read_last_market_slot() < real_slot,
         "test must remain in partial catchup mode after the first crank"
     );
 
+    clear_risk_buffer_for_test(&mut env);
     env.try_crank_once()
         .expect("second same-slot partial crank should still make catchup progress");
     assert_eq!(
@@ -4501,7 +4512,9 @@ fn test_instruction_decoder_removed_tags_rejected() {
 // ── Mark EWMA clamp-base tests ─────────────────────────────────────────
 
 use percolator_prog::oracle::clamp_oracle_price;
-use percolator_prog::policy::{ewma_update, mark_ewma_clamp_base};
+use percolator_prog::policy::{
+    ewma_update, hyperp_dynamic_fee_bps, mark_ewma_clamp_base, price_move_bps_ceil,
+};
 
 /// Test 1.1: Single-slot max movement with index-clamped EWMA.
 /// Mark starts at index=100. Attacker fills at max-clamped price.
@@ -4735,6 +4748,286 @@ fn test_ewma_zero_min_fee_full_alpha() {
         with_dust, with_full,
         "mark_min_fee=0 → all trades equal weight"
     );
+}
+
+/// After-hours Hyperp fee policy: a trade that moves the EWMA mark by 5 bps
+/// over a normal 1 bps base fee must be charged 6 bps. The externality
+/// notional is two-sided trade notional here, matching the engine's two-sided
+/// fee collection.
+#[test]
+fn test_hyperp_dynamic_fee_adds_actual_mark_move_bps() {
+    let old_mark = 100_000_000u64;
+    let clamped_exec = 110_000_000u64;
+    let trade_notional = 1_000_000_000u128;
+    let externality_notional = trade_notional * 2;
+    let fee = hyperp_dynamic_fee_bps(
+        1, // normal fee = 1 bip
+        old_mark,
+        clamped_exec,
+        199, // alpha = 50 bps for dt=1
+        100,
+        101,
+        trade_notional,
+        externality_notional,
+        0, // full-weight mark update
+    )
+    .expect("dynamic fee fits the engine hard fee bound");
+    let fee_paid = ((trade_notional * fee as u128 + 9_999) / 10_000) * 2;
+    let next_mark = ewma_update(old_mark, clamped_exec, 199, 100, 101, fee_paid as u64, 0);
+    assert_eq!(price_move_bps_ceil(old_mark, next_mark), Some(5));
+    assert_eq!(fee, 6, "1 bip base + 5 bips mark movement");
+}
+
+/// There is no deployer-configured cap below 100%. A cap below the needed
+/// mark-movement fee would be a liveness attack: valid after-hours trades would
+/// revert exactly when the market needs the fee to price mark movement.
+#[test]
+fn test_hyperp_dynamic_fee_has_no_configured_cap_below_hard_bound() {
+    let fee = hyperp_dynamic_fee_bps(
+        1,
+        100_000_000,
+        110_000_000,
+        199,
+        100,
+        101,
+        1_000_000_000,
+        2_000_000_000,
+        0,
+    )
+    .expect("former low cap would reject this, but dynamic mode must not cap it");
+    assert_eq!(fee, 6);
+}
+
+/// Existing OI is the attacker-favorable case: a tiny after-hours fill can move
+/// the mark while a larger pre-existing book receives the PnL transfer. The
+/// policy prices the mark movement against the larger exposed notional and
+/// returns the needed fee when it fits the engine hard fee bound.
+#[test]
+fn test_hyperp_dynamic_fee_tiny_fill_pays_for_large_existing_oi_when_possible() {
+    let trade_notional = 1_000_000u128;
+    let existing_book_notional = 1_000_000_000u128;
+    let fee = hyperp_dynamic_fee_bps(
+        1,
+        100_000_000,
+        110_000_000,
+        199,
+        100,
+        101,
+        trade_notional,
+        existing_book_notional * 2,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        fee, 5001,
+        "small fill must pay the full mark externality when it fits the hard bound"
+    );
+}
+
+/// If the required externality fee exceeds the engine's hard bps bound, the
+/// trade must reject. This is not a deployer-configured cap; it is the current
+/// engine API limit for bps-based trade fees.
+#[test]
+fn test_hyperp_dynamic_fee_rejects_only_above_engine_hard_bound() {
+    let trade_notional = 1_000_000u128;
+    let existing_book_notional = 1_000_000_000_000u128;
+    let fee = hyperp_dynamic_fee_bps(
+        1,
+        100_000_000,
+        110_000_000,
+        199,
+        100,
+        101,
+        trade_notional,
+        existing_book_notional * 2,
+        0,
+    );
+    assert_eq!(
+        fee, None,
+        "required fee exceeds the engine's 10_000 bps trade-fee bound"
+    );
+}
+
+/// Fee weighting is circular: the fee paid changes the EWMA movement. The
+/// helper solves the fixed point and guarantees the selected fee covers the
+/// actual, fee-weighted mark movement, not a stale pre-fee estimate.
+#[test]
+fn test_hyperp_dynamic_fee_covers_partial_fee_weighted_mark_move() {
+    let old_mark = 100_000_000u64;
+    let clamped_exec = 110_000_000u64;
+    let trade_notional = 10_000_000u128;
+    let externality_notional = trade_notional * 2;
+    let mark_min_fee = 1_000_000u64;
+    let fee = hyperp_dynamic_fee_bps(
+        1,
+        old_mark,
+        clamped_exec,
+        10,
+        100,
+        101,
+        trade_notional,
+        externality_notional,
+        mark_min_fee,
+    )
+    .expect("hard bound covers partial-weight movement");
+    let fee_paid = ((trade_notional * fee as u128 + 9_999) / 10_000) * 2;
+    let next_mark = ewma_update(
+        old_mark,
+        clamped_exec,
+        10,
+        100,
+        101,
+        fee_paid as u64,
+        mark_min_fee,
+    );
+    let actual_move = price_move_bps_ceil(old_mark, next_mark).unwrap();
+    assert!(
+        fee >= 1 + actual_move,
+        "fee={} must cover base=1 + actual_move={}",
+        fee,
+        actual_move
+    );
+}
+
+/// Same-mark fills pay the normal base fee; the dynamic surcharge is exactly
+/// zero when the EWMA mark does not move.
+#[test]
+fn test_hyperp_dynamic_fee_same_mark_uses_base_fee() {
+    let fee = hyperp_dynamic_fee_bps(
+        7,
+        100_000_000,
+        100_000_000,
+        10,
+        100,
+        101,
+        1_000_000,
+        2_000_000,
+        0,
+    )
+    .unwrap();
+    assert_eq!(fee, 7);
+}
+
+/// A downward after-hours mark move is charged symmetrically with an upward
+/// move. This covers the short-side manipulation direction: the fee prices the
+/// absolute EWMA displacement, not only rallies.
+#[test]
+fn test_hyperp_dynamic_fee_charges_downward_mark_move() {
+    let old_mark = 100_000_000u64;
+    let clamped_exec = 90_000_000u64;
+    let trade_notional = 1_000_000_000u128;
+    let externality_notional = trade_notional * 2;
+    let fee = hyperp_dynamic_fee_bps(
+        1,
+        old_mark,
+        clamped_exec,
+        199,
+        100,
+        101,
+        trade_notional,
+        externality_notional,
+        0,
+    )
+    .expect("downward dynamic fee fits the hard fee bound");
+    let fee_paid = ((trade_notional * fee as u128 + 9_999) / 10_000) * 2;
+    let next_mark = ewma_update(old_mark, clamped_exec, 199, 100, 101, fee_paid as u64, 0);
+    let mark_move = price_move_bps_ceil(old_mark, next_mark).unwrap();
+    assert_eq!(mark_move, 5);
+    assert_eq!(fee, 6, "1 bip base + 5 bips downward mark movement");
+}
+
+/// A nonzero signed trade request can still round to zero notional at very
+/// small prices/sizes. Dynamic Hyperp mode must reject such a fill when it
+/// would move the mark: otherwise an attacker could move EWMA without paying
+/// an externality fee.
+#[test]
+fn test_hyperp_dynamic_fee_rejects_zero_notional_mark_move() {
+    let fee = hyperp_dynamic_fee_bps(1, 100_000_000, 110_000_000, 199, 100, 101, 0, 2_000_000, 0);
+    assert_eq!(
+        fee, None,
+        "zero-notional fills cannot pay for nonzero mark movement"
+    );
+}
+
+/// The first mark seed has no prior mark to displace, so it uses the base fee.
+/// Hyperp markets seed at InitMarket; this branch is still kept fail-safe for
+/// zeroed/corrupt test states.
+#[test]
+fn test_hyperp_dynamic_fee_unseeded_old_mark_uses_base_fee() {
+    let fee = hyperp_dynamic_fee_bps(
+        9,
+        0,
+        110_000_000,
+        199,
+        100,
+        101,
+        1_000_000_000,
+        2_000_000_000,
+        0,
+    )
+    .unwrap();
+    assert_eq!(fee, 9);
+}
+
+/// Splitting multiple fills into the same slot cannot compound EWMA movement.
+/// After the first full-weight fill stamps the mark clock, a second same-slot
+/// fill has dt=0, pays only the base fee, and leaves the mark unchanged.
+#[test]
+fn test_hyperp_dynamic_fee_same_slot_split_does_not_compound_mark() {
+    let old_mark = 100_000_000u64;
+    let clamped_exec = 110_000_000u64;
+    let trade_notional = 1_000_000_000u128;
+    let externality_notional = trade_notional * 2;
+
+    let first_fee = hyperp_dynamic_fee_bps(
+        1,
+        old_mark,
+        clamped_exec,
+        199,
+        100,
+        101,
+        trade_notional,
+        externality_notional,
+        0,
+    )
+    .unwrap();
+    assert!(first_fee > 1);
+    let first_fee_paid = ((trade_notional * first_fee as u128 + 9_999) / 10_000) * 2;
+    let first_mark = ewma_update(
+        old_mark,
+        clamped_exec,
+        199,
+        100,
+        101,
+        first_fee_paid as u64,
+        0,
+    );
+    assert!(first_mark > old_mark);
+
+    let second_fee = hyperp_dynamic_fee_bps(
+        1,
+        first_mark,
+        clamped_exec,
+        199,
+        101,
+        101,
+        trade_notional,
+        externality_notional,
+        0,
+    )
+    .unwrap();
+    let second_fee_paid = ((trade_notional * second_fee as u128 + 9_999) / 10_000) * 2;
+    let second_mark = ewma_update(
+        first_mark,
+        clamped_exec,
+        199,
+        101,
+        101,
+        second_fee_paid as u64,
+        0,
+    );
+    assert_eq!(second_fee, 1);
+    assert_eq!(second_mark, first_mark);
 }
 
 /// Zero fee (zero-fill or insolvent) cannot move mark.
@@ -5849,10 +6142,11 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
     }
 
     // Set bounded staleness for permissionless resolution.
-    // Slab offset = HEADER_LEN(168) + config.max_staleness_secs(96) = 264.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        let mut config = percolator_prog::state::read_config(&slab.data);
+        config.max_staleness_secs = 30;
+        percolator_prog::state::write_config(&mut slab.data, &config);
         env.svm.set_account(env.slab, slab).unwrap();
     }
 

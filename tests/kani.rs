@@ -27,7 +27,8 @@ extern crate kani;
 use percolator_prog::constants::{
     DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS, MATCHER_ABI_VERSION, MAX_ABS_FUNDING_E9_PER_SLOT,
     MAX_ACCRUAL_DT_SLOTS, MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS, MAX_PROFIT_MATURITY_SLOTS,
-    MAX_UNIT_SCALE, MIN_FUNDING_LIFETIME_SLOTS,
+    MAX_UNIT_SCALE, MIN_FUNDING_LIFETIME_SLOTS, ORACLE_LEG_FLAG_DIVIDE_LEG2,
+    ORACLE_LEG_FLAG_DIVIDE_LEG3,
 };
 use percolator_prog::ix::Instruction;
 use percolator_prog::matcher_abi::{
@@ -145,7 +146,7 @@ struct InitRiskWire {
     h_min: u64,
     maintenance_margin_bps: u64,
     initial_margin_bps: u64,
-    trading_fee_bps: u64,
+    max_trading_fee_bps: u64,
     max_accounts: u64,
     new_account_fee: u128,
     h_max: u64,
@@ -174,7 +175,7 @@ fn any_init_risk_wire_valid_for_decode() -> InitRiskWire {
         h_min,
         maintenance_margin_bps: kani::any(),
         initial_margin_bps: kani::any(),
-        trading_fee_bps: kani::any(),
+        max_trading_fee_bps: kani::any(),
         max_accounts: kani::any(),
         new_account_fee: kani::any(),
         h_max,
@@ -209,6 +210,10 @@ fn push_u128(out: &mut Vec<u8>, v: u128) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+fn push_bytes32(out: &mut Vec<u8>, v: [u8; 32]) {
+    out.extend_from_slice(&v);
+}
+
 fn encode_init_market_minimal_for_kani(r: InitRiskWire) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0); // InitMarket tag
@@ -226,7 +231,7 @@ fn encode_init_market_minimal_for_kani(r: InitRiskWire) -> Vec<u8> {
     push_u64(&mut out, r.h_min);
     push_u64(&mut out, r.maintenance_margin_bps);
     push_u64(&mut out, r.initial_margin_bps);
-    push_u64(&mut out, r.trading_fee_bps);
+    push_u64(&mut out, r.max_trading_fee_bps);
     push_u64(&mut out, r.max_accounts);
     push_u128(&mut out, r.new_account_fee);
     push_u64(&mut out, r.h_max);
@@ -264,6 +269,19 @@ fn append_init_market_extended_tail_for_kani(
     push_u64(out, force_close_delay_slots);
 }
 
+fn append_init_market_oracle_leg_tail_for_kani(
+    out: &mut Vec<u8>,
+    oracle_leg_count: u8,
+    oracle_leg_flags: u8,
+    oracle_leg2_feed_id: [u8; 32],
+    oracle_leg3_feed_id: [u8; 32],
+) {
+    out.push(oracle_leg_count);
+    out.push(oracle_leg_flags);
+    push_bytes32(out, oracle_leg2_feed_id);
+    push_bytes32(out, oracle_leg3_feed_id);
+}
+
 // =============================================================================
 // INITMARKET WIRE FORMAT -> ENGINE RISKPARAMS PROOFS
 // =============================================================================
@@ -279,17 +297,15 @@ fn kani_init_market_decode_wires_risk_params_to_engine_envelope() {
     let decoded = Instruction::decode(&data);
 
     match decoded {
-        Ok(Instruction::InitMarket {
-            risk_params,
-            new_account_fee,
-            permissionless_resolve_stale_slots,
-            funding_horizon_slots,
-            funding_k_bps,
-            funding_max_premium_bps,
-            funding_max_e9_per_slot,
-            force_close_delay_slots,
-            ..
-        }) => {
+        Ok(Instruction::InitMarket(args)) => {
+            let risk_params = args.risk_params;
+            let new_account_fee = args.new_account_fee;
+            let permissionless_resolve_stale_slots = args.permissionless_resolve_stale_slots;
+            let funding_horizon_slots = args.funding_horizon_slots;
+            let funding_k_bps = args.funding_k_bps;
+            let funding_max_premium_bps = args.funding_max_premium_bps;
+            let funding_max_e9_per_slot = args.funding_max_e9_per_slot;
+            let force_close_delay_slots = args.force_close_delay_slots;
             assert_eq!(risk_params.h_min, wire.h_min);
             assert_eq!(risk_params.h_max, wire.h_max);
             assert_eq!(
@@ -297,7 +313,7 @@ fn kani_init_market_decode_wires_risk_params_to_engine_envelope() {
                 wire.maintenance_margin_bps
             );
             assert_eq!(risk_params.initial_margin_bps, wire.initial_margin_bps);
-            assert_eq!(risk_params.trading_fee_bps, wire.trading_fee_bps);
+            assert_eq!(risk_params.max_trading_fee_bps, wire.max_trading_fee_bps);
             assert_eq!(risk_params.max_accounts, wire.max_accounts);
             assert_eq!(risk_params.liquidation_fee_bps, wire.liquidation_fee_bps);
             assert_eq!(
@@ -380,34 +396,29 @@ fn kani_init_market_extended_tail_decode_is_exact() {
     );
 
     match Instruction::decode(&data) {
-        Ok(Instruction::InitMarket {
-            insurance_withdraw_max_bps: got_iwm,
-            insurance_withdraw_cooldown_slots: got_iwc,
-            permissionless_resolve_stale_slots: got_prs,
-            funding_horizon_slots: got_fh,
-            funding_k_bps: got_fk,
-            funding_max_premium_bps: got_fmp,
-            funding_max_e9_per_slot: got_fms,
-            mark_min_fee: got_mmf,
-            force_close_delay_slots: got_fcd,
-            ..
-        }) => {
-            assert_eq!(got_iwm, insurance_withdraw_max_bps);
-            assert_eq!(got_iwc, insurance_withdraw_cooldown_slots);
-            assert_eq!(got_prs, permissionless_resolve_stale_slots);
-            assert_eq!(got_fh, Some(funding_horizon_slots));
-            assert_eq!(got_fk, Some(funding_k_bps));
-            assert_eq!(got_fmp, Some(funding_max_premium_bps));
-            assert_eq!(got_fms, Some(funding_max_e9_per_slot));
-            assert_eq!(got_mmf, mark_min_fee);
-            assert_eq!(got_fcd, force_close_delay_slots);
+        Ok(Instruction::InitMarket(args)) => {
+            assert_eq!(args.insurance_withdraw_max_bps, insurance_withdraw_max_bps);
+            assert_eq!(
+                args.insurance_withdraw_cooldown_slots,
+                insurance_withdraw_cooldown_slots
+            );
+            assert_eq!(
+                args.permissionless_resolve_stale_slots,
+                permissionless_resolve_stale_slots
+            );
+            assert_eq!(args.funding_horizon_slots, Some(funding_horizon_slots));
+            assert_eq!(args.funding_k_bps, Some(funding_k_bps));
+            assert_eq!(args.funding_max_premium_bps, Some(funding_max_premium_bps));
+            assert_eq!(args.funding_max_e9_per_slot, Some(funding_max_e9_per_slot));
+            assert_eq!(args.mark_min_fee, mark_min_fee);
+            assert_eq!(args.force_close_delay_slots, force_close_delay_slots);
         }
         _ => panic!("valid extended InitMarket wire must decode to InitMarket"),
     }
 }
 
-/// Prove any partial extended InitMarket tail is rejected. The only accepted
-/// forms are no tail or the full 66-byte tail.
+/// Prove any partial extended InitMarket tail is rejected. The first optional
+/// segment must be either absent or the full 66-byte extended tail.
 #[kani::proof]
 #[kani::unwind(67)]
 fn kani_init_market_partial_extended_tail_rejected() {
@@ -416,6 +427,9 @@ fn kani_init_market_partial_extended_tail_rejected() {
     let extra_len_raw: u8 = kani::any();
     let extra_len = (extra_len_raw as usize) % 66;
     kani::assume(extra_len > 0);
+    // 8 trailing bytes is the valid dynamic-fee tail with no oracle-leg tail.
+    // This proof covers malformed oracle-leg tails only.
+    kani::assume(extra_len != 8);
 
     let mut i = 0usize;
     while i < extra_len {
@@ -426,6 +440,88 @@ fn kani_init_market_partial_extended_tail_rejected() {
     assert!(
         Instruction::decode(&data).is_err(),
         "partial InitMarket extended tail must be rejected"
+    );
+}
+
+/// Prove the optional 3-leg oracle tail is decoded exactly after the extended
+/// tail. This pins the wire format for synthetic crosses such as
+/// TOTO/SOL = TOTO/JPY ÷ USD/JPY ÷ SOL/USD.
+#[kani::proof]
+fn kani_init_market_oracle_leg_tail_decode_is_exact() {
+    let wire = any_init_risk_wire_valid_for_decode();
+    let mut data = encode_init_market_minimal_for_kani(wire);
+    append_init_market_extended_tail_for_kani(
+        &mut data,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+    );
+
+    let oracle_leg_count: u8 = kani::any();
+    let oracle_leg_flags: u8 = ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    let oracle_leg2_feed_id: [u8; 32] = kani::any();
+    let oracle_leg3_feed_id: [u8; 32] = kani::any();
+    append_init_market_oracle_leg_tail_for_kani(
+        &mut data,
+        oracle_leg_count,
+        oracle_leg_flags,
+        oracle_leg2_feed_id,
+        oracle_leg3_feed_id,
+    );
+
+    match Instruction::decode(&data) {
+        Ok(Instruction::InitMarket(args)) => {
+            assert_eq!(args.oracle_leg_count, oracle_leg_count);
+            assert_eq!(args.oracle_leg_flags, oracle_leg_flags);
+            assert_eq!(args.oracle_leg_feeds.leg2_feed_id, oracle_leg2_feed_id);
+            assert_eq!(args.oracle_leg_feeds.leg3_feed_id, oracle_leg3_feed_id);
+        }
+        _ => panic!("valid oracle-leg InitMarket wire must decode to InitMarket"),
+    }
+}
+
+/// Prove any partial oracle-leg tail after the extended InitMarket tail is
+/// rejected. There is no silent forward-compat trailing data.
+#[kani::proof]
+#[kani::unwind(67)]
+fn kani_init_market_partial_oracle_leg_tail_rejected() {
+    let wire = any_init_risk_wire_valid_for_decode();
+    let mut data = encode_init_market_minimal_for_kani(wire);
+    append_init_market_extended_tail_for_kani(
+        &mut data,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+    );
+
+    let extra_len_raw: u8 = kani::any();
+    let extra_len = (extra_len_raw as usize) % 66;
+    kani::assume(extra_len > 0);
+    // 8 trailing bytes is a valid dynamic-fee tail without any oracle-leg
+    // tail. This proof is specifically about malformed oracle-leg tails.
+    kani::assume(extra_len != 8);
+
+    let mut i = 0usize;
+    while i < extra_len {
+        data.push(kani::any());
+        i += 1;
+    }
+
+    assert!(
+        Instruction::decode(&data).is_err(),
+        "partial InitMarket oracle-leg tail must be rejected"
     );
 }
 
@@ -1493,7 +1589,7 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
         let valid_ret = MatcherReturnFields {
             abi_version: MATCHER_ABI_VERSION,
             flags: FLAG_VALID | FLAG_PARTIAL_OK,
-            exec_price_e6: 1_000_000,
+            exec_price_e6: 50_000_000,
             exec_size: 0,
             req_id,
             lp_account_id: 1,
@@ -2315,9 +2411,10 @@ fn kani_tradecpi_from_ret_req_id_is_nonce_plus_one() {
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK; // PARTIAL_OK allows exec_size=0
     ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
+    kani::assume(ret.oracle_price_e6 != 0);
+    ret.exec_price_e6 = ret.oracle_price_e6;
     ret.req_id = expected_req_id; // Must match nonce_on_success(old_nonce)
-    ret.exec_size = 0; // With PARTIAL_OK, zero size is always valid
+    ret.exec_size = 0; // With PARTIAL_OK, zero size is valid only at oracle price
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price_e6: u64 = ret.oracle_price_e6;
@@ -2388,9 +2485,10 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
     ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
+    kani::assume(ret.oracle_price_e6 != 0);
+    ret.exec_price_e6 = ret.oracle_price_e6;
     ret.req_id = expected_req_id;
-    ret.exec_size = 0; // PARTIAL_OK allows zero
+    ret.exec_size = 0; // PARTIAL_OK allows zero only at oracle price
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price_e6: u64 = ret.oracle_price_e6;
@@ -3270,7 +3368,8 @@ fn kani_decide_trade_cpi_from_ret_universal() {
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK; // PARTIAL_OK allows exec_size=0
     ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
+    kani::assume(ret.oracle_price_e6 != 0);
+    ret.exec_price_e6 = ret.oracle_price_e6;
     ret.req_id = req_id; // Must echo computed req_id for ABI validation to pass
 
     let lp_account_id: u64 = ret.lp_account_id; // Must match echoed value

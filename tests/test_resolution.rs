@@ -12,6 +12,29 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
+fn update_market_config(
+    env: &mut TestEnv,
+    f: impl FnOnce(&mut percolator_prog::state::MarketConfig),
+) {
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    let mut config = percolator_prog::state::read_config(&slab.data);
+    f(&mut config);
+    percolator_prog::state::write_config(&mut slab.data, &config);
+    env.svm.set_account(env.slab, slab).unwrap();
+}
+
+fn set_max_staleness_secs(env: &mut TestEnv, secs: u64) {
+    update_market_config(env, |config| {
+        config.max_staleness_secs = secs;
+    });
+}
+
+fn set_permissionless_resolve_stale_slots(env: &mut TestEnv, slots: u64) {
+    update_market_config(env, |config| {
+        config.permissionless_resolve_stale_slots = slots;
+    });
+}
+
 fn settle_warmup_and_convert_released_pnl(
     env: &mut TestEnv,
     owner: &Keypair,
@@ -1005,12 +1028,7 @@ fn test_resolve_permissionless_after_staleness() {
     env.init_market_with_cap(0, 100);
 
     // Override max_staleness_secs to 30 for faster staleness detection
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        // max_staleness_secs: at slab offset 72+96=168
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes()); // 30 seconds
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     // Crank to establish baseline (oracle is fresh at slot 100, ts=100)
     env.crank();
@@ -1059,13 +1077,7 @@ fn test_resolve_permissionless_already_admin_resolved() {
     env.init_market_with_invert(0);
 
     // Enable permissionless resolve
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
-        let offset = config_end - 32; // permissionless_resolve_stale_slots (before mark_min_fee+padding)
-        slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_permissionless_resolve_stale_slots(&mut env, 50);
 
     // Admin resolves first
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -1090,11 +1102,7 @@ fn test_resolve_permissionless_settlement_price() {
     env.init_market_with_cap(0, 50);
 
     // Override max_staleness_secs to 30 for faster staleness detection
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     env.crank(); // oracle = $138 at ts=100
                  // Make oracle stale without updating publish_time
@@ -1120,14 +1128,8 @@ fn test_resolve_permissionless_rejects_wrong_oracle() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
-        let offset = config_end - 32; // permissionless_resolve_stale_slots (before mark_min_fee+padding)
-        slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_permissionless_resolve_stale_slots(&mut env, 50);
+    set_max_staleness_secs(&mut env, 30);
 
     env.crank(); // establish baseline
 
@@ -1222,12 +1224,7 @@ fn test_governance_free_full_lifecycle() {
     assert_eq!(env.read_funding_max_e9_per_slot(), 10);
 
     // Step 2: Set bounded staleness (so oracle can go stale for permissionless resolution)
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        // max_staleness_secs at offset 72+96=168
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     // Step 3: Open positions
     let lp = Keypair::new();
@@ -1295,11 +1292,7 @@ fn test_governance_free_full_lifecycle_inverted() {
         8,   // custom max per slot
     );
 
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -1356,12 +1349,7 @@ fn test_resolve_permissionless_inverted_market() {
     env.init_market_with_cap(1, 50);
 
     // Bounded staleness so oracle can go stale
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        // max_staleness_secs at offset 72+96=168
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     // Crank to establish baseline oracle price
     env.crank();
@@ -1391,11 +1379,7 @@ fn test_resolve_permissionless_inverted_settlement_price() {
     let mut env = TestEnv::new();
     env.init_market_with_cap(1, 50);
 
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     env.crank(); // Establishes oracle price in inverted form
 
@@ -1445,11 +1429,7 @@ fn test_resolve_permissionless_inverted_with_positions() {
     let mut env = TestEnv::new();
     env.init_market_with_cap(1, 80);
 
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     // Set up LP and user with positions
     let lp = Keypair::new();
@@ -1505,11 +1485,7 @@ fn test_resolve_permissionless_empty_market_at_sentinel() {
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 100);
 
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     // Do NOT crank — engine still has init sentinel price=1
 
@@ -1559,11 +1535,7 @@ fn test_force_close_resolved_basic() {
     env.try_init_market_raw(data).expect("init failed");
 
     // Set bounded staleness for permissionless resolution
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -1617,11 +1589,7 @@ fn test_force_close_resolved_rejects_before_delay() {
         500, // 500 slot delay
     );
     env.try_init_market_raw(data).expect("init failed");
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -1749,11 +1717,7 @@ fn test_init_sentinel_permissionless_resolve_deposits_only_preserves_capital() {
 
     // Tighten max_staleness_secs so "oracle dead" can be triggered by clock
     // advance without us having to actually stop the mocked Pyth feed.
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     // Deposit only. No trade → no execute_trade → no oracle read from the
     // wrapper's read_price path → FLAG_ORACLE_INITIALIZED stays clear,
@@ -1798,11 +1762,7 @@ fn test_sentinel_replaced_after_first_crank() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 50);
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
 
     // One crank. The crank reads the mocked Pyth feed, validates it, stamps
     // engine.last_oracle_price and FLAG_ORACLE_INITIALIZED.
@@ -1864,11 +1824,7 @@ fn test_sentinel_invariant_nonzero_oi_implies_oracle_initialized() {
 
     // Now force oracle death and resolve. Because the trade initialized the
     // oracle, settlement uses the real price (not the sentinel).
-    {
-        let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
-        env.svm.set_account(env.slab, slab).unwrap();
-    }
+    set_max_staleness_secs(&mut env, 30);
     env.svm.set_sysvar(&Clock {
         slot: 500,
         unix_timestamp: 500,

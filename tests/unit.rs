@@ -8,6 +8,7 @@ use percolator::{I128, MAX_ACCOUNTS, U128};
 use percolator_prog::{
     constants::MAGIC,
     error::PercolatorError,
+    ix::Instruction,
     matcher_abi::{validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_VALID},
     oracle, policy,
     processor::process_instruction,
@@ -280,6 +281,13 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     data
 }
 
+fn overwrite_init_market_max_trade_fee_bps(data: &mut [u8], max_trade_fee_bps: u64) {
+    const INIT_PREFIX_LEN: usize = 1 + 32 + 32 + 32 + 8 + 2 + 1 + 4 + 8 + 16;
+    const MAX_TRADE_FEE_OFFSET_IN_RISK_PARAMS: usize = 8 + 8 + 8;
+    let off = INIT_PREFIX_LEN + MAX_TRADE_FEE_OFFSET_IN_RISK_PARAMS;
+    data[off..off + 8].copy_from_slice(&max_trade_fee_bps.to_le_bytes());
+}
+
 fn encode_init_market_invert(
     fixture: &MarketFixture,
     crank_staleness: u64,
@@ -527,10 +535,17 @@ fn test_matcher_zero_fill_with_oracle_price_is_accepted() {
 fn test_external_oracle_flat_market_uses_raw_target() {
     let mut config = state::MarketConfig::zeroed();
 
-    let price =
-        oracle::clamp_external_price(&mut config, Ok((120_000_000, 1)), 100_000_000, 1, 0, false)
-            .unwrap();
+    let (price, advanced) = oracle::clamp_external_price(
+        &mut config,
+        Ok((120_000_000, 1, true)),
+        100_000_000,
+        1,
+        0,
+        false,
+    )
+    .unwrap();
 
+    assert!(advanced);
     assert_eq!(price, 120_000_000);
     assert_eq!(config.last_effective_price_e6, 120_000_000);
     assert_eq!(config.oracle_target_price_e6, 120_000_000);
@@ -540,13 +555,431 @@ fn test_external_oracle_flat_market_uses_raw_target() {
 fn test_external_oracle_with_open_interest_respects_zero_dt_clamp() {
     let mut config = state::MarketConfig::zeroed();
 
-    let price =
-        oracle::clamp_external_price(&mut config, Ok((120_000_000, 1)), 100_000_000, 1, 0, true)
-            .unwrap();
+    let (price, advanced) = oracle::clamp_external_price(
+        &mut config,
+        Ok((120_000_000, 1, true)),
+        100_000_000,
+        1,
+        0,
+        true,
+    )
+    .unwrap();
 
+    assert!(advanced);
     assert_eq!(price, 100_000_000);
     assert_eq!(config.last_effective_price_e6, 100_000_000);
     assert_eq!(config.oracle_target_price_e6, 120_000_000);
+}
+
+#[test]
+fn test_three_leg_external_oracle_composes_toto_sol_cross() {
+    let toto_jpy_feed = [0x11u8; 32];
+    let usd_jpy_feed = [0x22u8; 32];
+    let sol_usd_feed = [0x33u8; 32];
+    let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+
+    let mut config = state::MarketConfig::zeroed();
+    config.index_feed_id = toto_jpy_feed;
+    config.oracle_leg2_feed_id = usd_jpy_feed;
+    config.oracle_leg3_feed_id = sol_usd_feed;
+    config.oracle_leg_count = 3;
+    config.oracle_leg_flags = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2
+        | percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    config.max_staleness_secs = 60;
+    config.conf_filter_bps = 500;
+
+    // TOTO/SOL = (TOTO/JPY) / (USD/JPY) / (SOL/USD).
+    // 4000 / 150 / 200 = 0.133333... SOL.
+    let mut toto_jpy = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&toto_jpy_feed, 4_000_000_000, -6, 1, 100),
+    );
+    let mut usd_jpy = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&usd_jpy_feed, 150_000_000, -6, 1, 101),
+    );
+    let mut sol_usd = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&sol_usd_feed, 200_000_000, -6, 1, 102),
+    );
+
+    let infos = vec![toto_jpy.to_info(), usd_jpy.to_info(), sol_usd.to_info()];
+    let (price, publish_time, advanced) =
+        oracle::read_external_price_e6(&mut config, &infos, 102).unwrap();
+
+    assert!(advanced);
+    assert_eq!(publish_time, 102);
+    assert_eq!(price, 133_333);
+    assert_eq!(
+        config.oracle_leg_prices_e6,
+        [4_000_000_000, 150_000_000, 200_000_000]
+    );
+    assert_eq!(config.oracle_leg_publish_times, [100, 101, 102]);
+}
+
+#[test]
+fn test_three_leg_external_oracle_rejects_leg_rollback() {
+    let toto_jpy_feed = [0x44u8; 32];
+    let usd_jpy_feed = [0x55u8; 32];
+    let sol_usd_feed = [0x66u8; 32];
+    let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+
+    let mut config = state::MarketConfig::zeroed();
+    config.index_feed_id = toto_jpy_feed;
+    config.oracle_leg2_feed_id = usd_jpy_feed;
+    config.oracle_leg3_feed_id = sol_usd_feed;
+    config.oracle_leg_count = 3;
+    config.oracle_leg_flags = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2
+        | percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    config.max_staleness_secs = 60;
+    config.conf_filter_bps = 500;
+
+    let mut toto_jpy = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&toto_jpy_feed, 4_000_000_000, -6, 1, 100),
+    );
+    let mut usd_jpy = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&usd_jpy_feed, 150_000_000, -6, 1, 100),
+    );
+    let mut sol_usd = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&sol_usd_feed, 200_000_000, -6, 1, 100),
+    );
+
+    {
+        let infos = vec![toto_jpy.to_info(), usd_jpy.to_info(), sol_usd.to_info()];
+        oracle::read_external_price_e6(&mut config, &infos, 100).unwrap();
+    }
+
+    usd_jpy.data = make_pyth(&usd_jpy_feed, 150_000_000, -6, 1, 99);
+    let infos = vec![toto_jpy.to_info(), usd_jpy.to_info(), sol_usd.to_info()];
+    assert_eq!(
+        oracle::read_external_price_e6(&mut config, &infos, 100),
+        Err(PercolatorError::OracleStale.into())
+    );
+}
+
+#[test]
+fn test_three_leg_external_oracle_rejects_same_timestamp_price_change() {
+    let toto_jpy_feed = [0x77u8; 32];
+    let usd_jpy_feed = [0x88u8; 32];
+    let sol_usd_feed = [0x99u8; 32];
+    let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+
+    let mut config = state::MarketConfig::zeroed();
+    config.index_feed_id = toto_jpy_feed;
+    config.oracle_leg2_feed_id = usd_jpy_feed;
+    config.oracle_leg3_feed_id = sol_usd_feed;
+    config.oracle_leg_count = 3;
+    config.oracle_leg_flags = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2
+        | percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    config.max_staleness_secs = 60;
+    config.conf_filter_bps = 500;
+
+    let mut toto_jpy = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&toto_jpy_feed, 4_000_000_000, -6, 1, 100),
+    );
+    let mut usd_jpy = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&usd_jpy_feed, 150_000_000, -6, 1, 100),
+    );
+    let mut sol_usd = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&sol_usd_feed, 200_000_000, -6, 1, 100),
+    );
+
+    {
+        let infos = vec![toto_jpy.to_info(), usd_jpy.to_info(), sol_usd.to_info()];
+        oracle::read_external_price_e6(&mut config, &infos, 100).unwrap();
+    }
+
+    usd_jpy.data = make_pyth(&usd_jpy_feed, 151_000_000, -6, 1, 100);
+    let infos = vec![toto_jpy.to_info(), usd_jpy.to_info(), sol_usd.to_info()];
+    assert_eq!(
+        oracle::read_external_price_e6(&mut config, &infos, 100),
+        Err(PercolatorError::OracleInvalid.into())
+    );
+}
+
+#[test]
+fn test_oracle_leg_config_rejects_all_invalid_shapes() {
+    let leg1 = [0x01u8; 32];
+    let leg2 = [0x02u8; 32];
+    let leg3 = [0x03u8; 32];
+    let zero = [0u8; 32];
+    let divide2 = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2;
+    let divide3 = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3;
+
+    assert!(oracle::oracle_leg_config_ok(
+        false, 1, 0, &leg1, &zero, &zero
+    ));
+    assert!(oracle::oracle_leg_config_ok(
+        false, 2, divide2, &leg1, &leg2, &zero
+    ));
+    assert!(oracle::oracle_leg_config_ok(
+        false,
+        3,
+        divide2 | divide3,
+        &leg1,
+        &leg2,
+        &leg3
+    ));
+
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 0, 0, &leg1, &zero, &zero),
+        "external oracle count must be 1..=3"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 4, 0, &leg1, &leg2, &leg3),
+        "external oracle count must not exceed cap"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 1, 0, &zero, &zero, &zero),
+        "leg1 feed cannot be zero"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 1, divide2, &leg1, &zero, &zero),
+        "single-leg markets cannot set orientation flags"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 1, 0, &leg1, &leg2, &zero),
+        "single-leg markets cannot carry inactive leg2 feed"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 2, divide3, &leg1, &leg2, &zero),
+        "two-leg markets cannot set inactive leg3 orientation"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 2, 0, &leg1, &leg1, &zero),
+        "duplicate leg1/leg2 feeds are ambiguous"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(false, 3, 0, &leg1, &leg2, &leg2),
+        "duplicate leg2/leg3 feeds are ambiguous"
+    );
+    assert!(
+        !oracle::oracle_leg_config_ok(true, 2, 0, &zero, &leg2, &zero),
+        "Hyperp markets cannot configure external oracle legs"
+    );
+}
+
+#[test]
+fn test_two_leg_external_oracle_multiply_and_divide_paths() {
+    let feed1 = [0x0au8; 32];
+    let feed2 = [0x0bu8; 32];
+    let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+
+    let mut leg1 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed1, 2_000_000, -6, 1, 10),
+    );
+    let mut leg2 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed2, 3_000_000, -6, 1, 10),
+    );
+
+    let mut multiply = state::MarketConfig::zeroed();
+    multiply.index_feed_id = feed1;
+    multiply.oracle_leg2_feed_id = feed2;
+    multiply.oracle_leg_count = 2;
+    multiply.max_staleness_secs = 60;
+    multiply.conf_filter_bps = 500;
+    let infos = vec![leg1.to_info(), leg2.to_info()];
+    let (price, publish_time, advanced) =
+        oracle::read_external_price_e6(&mut multiply, &infos, 10).unwrap();
+    assert!(advanced);
+    assert_eq!(publish_time, 10);
+    assert_eq!(price, 6_000_000, "2.0 * 3.0 = 6.0");
+
+    let mut divide = state::MarketConfig::zeroed();
+    divide.index_feed_id = feed1;
+    divide.oracle_leg2_feed_id = feed2;
+    divide.oracle_leg_count = 2;
+    divide.oracle_leg_flags = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2;
+    divide.max_staleness_secs = 60;
+    divide.conf_filter_bps = 500;
+    let infos = vec![leg1.to_info(), leg2.to_info()];
+    let (price, _, advanced) = oracle::read_external_price_e6(&mut divide, &infos, 10).unwrap();
+    assert!(advanced);
+    assert_eq!(price, 666_666, "2.0 / 3.0 floors in e6 units");
+}
+
+#[test]
+fn test_three_leg_external_oracle_duplicate_observation_is_not_advanced() {
+    let feed1 = [0x0cu8; 32];
+    let feed2 = [0x0du8; 32];
+    let feed3 = [0x0eu8; 32];
+    let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+
+    let mut config = state::MarketConfig::zeroed();
+    config.index_feed_id = feed1;
+    config.oracle_leg2_feed_id = feed2;
+    config.oracle_leg3_feed_id = feed3;
+    config.oracle_leg_count = 3;
+    config.oracle_leg_flags = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2
+        | percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    config.max_staleness_secs = 60;
+    config.conf_filter_bps = 500;
+
+    let mut leg1 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed1, 4_000_000_000, -6, 1, 100),
+    );
+    let mut leg2 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed2, 150_000_000, -6, 1, 100),
+    );
+    let mut leg3 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed3, 200_000_000, -6, 1, 100),
+    );
+
+    {
+        let infos = vec![leg1.to_info(), leg2.to_info(), leg3.to_info()];
+        let (_, _, advanced) = oracle::read_external_price_e6(&mut config, &infos, 100).unwrap();
+        assert!(advanced);
+    }
+
+    let before_prices = config.oracle_leg_prices_e6;
+    let before_times = config.oracle_leg_publish_times;
+    let infos = vec![leg1.to_info(), leg2.to_info(), leg3.to_info()];
+    let (price, publish_time, advanced) =
+        oracle::read_external_price_e6(&mut config, &infos, 100).unwrap();
+    assert!(!advanced, "exact replay must not stamp a new observation");
+    assert_eq!(price, 133_333);
+    assert_eq!(publish_time, 100);
+    assert_eq!(config.oracle_leg_prices_e6, before_prices);
+    assert_eq!(config.oracle_leg_publish_times, before_times);
+}
+
+#[test]
+fn test_three_leg_external_oracle_missing_account_and_composition_overflow_fail_closed() {
+    let feed1 = [0xa1u8; 32];
+    let feed2 = [0xa2u8; 32];
+    let feed3 = [0xa3u8; 32];
+    let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+
+    let mut config = state::MarketConfig::zeroed();
+    config.index_feed_id = feed1;
+    config.oracle_leg2_feed_id = feed2;
+    config.oracle_leg3_feed_id = feed3;
+    config.oracle_leg_count = 3;
+    config.max_staleness_secs = 60;
+    config.conf_filter_bps = 500;
+
+    let mut leg1 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed1, 1_000_000_000_000, -6, 1, 10),
+    );
+    let mut leg2 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed2, 2_000_000, -6, 1, 10),
+    );
+    let mut leg3 = TestAccount::new(
+        Pubkey::new_unique(),
+        pyth_receiver_id,
+        0,
+        make_pyth(&feed3, 1_000_000, -6, 1, 10),
+    );
+
+    {
+        let infos = vec![leg1.to_info(), leg2.to_info()];
+        assert_eq!(
+            oracle::read_external_price_e6(&mut config, &infos, 10),
+            Err(ProgramError::NotEnoughAccountKeys)
+        );
+    }
+
+    let infos = vec![leg1.to_info(), leg2.to_info(), leg3.to_info()];
+    assert_eq!(
+        oracle::read_external_price_e6(&mut config, &infos, 10),
+        Err(PercolatorError::OracleInvalid.into()),
+        "composed price above engine MAX_ORACLE_PRICE must fail closed"
+    );
+}
+
+#[test]
+fn test_init_market_dynamic_fee_tail_decodes_after_extended_tail() {
+    let f = setup_market();
+    let mut data = encode_init_market(&f, 50);
+    let base_fee_bps = 7u64;
+    data.extend_from_slice(&base_fee_bps.to_le_bytes());
+
+    match Instruction::decode(&data).expect("extended + dynamic fee tail must decode") {
+        Instruction::InitMarket(args) => {
+            assert_eq!(args.trade_fee_base_bps, base_fee_bps);
+            assert_eq!(args.oracle_leg_count, 1);
+            assert_eq!(args.oracle_leg_flags, 0);
+            assert_eq!(args.oracle_leg_feeds.leg2_feed_id, [0u8; 32]);
+            assert_eq!(args.oracle_leg_feeds.leg3_feed_id, [0u8; 32]);
+        }
+        other => panic!("unexpected instruction: {other:?}"),
+    }
+}
+
+#[test]
+fn test_external_oracle_market_rejects_dynamic_fee_tail() {
+    let mut f = setup_market();
+    let mut data = encode_init_market(&f, 50);
+    overwrite_init_market_max_trade_fee_bps(
+        &mut data,
+        percolator_prog::constants::MAX_DYNAMIC_TRADE_FEE_BPS,
+    );
+    data.extend_from_slice(&1u64.to_le_bytes()); // base < max requests dynamic mode
+
+    let accounts = vec![
+        f.admin.to_info(),
+        f.slab.to_info(),
+        f.mint.to_info(),
+        f.vault.to_info(),
+        f.clock.to_info(),
+        f.pyth_index.to_info(),
+    ];
+    let res = process_instruction(&f.program_id, &accounts, &data);
+    assert_eq!(
+        res,
+        Err(PercolatorError::InvalidConfigParam.into()),
+        "dynamic mark-movement fees are Hyperp-only; external markets must use base == max"
+    );
+    assert_ne!(
+        state::read_header(&f.slab.data).magic,
+        MAGIC,
+        "rejected init must not initialize the slab"
+    );
 }
 
 #[test]

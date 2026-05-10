@@ -299,7 +299,7 @@ fn test_hyperp_init_market_with_valid_price() {
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(
         &slab_data[FEED_ID_OFF..FEED_ID_OFF + 32],
-        &[0u8; 32],
+        [0u8; 32],
         "Hyperp market must store zeroed feed id"
     );
     assert_eq!(
@@ -458,19 +458,16 @@ fn test_hyperp_init_market_with_inverted_price() {
     let index = config.last_effective_price_e6;
     let cap_off = common::ENGINE_OFFSET + 32 + 160;
     let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
-    const FEED_ID_OFF: usize = 136 + 64;
-    const INVERT_OFF: usize = 136 + 107;
     let used_off = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(
-        &slab_data[FEED_ID_OFF..FEED_ID_OFF + 32],
-        &[0u8; 32],
+        config.index_feed_id, [0u8; 32],
         "Hyperp market must store zeroed feed id"
     );
     assert_eq!(
-        slab_data[INVERT_OFF], 1,
+        config.invert, 1,
         "invert flag should be 1 for inverted Hyperp init"
     );
     assert_eq!(
@@ -781,8 +778,7 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     // Read last_effective_price_e6 (index) from slab. In a flat market,
     // same-slot target adoption is permitted and should move toward the mark.
     let slab_data = svm.get_account(&slab).unwrap().data;
-    const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
-    let index_after = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
+    let index_after = percolator_prog::state::read_config(&slab_data).last_effective_price_e6;
     assert!(
         index_after >= initial_price_e6,
         "flat same-slot crank should not move away from the target: initial={} after={}",
@@ -839,17 +835,13 @@ fn test_hyperp_index_smoothing_rate_limited() {
     env.try_push_oracle_price(&admin, 200_000_000, 200)
         .expect("push");
 
-    let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
-
     // Advance 10 slots and crank. Index should move toward mark.
     let dt: u64 = 10;
     env.set_slot(dt); // set_slot adds 100 internally for monotonicity
     env.crank();
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    let index_after_crank =
-        u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
+    let index_after_crank = percolator_prog::state::read_config(&slab_data).last_effective_price_e6;
 
     // Max allowed movement: index * cap * dt / 1_000_000
     let max_delta = initial_price as u128 * cap as u128 * dt as u128 / 1_000_000;
@@ -884,7 +876,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
     let index_after_same_slot =
-        u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
+        percolator_prog::state::read_config(&slab_data).last_effective_price_e6;
 
     assert!(
         index_after_same_slot >= index_before_same_slot,
@@ -1228,14 +1220,10 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     println!("FUNDING ANTI-RETROACTIVITY UpdateConfig: PASSED");
 }
 
-/// Oracle observation monotonicity (graceful policy): a Pyth update
-/// with a `publish_time` older than the last accepted observation
-/// must NOT advance the stored baseline or timestamp, but it also
-/// must not fail the caller's tx. The wrapper substitutes the stored
-/// `last_effective_price_e6` so callers who signed before a newer
-/// update landed (offline signers, hardware wallets, multi-sigs) can
-/// still execute against the freshest known price. Baseline-rewind
-/// is impossible regardless of what older observation is submitted.
+/// Oracle observation monotonicity: a Pyth update with a `publish_time`
+/// older than the last accepted observation must fail closed and must not
+/// advance the stored baseline or timestamp. Baseline-rewind is impossible
+/// regardless of what older observation is submitted.
 #[test]
 fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
     let mut env = TestEnv::new();
@@ -1245,23 +1233,13 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
     env.set_slot_and_price(100, 138_000_000);
     env.crank();
 
-    const LAST_ORACLE_PUB_TS_OFF: usize = 320; // HEADER_LEN(136) + last_oracle_publish_time(184)
-    const LAST_EFFECTIVE_PRICE_OFF: usize = 328; // HEADER_LEN(136) + last_effective_price_e6(192)
     let read_pub_ts = |env: &TestEnv| -> i64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
-        i64::from_le_bytes(
-            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
-                .try_into()
-                .unwrap(),
-        )
+        percolator_prog::state::read_config(&d).last_oracle_publish_time
     };
     let read_baseline = |env: &TestEnv| -> u64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
-        u64::from_le_bytes(
-            d[LAST_EFFECTIVE_PRICE_OFF..LAST_EFFECTIVE_PRICE_OFF + 8]
-                .try_into()
-                .unwrap(),
-        )
+        percolator_prog::state::read_config(&d).last_effective_price_e6
     };
     let pub_ts_before = read_pub_ts(&env);
     let baseline_before = read_baseline(&env);
@@ -1290,8 +1268,12 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
         )
         .unwrap();
 
-    // Crank must SUCCEED (graceful) — the wrapper substitutes the stored baseline.
-    env.crank();
+    // Crank must fail closed; the wrapper refuses caller-supplied older
+    // observations instead of substituting a local baseline.
+    assert!(
+        env.try_crank().is_err(),
+        "older oracle observation must be rejected"
+    );
 
     // Neither the timestamp nor the baseline moved.
     assert_eq!(
@@ -1307,34 +1289,23 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
     );
 }
 
-/// Equal `publish_time` must succeed (caller's tx doesn't fail) but
-/// must NOT re-clamp the baseline. Replaying the same Pyth observation
-/// N times must be a no-op — otherwise an attacker can walk
-/// `last_effective_price_e6` toward the raw oracle price by one
-/// cap-step per replay.
+/// Equal `publish_time` with a different price must fail closed. Replaying
+/// a caller-mutated account at the same timestamp must not walk
+/// `last_effective_price_e6` toward the raw oracle price by one cap-step
+/// per replay.
 #[test]
 fn test_oracle_equal_publish_time_replay_does_not_walk_baseline() {
     let mut env = TestEnv::new();
     // Set a tight 1% cap so each cap-step would be visible.
     env.init_market_with_cap(0, 80);
 
-    const LAST_ORACLE_PUB_TS_OFF: usize = 320;
-    const LAST_EFFECTIVE_PRICE_OFF: usize = 328; // HEADER_LEN(136) + last_effective_price_e6(192) (v12.19)
     let read_pub_ts = |env: &TestEnv| -> i64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
-        i64::from_le_bytes(
-            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
-                .try_into()
-                .unwrap(),
-        )
+        percolator_prog::state::read_config(&d).last_oracle_publish_time
     };
     let read_baseline = |env: &TestEnv| -> u64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
-        u64::from_le_bytes(
-            d[LAST_EFFECTIVE_PRICE_OFF..LAST_EFFECTIVE_PRICE_OFF + 8]
-                .try_into()
-                .unwrap(),
-        )
+        percolator_prog::state::read_config(&d).last_effective_price_e6
     };
 
     // Genesis Pyth at price 100, accepted at init.
@@ -1360,10 +1331,13 @@ fn test_oracle_equal_publish_time_replay_does_not_walk_baseline() {
         )
         .unwrap();
 
-    // Replay the same publish_time N times. Each crank must succeed
-    // but baseline + timestamp must not advance.
+    // Replay the same publish_time N times with a conflicting price. Each
+    // crank must fail closed, and baseline + timestamp must not advance.
     for _ in 0..10 {
-        env.crank();
+        assert!(
+            env.try_crank().is_err(),
+            "same-timestamp conflicting oracle observation must be rejected"
+        );
     }
 
     assert_eq!(

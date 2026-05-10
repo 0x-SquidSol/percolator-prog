@@ -25,17 +25,17 @@ pub use std::path::PathBuf;
 // --features medium` for MAX_ACCOUNTS=1024, or no flag for the
 // default MAX_ACCOUNTS=4096.
 #[cfg(all(feature = "small", not(feature = "medium")))]
-pub const SLAB_LEN: usize = 111376;
+pub const SLAB_LEN: usize = 111520;
 #[cfg(all(feature = "small", not(feature = "medium")))]
 pub const MAX_ACCOUNTS: usize = 256;
 
 #[cfg(all(feature = "medium", not(feature = "small")))]
-pub const SLAB_LEN: usize = 440176;
+pub const SLAB_LEN: usize = 440320;
 #[cfg(all(feature = "medium", not(feature = "small")))]
 pub const MAX_ACCOUNTS: usize = 1024;
 
 #[cfg(not(any(feature = "small", feature = "medium")))]
-pub const SLAB_LEN: usize = 1755376;
+pub const SLAB_LEN: usize = 1755520;
 #[cfg(not(any(feature = "small", feature = "medium")))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
@@ -64,7 +64,7 @@ pub const DEFAULT_INIT_CAPITAL: u64 = DEFAULT_INIT_PAYMENT - DEFAULT_NEW_ACCOUNT
 
 // SBF-target RiskEngine offsets. These are not derived from native
 // `size_of` because host u128 alignment differs from SBF.
-pub const ENGINE_OFFSET: usize = 520;
+pub const ENGINE_OFFSET: usize = 664;
 pub const ENGINE_BITMAP_OFFSET: usize = 1088;
 
 #[cfg(all(feature = "small", not(feature = "medium")))]

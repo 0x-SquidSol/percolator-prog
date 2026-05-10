@@ -6642,24 +6642,13 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
     // source before trades can produce exec prices at the mark).
     env.try_push_oracle_price(&admin, 1_000_000, 1).unwrap();
 
-    // v12.19 MarketConfig layout (u128 alignment pulls fields forward):
-    //   last_mark_push_slot (u128) starts at config offset 240.
-    //   mark_ewma_last_slot (u64) is at config offset 280.
-    const MARK_EWMA_LAST_OFF: usize = 136 + 280;
-    const LAST_MARK_PUSH_OFF: usize = 136 + 240; // low 8 bytes of u128 = slot
     let read_slots = |env: &TradeCpiTestEnv| -> (u64, u64) {
         let slab = env.svm.get_account(&env.slab).unwrap().data;
-        let e = u64::from_le_bytes(
-            slab[MARK_EWMA_LAST_OFF..MARK_EWMA_LAST_OFF + 8]
-                .try_into()
-                .unwrap(),
-        );
-        let p = u64::from_le_bytes(
-            slab[LAST_MARK_PUSH_OFF..LAST_MARK_PUSH_OFF + 8]
-                .try_into()
-                .unwrap(),
-        );
-        (e, p)
+        let config = percolator_prog::state::read_config(&slab);
+        (
+            config.mark_ewma_last_slot,
+            config.last_mark_push_slot as u64,
+        )
     };
 
     // Snapshot liveness slots BEFORE the test trade.
@@ -6737,6 +6726,298 @@ fn init_hyperp_with_fee_weighting(
     env.svm
         .send_transaction(tx)
         .expect("init hyperp fee-weighted market failed");
+}
+
+fn init_hyperp_with_dynamic_fee(
+    env: &mut TradeCpiTestEnv,
+    initial_mark_price_e6: u64,
+    max_trading_fee_bps: u64,
+    trade_fee_base_bps: u64,
+    mark_min_fee: u64,
+) {
+    try_init_hyperp_with_dynamic_fee(
+        env,
+        initial_mark_price_e6,
+        max_trading_fee_bps,
+        trade_fee_base_bps,
+        mark_min_fee,
+    )
+    .expect("init hyperp dynamic-fee market failed");
+}
+
+fn try_init_hyperp_with_dynamic_fee(
+    env: &mut TradeCpiTestEnv,
+    initial_mark_price_e6: u64,
+    max_trading_fee_bps: u64,
+    trade_fee_base_bps: u64,
+    mark_min_fee: u64,
+) -> Result<(), String> {
+    let admin = &env.payer;
+    let mut data = encode_init_market_hyperp_with_fees(
+        &admin.pubkey(),
+        &env.mint,
+        initial_mark_price_e6,
+        100,
+        max_trading_fee_bps,
+        mark_min_fee,
+    );
+    data.extend_from_slice(&trade_fee_base_bps.to_le_bytes());
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+fn read_market_config(env: &TradeCpiTestEnv) -> percolator_prog::state::MarketConfig {
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    percolator_prog::state::read_config(&slab.data)
+}
+
+fn two_sided_fee_for_trade(size_q: i128, exec_price_e6: u64, fee_bps: u64) -> u128 {
+    let notional = size_q.unsigned_abs() * exec_price_e6 as u128 / percolator::POS_SCALE;
+    if notional == 0 || fee_bps == 0 {
+        return 0;
+    }
+    ((notional * fee_bps as u128 + 9_999) / 10_000) * 2
+}
+
+#[test]
+fn test_hyperp_after_hours_trade_fee_matches_ewma_mark_movement() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(101);
+    let cfg_before = read_market_config(&env);
+    let insurance_before = env.read_insurance_balance();
+    let size = 100_000_000i128;
+
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        size,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("dynamic-fee Hyperp trade should execute");
+
+    let cfg_after = read_market_config(&env);
+    let insurance_after = env.read_insurance_balance();
+    let mark_move_bps = percolator_prog::policy::price_move_bps_ceil(
+        cfg_before.mark_ewma_e6,
+        cfg_after.mark_ewma_e6,
+    )
+    .unwrap();
+    assert!(
+        mark_move_bps > 0,
+        "test must produce a nonzero EWMA mark movement"
+    );
+
+    // The passive matcher used by this harness quotes buys at
+    // oracle * (1 + 15 bps): 10 bps spread + 5 bps matcher fee.
+    let exec_price = cfg_before.last_effective_price_e6 * 10_015 / 10_000;
+    let expected_fee = two_sided_fee_for_trade(size, exec_price, 1 + mark_move_bps);
+    assert_eq!(
+        insurance_after - insurance_before,
+        expected_fee,
+        "wrapper fee should be base fee + actual EWMA mark movement"
+    );
+}
+
+#[test]
+fn test_hyperp_after_hours_mark_stays_static_until_trade_then_fee_rises() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let cfg_before_wait = read_market_config(&env);
+    env.set_slot(101);
+    env.crank();
+    let cfg_after_wait = read_market_config(&env);
+    assert_eq!(
+        cfg_after_wait.mark_ewma_e6, cfg_before_wait.mark_ewma_e6,
+        "after-hours cranks without a trade observation must not move the EWMA mark"
+    );
+    assert_eq!(
+        cfg_after_wait.hyperp_mark_e6, cfg_before_wait.hyperp_mark_e6,
+        "after-hours cranks without a trade observation must not move the Hyperp mark"
+    );
+    assert_eq!(
+        cfg_after_wait.last_mark_push_slot, cfg_before_wait.last_mark_push_slot,
+        "after-hours cranks without a trade observation must not refresh mark-push liveness"
+    );
+
+    let insurance_before = env.read_insurance_balance();
+    let size = 100_000_000i128;
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        size,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("first after-hours dynamic-fee trade should execute");
+
+    let cfg_after_trade = read_market_config(&env);
+    let insurance_after = env.read_insurance_balance();
+    let mark_move_bps = percolator_prog::policy::price_move_bps_ceil(
+        cfg_after_wait.mark_ewma_e6,
+        cfg_after_trade.mark_ewma_e6,
+    )
+    .unwrap();
+    assert!(
+        mark_move_bps > 0,
+        "first after-hours trade must move the fee-weighted EWMA mark"
+    );
+    assert!(
+        cfg_after_trade.mark_ewma_last_slot > cfg_after_wait.mark_ewma_last_slot,
+        "first after-hours trade must stamp a fresh EWMA observation"
+    );
+
+    // The passive matcher used by this harness quotes buys at
+    // oracle * (1 + 15 bps): 10 bps spread + 5 bps matcher fee.
+    let exec_price = cfg_after_wait.last_effective_price_e6 * 10_015 / 10_000;
+    let base_only_fee = two_sided_fee_for_trade(size, exec_price, 1);
+    let expected_fee = two_sided_fee_for_trade(size, exec_price, 1 + mark_move_bps);
+    let actual_fee = insurance_after - insurance_before;
+    assert!(
+        actual_fee > base_only_fee,
+        "dynamic after-hours fee must rise above the base fee when the mark moves"
+    );
+    assert_eq!(
+        actual_fee, expected_fee,
+        "dynamic after-hours fee should be base fee plus actual EWMA mark movement"
+    );
+}
+
+#[test]
+fn test_hyperp_dynamic_fee_init_rejects_deployer_cap_below_hard_bound() {
+    let mut env = TradeCpiTestEnv::new();
+    let err = try_init_hyperp_with_dynamic_fee(
+        &mut env, 1_000_000, 20, // deployer cap below hard 10_000 bps headroom
+        1,  // base < max means dynamic mode
+        0,
+    )
+    .expect_err("dynamic fee mode must reject deployer fee caps below hard headroom");
+    assert!(
+        err.contains("InvalidConfigParam") || err.contains("custom program error"),
+        "unexpected rejection: {err}"
+    );
+}
+
+#[test]
+fn test_hyperp_dynamic_fee_init_rejects_base_above_cap() {
+    let mut env = TradeCpiTestEnv::new();
+    let err = try_init_hyperp_with_dynamic_fee(
+        &mut env, 1_000_000, 10, // max fee cap
+        11, // base fee above cap is nonsensical
+        0,
+    )
+    .expect_err("InitMarket must reject base fee above max fee cap");
+    assert!(
+        err.contains("InvalidConfigParam") || err.contains("custom program error"),
+        "unexpected rejection: {err}"
+    );
+}
+
+#[test]
+fn test_hyperp_after_hours_tiny_fill_rejects_only_above_engine_hard_bound() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(101);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        10_000_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("setup trade should open a very large existing book");
+
+    env.set_slot(102);
+    let cfg_before = read_market_config(&env);
+    let insurance_before = env.read_insurance_balance();
+    let err = env
+        .try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            1_000_000, // tiny fill relative to the now-open book
+            &matcher_prog,
+            &matcher_ctx,
+        )
+        .expect_err("tiny fill should reject when required fee exceeds hard bound");
+
+    assert!(
+        err.contains("InvalidConfigParam") || err.contains("custom program error"),
+        "unexpected rejection: {err}"
+    );
+    let cfg_after = read_market_config(&env);
+    assert_eq!(
+        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
+        "rejected tiny-fill attack must not move the EWMA mark"
+    );
+    assert_eq!(
+        cfg_after.last_mark_push_slot, cfg_before.last_mark_push_slot,
+        "rejected tiny-fill attack must not refresh Hyperp liveness"
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "rejected tiny-fill attack must not collect fees"
+    );
 }
 
 fn read_hyperp_liveness_slots(env: &TradeCpiTestEnv) -> (u64, u64) {

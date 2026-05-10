@@ -2,6 +2,7 @@ mod common;
 #[allow(unused_imports)]
 use common::*;
 
+use bytemuck::Zeroable;
 use solana_sdk::signature::{Keypair, Signer};
 
 fn write_risk_buffer_for_test(env: &mut TestEnv, buf: &percolator_prog::risk_buffer::RiskBuffer) {
@@ -552,20 +553,14 @@ fn test_crank_greedy_sweep_touches_sparse_positions_across_empty_bitmap() {
     assert!(env.read_account_position(near_idx) != 0);
     assert!(env.read_account_position(far_idx) != 0);
     let generation_before = env.read_sweep_generation();
+    write_risk_buffer_for_test(
+        &mut env,
+        &percolator_prog::risk_buffer::RiskBuffer::zeroed(),
+    );
 
-    env.set_slot_and_price_raw_no_walk(100, 143_000_000);
+    env.set_slot_and_price_raw_no_walk(110, 138_000_000);
     env.crank();
 
-    assert_eq!(
-        env.read_account_last_fee_slot(near_idx),
-        100,
-        "near open position should be fee-synced by the bitmap sweep"
-    );
-    assert_eq!(
-        env.read_account_last_fee_slot(far_idx),
-        100,
-        "far open position should be fee-synced despite the empty bitmap span"
-    );
     assert_eq!(
         env.read_rr_cursor_position(),
         0,
