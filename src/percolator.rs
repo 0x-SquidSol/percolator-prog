@@ -6936,6 +6936,12 @@ pub mod processor {
             engine.sync_account_fee_to_slot_not_atomic(a, now_slot, maintenance_fee_per_slot)?;
             engine.sync_account_fee_to_slot_not_atomic(b, now_slot, maintenance_fee_per_slot)?;
         }
+        // FIX-8 (CRITICAL DRIFT): use the computed admit_threshold.
+        // Was: `admit_threshold` was bound but discarded — `None` was
+        // passed to engine.execute_trade_not_atomic, defeating the
+        // v12.19 admission gate. Now we thread the
+        // maintenance_margin_bps through so the engine's 10th arg
+        // actually consumes against maintenance margin during admission.
         let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
         engine.execute_trade_not_atomic(
             a,
@@ -6947,7 +6953,7 @@ pub mod processor {
             funding_rate_e9,
             admit_h_min,
             admit_h_max,
-            None, /* v12.19: 9->10 args (added admit_h_max_consumption_threshold_bps_opt) */
+            admit_threshold,
         )
     }
 
@@ -11912,7 +11918,15 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         amount: u64,
     ) -> ProgramResult {
-        accounts::expect_len(accounts, 9)?;
+        // FIX-5 (HIGH DRIFT): accept either 9 or 10 accounts so the
+        // creator-lock branch at line 12059 (`if accounts.len() >= 10`)
+        // is reachable. The prior `expect_len(accounts, 9)` rejected
+        // every 10-account form before the creator-lock code path
+        // could run — depositors who created the LP vault could not
+        // accumulate creator-lock state via this entry.
+        if accounts.len() != 9 && accounts.len() != 10 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
         let a_depositor = &accounts[0];
         let a_slab = &accounts[1];
         let a_depositor_ata = &accounts[2];
