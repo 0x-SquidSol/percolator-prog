@@ -2354,7 +2354,7 @@ pub mod ix {
         let h_min = read_u64(input)?;
         let maintenance_margin_bps = read_u64(input)?;
         let initial_margin_bps = read_u64(input)?;
-        let trading_fee_bps = read_u64(input)?;
+        let max_trading_fee_bps = read_u64(input)?;
         let max_accounts = read_u64(input)?;
         // Wrapper-charged new-account fee (base units). At InitUser/InitLP
         // the wrapper splits `fee_payment` into two parts: `new_account_fee`
@@ -2390,7 +2390,7 @@ pub mod ix {
         let params = RiskParams {
             maintenance_margin_bps,
             initial_margin_bps,
-            trading_fee_bps,
+            max_trading_fee_bps,
             max_accounts,
             liquidation_fee_bps,
             liquidation_fee_cap,
@@ -4777,7 +4777,7 @@ pub mod processor {
         size: i128,
         funding_rate_e9: i128,
         lp_account_id: u64,
-        _maintenance_fee_per_slot: u128,
+        trade_fee_bps: u64,
     ) -> Result<(), RiskError> {
         let lp = &engine.accounts[lp_idx as usize];
         let exec = matcher.execute_match(
@@ -4813,6 +4813,7 @@ pub mod processor {
             abs_size,
             exec.price,
             funding_rate_e9,
+            trade_fee_bps,
             admit_h_min,
             admit_h_max,
             admit_threshold,
@@ -5559,7 +5560,7 @@ pub mod processor {
                     {
                         return Err(ProgramError::InvalidInstructionData);
                     }
-                    if p.trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
+                    if p.max_trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     if p.min_nonzero_mm_req == 0
@@ -6458,18 +6459,49 @@ pub mod processor {
                 };
                 let partial_target =
                     oversized_catchup_target(engine, clock.slot, raw_target, funding_rate_e9_pre)?;
+                let has_liquidation_hint = combined.iter().any(|&(_, policy)| policy.is_some());
                 let (crank_slot, crank_price, partial_catchup, rr_window_size, rr_scan_limit) =
-                    if partial_target.is_some() {
-                        let rr_window_size = if candidates.is_empty() {
+                    if let Some(segment_slot) = partial_target {
+                        let segment_dt = segment_slot.saturating_sub(engine.last_market_slot);
+                        let segment_price = oracle::effective_price_from_target(
+                            engine.last_oracle_price,
+                            raw_target,
+                            engine.params.max_price_move_bps_per_slot,
+                            segment_dt,
+                            oi_any,
+                        );
+                        let rr_window_size = if has_liquidation_hint {
+                            0
+                        } else if candidates.is_empty() {
                             crate::constants::RR_WINDOW_PER_CRANK
                         } else {
                             crate::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK
                         };
-                        let rr_scan_limit = core::cmp::min(
-                            crate::constants::RR_SCAN_LIMIT_PER_CRANK,
-                            engine.params.max_accounts,
-                        );
-                        (clock.slot, price, true, rr_window_size, rr_scan_limit)
+                        let rr_scan_limit = if has_liquidation_hint {
+                            0
+                        } else {
+                            core::cmp::min(
+                                crate::constants::RR_SCAN_LIMIT_PER_CRANK,
+                                engine.params.max_accounts,
+                            )
+                        };
+                        let progress_slot = if has_liquidation_hint {
+                            // Candidate liquidation is evaluated at the bounded
+                            // segment that was just accrued. Using the full
+                            // authenticated wall-clock slot here makes the
+                            // engine loss-stale and can turn honest liquidation
+                            // hints into touches until a later non-partial crank.
+                            segment_slot
+                        } else {
+                            clock.slot
+                        };
+                        (
+                            progress_slot,
+                            segment_price,
+                            true,
+                            rr_window_size,
+                            rr_scan_limit,
+                        )
                     } else {
                         let rr_window_size = if candidates.is_empty() {
                             crate::constants::RR_WINDOW_PER_CRANK
@@ -6486,21 +6518,12 @@ pub mod processor {
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
                 let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
-                let bounded_engine_candidates;
+                let bounded_engine_candidates = combined
+                    .iter()
+                    .map(|&(idx, policy)| (idx, policy))
+                    .collect::<alloc::vec::Vec<_>>();
                 let engine_candidates: &[(u16, Option<percolator::LiquidationPolicy>)] =
-                    if partial_catchup {
-                        bounded_engine_candidates = combined
-                            .iter()
-                            .map(|&(idx, _policy)| (idx, None))
-                            .collect::<alloc::vec::Vec<_>>();
-                        &bounded_engine_candidates
-                    } else {
-                        bounded_engine_candidates = combined
-                            .iter()
-                            .map(|&(idx, policy)| (idx, policy))
-                            .collect::<alloc::vec::Vec<_>>();
-                        &bounded_engine_candidates
-                    };
+                    &bounded_engine_candidates;
                 let progress_outcome = engine
                     .permissionless_progress_not_atomic(percolator::PermissionlessProgressRequest {
                         now_slot: crank_slot,
@@ -6950,7 +6973,7 @@ pub mod processor {
                 // mark is stickier during volatile loss-absorption events, never
                 // more manipulable. A future engine API could expose fee_paid directly.
                 let current_fee_paid_cap =
-                    current_trade_fee_paid_cap(size, price, engine.params.trading_fee_bps)?;
+                    current_trade_fee_paid_cap(size, price, engine.params.max_trading_fee_bps)?;
                 let ins_before = engine.insurance_fund.balance.get();
 
                 #[cfg(feature = "cu-audit")]
@@ -6968,7 +6991,7 @@ pub mod processor {
                     size,
                     funding_rate_e9,
                     0, // NoOpMatcher ignores lp_account_id
-                    0,
+                    engine.params.max_trading_fee_bps,
                 )
                 .map_err(map_risk_error)?;
 
@@ -7530,7 +7553,7 @@ pub mod processor {
                     let band_bps = {
                         let data_ref = a_slab.try_borrow_data()?;
                         let engine_ref = zc::engine_ref(&data_ref)?;
-                        let fee_bps = engine_ref.params.trading_fee_bps;
+                        let fee_bps = engine_ref.params.max_trading_fee_bps;
                         core::cmp::max(fee_bps.saturating_mul(2), 100) // at least 1%
                     };
                     let diff = if exec_price > price {
@@ -7583,7 +7606,7 @@ pub mod processor {
                     let current_fee_paid_cap = current_trade_fee_paid_cap(
                         trade_size,
                         exec_price,
-                        engine.params.trading_fee_bps,
+                        engine.params.max_trading_fee_bps,
                     )?;
 
                     // Snapshot insurance for fee-weighted EWMA (delta approach).
@@ -7613,7 +7636,7 @@ pub mod processor {
                         trade_size,
                         funding_rate_e9_pre,
                         lp_account_id,
-                        0,
+                        engine.params.max_trading_fee_bps,
                     )
                     .map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]

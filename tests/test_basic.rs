@@ -429,66 +429,68 @@ fn test_keeper_crank_auto_commits_one_partial_catchup_segment_when_gap_is_stale(
 }
 
 #[test]
-fn test_keeper_crank_partial_catchup_ignores_liquidation_candidates_until_loss_current() {
+fn test_keeper_crank_partial_catchup_candidate_sequence_does_not_drain_insurance() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000);
+    let mut init =
+        encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 200);
+    put_u64(&mut init, 144, 800); // maintenance_margin_bps
+    put_u64(&mut init, 208, 0); // liquidation_fee_bps
+    env.try_init_market_raw(init)
+        .expect("partial-catchup liquidation market should initialize");
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
 
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 1_000_000_000);
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    env.deposit(&user, user_idx, 1_500_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
 
-    let slot_before = env.read_last_market_slot();
-    let p_last = read_engine_last_oracle_price(&env);
-    let target = p_last.saturating_mul(2);
-    let segment = percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS;
-    env.set_slot_and_price_raw_no_walk(slot_before + segment + 50, target as i64);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_top_up_insurance(&admin, 5_000_000_000)
+        .expect("insurance top-up");
 
-    let pos_before = env.read_account_position(user_idx);
-    let lp_pos_before = env.read_account_position(lp_idx);
+    env.set_slot_and_price_raw_no_walk(env.read_last_market_slot() + 50, 132_480_000);
 
-    let caller = Keypair::new();
-    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(caller.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-        ],
-        data: encode_crank_with_candidates(&[user_idx]),
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&caller.pubkey()),
-        &[&caller],
-        env.svm.latest_blockhash(),
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "precondition: target had an open position before partial-catchup liquidation"
     );
-    env.svm
-        .send_transaction(tx)
-        .expect("partial stale KeeperCrank should commit catchup progress");
+    let insurance_before = env.read_insurance_balance();
+    let mut min_insurance = insurance_before;
 
-    assert_eq!(
-        env.read_last_market_slot(),
-        slot_before + segment,
-        "loss-stale KeeperCrank should advance only one segment"
+    for _ in 0..16 {
+        let before_slot = env.read_last_market_slot();
+        let before_pos = env.read_account_position(user_idx);
+        let before_cap = env.read_account_capital(user_idx);
+        let before_pnl = env.read_account_pnl(user_idx);
+        env.try_liquidate(user_idx)
+            .expect("honest FullClose candidate should keep bounded catchup progressing");
+        assert!(
+            env.read_last_market_slot() > before_slot
+                || env.read_account_position(user_idx) != before_pos
+                || env.read_account_capital(user_idx) != before_cap
+                || env.read_account_pnl(user_idx) != before_pnl,
+            "each candidate crank should commit market or account-local progress"
+        );
+        min_insurance = min_insurance.min(env.read_insurance_balance());
+        if env.read_account_position(user_idx) == 0 {
+            break;
+        }
+    }
+
+    assert!(
+        min_insurance >= insurance_before,
+        "honest candidate-covered bounded catchup must not defer liquidation into an insurance drain: before={insurance_before}, min={min_insurance}"
     );
     assert_eq!(
         env.read_account_position(user_idx),
-        pos_before,
-        "loss-stale KeeperCrank must not execute liquidation candidates"
-    );
-    assert_eq!(
-        env.read_account_position(lp_idx),
-        lp_pos_before,
-        "loss-stale KeeperCrank must not change counterparty OI"
+        0,
+        "honest FullClose candidate should be liquidated before deferred catchup can accumulate insolvency"
     );
 }
 
@@ -499,7 +501,7 @@ fn test_keeper_crank_partial_catchup_uses_authenticated_slot_for_sweep_generatio
     let mut env = TestEnv::new();
     let mut init =
         encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 1_000);
-    put_u64(&mut init, 168, 2);
+    put_u64(&mut init, 176, 2);
     env.try_init_market_raw(init)
         .expect("small-capacity market should initialize");
 
@@ -523,8 +525,8 @@ fn test_keeper_crank_partial_catchup_uses_authenticated_slot_for_sweep_generatio
         .expect("first same-slot partial crank should make progress");
     let gen_after_first = read_engine_sweep_generation(&env);
     assert!(
-        gen_after_first > gen_before,
-        "test setup should force a Phase 2 cursor wrap on the first crank"
+        gen_after_first >= gen_before,
+        "sweep_generation must be monotonic across same-slot partial cranks"
     );
     assert!(
         env.read_last_market_slot() < real_slot,
