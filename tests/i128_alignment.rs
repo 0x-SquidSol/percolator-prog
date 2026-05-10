@@ -26,7 +26,9 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1484728; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
+// Wave 4c bumped +8 to track Wave 4a bankrupt-close gate fields
+// (engine PR #92 @ de6e1686). Cumulative +24 from pre-Wave-1.
+const SLAB_LEN: usize = 1484736; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

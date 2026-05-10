@@ -1509,6 +1509,12 @@ pub mod error {
         InvalidConfigParam,
         HyperpTradeNoCpiDisabled,
         EngineCorruptState,
+        /// Wave 4c: engine signalled an active bankrupt-close gate
+        /// (`RiskError::RecoveryRequired`). Gated handlers
+        /// (resolve_market, withdraw_live_insurance, sync_account_fee_to_slot)
+        /// refuse until the operator clears `active_close_present` via the
+        /// Wave 5b state-machine path. Always-clean on the gate-only branch.
+        EngineRecoveryRequired,
         // ── Fork-specific error variants ─────────────────────────────────────
         MarketPaused,
         LpVaultInvalidFeeShare,
@@ -1565,6 +1571,7 @@ pub mod error {
             RiskError::AccountNotFound => PercolatorError::EngineAccountNotFound,
             RiskError::SideBlocked => PercolatorError::EngineRiskReductionOnlyMode,
             RiskError::CorruptState => PercolatorError::EngineCorruptState,
+            RiskError::RecoveryRequired => PercolatorError::EngineRecoveryRequired,
         };
         ProgramError::Custom(err as u32)
     }
