@@ -83,6 +83,36 @@ pub mod constants {
     pub const MIN_INIT_MARKET_SEED: u64 = 0;
     pub const MIN_INIT_MARKET_SEED_LAMPORTS: u64 = MIN_INIT_MARKET_SEED;
 
+    // PORT-23 (toly src/percolator.rs:237-238). Confidence-filter bounds
+    // enforced at InitMarket. Toly's prose: "Disabling confidence checks
+    // is too sharp for public deployments; wide confidence bands are
+    // equivalent to accepting a low-quality oracle."
+    pub const MIN_CONF_FILTER_BPS: u16 = 50;
+    pub const MAX_CONF_FILTER_BPS: u16 = 1_000;
+    /// PORT-23 (toly src/percolator.rs:243). InitMarket upper bound on
+    /// oracle staleness, named so loose-constants policy can adjust the
+    /// bound centrally.
+    ///
+    /// PERCOLATOR-FORK-SPECIFIC: numerical value KEPT at fork's historical
+    /// 7-day ceiling rather than toly's 600 sec. Tightening to 10 minutes
+    /// would invalidate every test fixture (all use 86_400) and require
+    /// a deployer migration that's out of scope for this wrapper sync.
+    /// Phase-4 follow-up should evaluate tightening (toly's argument:
+    /// "a market that tolerates hours/days of stale oracle data lets the
+    /// admin choose a liveness footgun users cannot distinguish at
+    /// runtime from an intentionally permissive market").
+    pub const MAX_ORACLE_STALENESS_SECS: u64 = 7 * 86_400;
+    /// PORT-23 (toly src/percolator.rs:275). Upper bound on `h_max`. h_max
+    /// is independent from `max_accrual_dt_slots` and oracle staleness.
+    /// 6_480_000 slots ≈ 30 days at 400 ms/slot.
+    pub const MAX_PROFIT_MATURITY_SLOTS: u64 = 6_480_000;
+    /// PORT-23 (toly src/percolator.rs:304). Maximum hard oracle-staleness
+    /// horizon for permissionless market resolution. Decoupled from
+    /// `MAX_ACCRUAL_DT_SLOTS` (the resolution horizon is a product
+    /// liveness bound, not an accrual envelope; Degenerate path uses
+    /// cached price).
+    pub const MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 6_480_000;
+
     pub const fn align_up(x: usize, a: usize) -> usize {
         (x + (a - 1)) & !(a - 1)
     }
@@ -1143,6 +1173,18 @@ pub mod policy {
             external_target_e6
         };
         target == 0 || target == effective_price_e6
+    }
+
+    /// PORT-23 (toly src/percolator.rs:1264). Permissionless resolution
+    /// horizon predicate: 0 (feature disabled) or value bounded by
+    /// MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS. Decoupled from
+    /// MAX_ACCRUAL_DT_SLOTS — the two paths are deliberately separate:
+    /// the resolution horizon is a product liveness bound, not an
+    /// accrual envelope.
+    #[inline]
+    pub fn permissionless_resolve_horizon_ok(stale_slots: u64) -> bool {
+        stale_slots == 0
+            || stale_slots <= crate::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS
     }
 
     /// PORT-3-supporting (toly src/percolator.rs:846). Fee sync must never
@@ -5945,7 +5987,11 @@ pub mod processor {
         RiskEngine, RiskError, RiskParams, I128, U128, ADL_ONE, MAX_ACCOUNTS,
     };
     #[allow(unused_imports)]
-    use crate::constants::{ENGINE_OFF, ENGINE_LEN, HEADER_LEN};
+    use crate::constants::{
+        ENGINE_OFF, ENGINE_LEN, HEADER_LEN,
+        MIN_CONF_FILTER_BPS, MAX_CONF_FILTER_BPS,
+        MAX_ORACLE_STALENESS_SECS, MAX_PROFIT_MATURITY_SLOTS,
+    };
 
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
     // which handles K-pair PnL, checked arithmetic, and all settlement internally.
@@ -7797,8 +7843,13 @@ pub mod processor {
         if invert > 1 {
             return Err(ProgramError::InvalidInstructionData);
         }
-        // conf_filter_bps: 0..=10_000 (0 = disabled, 10_000 = 100%)
-        if conf_filter_bps > 10_000 {
+        // PORT-23 Hunk 1 (SF MEDIUM). Reject `conf_filter_bps == 0` (was
+        // previously allowed; disables confidence checks entirely) and
+        // tighten upper bound to MAX_CONF_FILTER_BPS = 1_000. A
+        // wide-conf feed is equivalent to accepting a low-quality oracle.
+        if conf_filter_bps < MIN_CONF_FILTER_BPS
+            || conf_filter_bps > MAX_CONF_FILTER_BPS
+        {
             return Err(ProgramError::InvalidInstructionData);
         }
         // Validate unit_scale: reject huge values that make most deposits credit 0 units
@@ -7827,10 +7878,12 @@ pub mod processor {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        // max_staleness_secs: reject 0 and unreasonable values.
-        // 0 would brick oracle reads. >7 days is clearly misconfigured —
-        // u64::MAX would effectively disable staleness checks entirely.
-        if max_staleness_secs == 0 || max_staleness_secs > 7 * 86400 {
+        // PORT-23 Hunk 2 (DRIFT LOW): replace inline `7 * 86400` literal
+        // with MAX_ORACLE_STALENESS_SECS named constant so loose-constants
+        // policy can adjust the bound centrally. PERCOLATOR-FORK-SPECIFIC
+        // numerical value KEPT at fork's 7-day ceiling rather than
+        // toly's 600 sec — see constant definition for rationale.
+        if max_staleness_secs == 0 || max_staleness_secs > MAX_ORACLE_STALENESS_SECS {
             return Err(ProgramError::InvalidInstructionData);
         }
 
@@ -7875,16 +7928,32 @@ pub mod processor {
         }
         // maintenance_fee_per_slot removed from engine in v12.15
 
-        // Permissionless resolve: if enabled, must exceed max_crank_staleness
-        // to prevent accidental instant-resolution from one missed crank.
-        if permissionless_resolve_stale_slots > 0
-            && permissionless_resolve_stale_slots <= risk_params.max_accrual_dt_slots
-        {
-            return Err(ProgramError::InvalidInstructionData);
+        // PORT-23 Hunk 6 (SF MEDIUM): replace fork's prior coupling check
+        // (`stale_slots <= max_accrual_dt_slots`) with toly's
+        // permissionless_resolve_horizon_ok policy. The resolution
+        // horizon is INDEPENDENT of the accrual envelope (Degenerate
+        // path uses cached price, not live accrual), and the policy
+        // also enforces an upper bound MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS
+        // so admin can't lock funds for years.
+        if !crate::policy::permissionless_resolve_horizon_ok(
+            permissionless_resolve_stale_slots,
+        ) {
+            return Err(PercolatorError::InvalidConfigParam.into());
         }
-        // Liveness: if permissionless resolution is enabled, force_close must
-        // also be enabled. Otherwise abandoned accounts on resolved markets
-        // with burned admin have no cleanup path.
+        // PORT-23 Hunk 7 (SF HIGH): non-Hyperp markets MUST have
+        // permissionless resolution enabled. Otherwise the only
+        // resolve path is admin-resolve, and a later UpdateAuthority
+        // burn (admin → Pubkey::zero()) leaves the market permanently
+        // un-resolvable — positions and insurance funds stranded
+        // forever ("bricked-on-burn" stranded-funds class).
+        let is_hyperp_check = index_feed_id == [0u8; 32];
+        if !is_hyperp_check && permissionless_resolve_stale_slots == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        // PERCOLATOR-FORK-SPECIFIC: liveness — if permissionless
+        // resolution is enabled, force_close must also be enabled.
+        // Otherwise abandoned accounts on resolved markets with burned
+        // admin have no cleanup path. Fork-only invariant; no toly KL.
         if permissionless_resolve_stale_slots > 0 && force_close_delay_slots == 0 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -7948,14 +8017,36 @@ pub mod processor {
         let a_clock = &accounts[5];
         let a_oracle = &accounts[7];
         let clock = Clock::from_account_info(a_clock)?;
-        // Engine v12 requires init_oracle_price > 0.
-        // Hyperp: use the normalized initial mark price.
-        // Non-Hyperp: use 1 as sentinel — the real oracle price is
-        // established on the first KeeperCrank via accrue_market_to.
-        // This is safe because no trades can happen before a crank
-        // (require_fresh_crank gate in engine), and the first
-        // accrue_market_to overwrites last_oracle_price.
-        let init_price = if is_hyperp { initial_mark_price_e6 } else { 1 };
+        // PORT-23 Hunk 9 (SF HIGH): seed engine.last_oracle_price with a
+        // real economic value at InitMarket time for non-Hyperp markets,
+        // and capture publish_time as a monotonicity baseline (used by
+        // read_price_and_stamp's monotonic-publish-time gate).
+        //
+        // Was: `init_price = 1` sentinel meaning "real price comes later
+        // from KeeperCrank". This violated spec goal 38 (no valid
+        // positive price may encode "no price yet"). Consequences:
+        // every check that read `engine.last_oracle_price > 0` got `1`
+        // — distorting clamp_oracle_price baselines, mark EWMA, and
+        // any code path that early-returned on positive prices.
+        // `last_oracle_publish_time = 0` defeated replay protection
+        // from genesis.
+        let (init_price, init_publish_time) = if is_hyperp {
+            (initial_mark_price_e6, 0i64)
+        } else {
+            let (fresh, publish_time) = oracle::read_engine_price_e6(
+                a_oracle,
+                &index_feed_id,
+                clock.unix_timestamp,
+                max_staleness_secs,
+                conf_filter_bps,
+                invert,
+                unit_scale,
+            )?;
+            if fresh == 0 || fresh > percolator::MAX_ORACLE_PRICE {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            (fresh, publish_time)
+        };
 
         // Prevalidate all engine RiskParams invariants to return
         // ProgramError instead of panicking inside engine.init_in_place().
@@ -7974,7 +8065,17 @@ pub mod processor {
             }
             // v12.19: public live warmup floor must be >= 1; h_min == 0
             // would short-circuit the spec §6.1 admission gate.
-            if p.h_min == 0 || p.h_max < p.h_min {
+            // PORT-23 Hunk 3 (SF MEDIUM): also reject h_max == 0
+            // explicitly (was only blocked transitively via h_min >= 1)
+            // and bound h_max from above by MAX_PROFIT_MATURITY_SLOTS so
+            // admin can't deploy with arbitrarily large h_max and let the
+            // §6.1 admission gate consume from a near-infinite warmup
+            // budget.
+            if p.h_min == 0
+                || p.h_max == 0
+                || p.h_max < p.h_min
+                || p.h_max > MAX_PROFIT_MATURITY_SLOTS
+            {
                 return Err(PercolatorError::InvalidConfigParam.into());
             }
             // v12.19: min_initial_deposit, insurance_floor, new_account_fee
@@ -8037,7 +8138,9 @@ pub mod processor {
             // hyperp_mark_e6 (set by PushHyperpMark on tag 16/17 retired path).
             hyperp_authority: [0u8; 32],
             hyperp_mark_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-            last_oracle_publish_time: 0,
+            // PORT-23 Hunk 9: seed publish_time from the InitMarket oracle
+            // read so subsequent reads can't rewind below genesis.
+            last_oracle_publish_time: init_publish_time,
             // Oracle price circuit breaker
             // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
             // Default: disabled for non-Hyperp, 1% per slot for Hyperp
