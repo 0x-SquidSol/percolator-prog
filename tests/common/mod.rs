@@ -27,9 +27,13 @@ pub use std::path::PathBuf;
 // v12.19 sync: wrapper logged `0x1747d8 = 1_525_208` as compile-time SLAB_LEN.
 // Wave 1 (engine PR #91 @ 8e3df3db) added 16 bytes to RiskEngine
 // (oracle_target_price_e6 + oracle_target_publish_time), bumping wrapper
-// compile-time SLAB_LEN to `0x1747e8 = 1_525_224`. The large-tier default
-// still needs the historical +512 byte LiteSVM padding, so the constant
-// is `1_525_224 + 512 = 1_525_736`.
+// compile-time SLAB_LEN to `0x1747e8 = 1_525_224`.
+// Wave 4a (engine PR #92 @ de6e1686) added 8 more bytes
+// (bankruptcy_hmax_lock_active + active_close_present + alignment),
+// bumping wrapper compile-time SLAB_LEN to `0x1747f0 = 1_525_232`.
+// The large-tier default still needs the historical +512 byte LiteSVM
+// padding, so the constant is `1_525_232 + 512 = 1_525_744`.
+// Cumulative +24 from pre-Wave-1.
 //
 // Small-tier carries pre-existing drift (program logs 0x17a10 = 96_784
 // vs hardcoded 96_760) that pre-dates Wave 1; use --features small only
@@ -41,7 +45,7 @@ pub const SLAB_LEN: usize = 96_760;
 pub const MAX_ACCOUNTS: usize = 256;
 
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-pub const SLAB_LEN: usize = 1_525_224 + 512;
+pub const SLAB_LEN: usize = 1_525_232 + 512;
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 

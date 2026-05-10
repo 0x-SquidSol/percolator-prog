@@ -43,25 +43,31 @@ use std::path::PathBuf;
 // `init_market` catches it and prints both sides so you know which one is
 // wrong.
 
+// Wave 4c: each tier's SLAB_LEN is wrapper compile-time
+// `GEN_TABLE_OFF + GEN_TABLE_LEN` where `GEN_TABLE_OFF` includes
+// `size_of::<RiskEngine>()`. Wave 4a (engine PR #92 @ de6e1686) added
+// `bankruptcy_hmax_lock_active: bool` + `active_close_present: u8`
+// to `RiskEngine` (+8 bytes after struct alignment), so every tier
+// shifts +8 vs the Wave 1 baseline. Cumulative +24 from pre-Wave-1.
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 19640;
+const SLAB_LEN: usize = 19648;
 
 #[cfg(feature = "small")]
 const MAX_ACCOUNTS: usize = 256;
 #[cfg(feature = "small")]
-const SLAB_LEN: usize = 94168;
+const SLAB_LEN: usize = 94176;
 
 #[cfg(feature = "medium")]
 const MAX_ACCOUNTS: usize = 1024;
 #[cfg(feature = "medium")]
-const SLAB_LEN: usize = 372280;
+const SLAB_LEN: usize = 372288;
 
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
 const MAX_ACCOUNTS: usize = 4096;
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
-const SLAB_LEN: usize = 1484728;
+const SLAB_LEN: usize = 1484736;
 
 const ACCOUNTS_PER_CRANK: u16 = 128;
 // Keep this in sync with `percolator::LIQ_BUDGET_PER_CRANK`.
