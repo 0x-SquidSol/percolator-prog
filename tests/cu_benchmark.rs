@@ -43,31 +43,37 @@ use std::path::PathBuf;
 // `init_market` catches it and prints both sides so you know which one is
 // wrong.
 
-// Wave 4c: each tier's SLAB_LEN is wrapper compile-time
+// Wave 5d: each tier's SLAB_LEN is wrapper compile-time
 // `GEN_TABLE_OFF + GEN_TABLE_LEN` where `GEN_TABLE_OFF` includes
-// `size_of::<RiskEngine>()`. Wave 4a (engine PR #92 @ de6e1686) added
-// `bankruptcy_hmax_lock_active: bool` + `active_close_present: u8`
-// to `RiskEngine` (+8 bytes after struct alignment), so every tier
-// shifts +8 vs the Wave 1 baseline. Cumulative +24 from pre-Wave-1.
+// `size_of::<RiskEngine>()`. Wave 5a (engine PR #93 @ 9d167a62)
+// added stress-envelope schema (+40 bytes useful + alignment pad).
+// Wave 5b (engine PR #94 @ a67ff66d) added bankrupt-close
+// state-machine schema (+96 bytes useful + internal align pads).
+// Combined Wave 5 growth in engine fixed_prefix: ENGINE_REL_USED
+// shifted from 736 → 928 = +192 bytes. Each tier SLAB_LEN constant
+// bumps +192 to match.
+//
+// Cumulative from pre-Wave-1: +16 (Wave 1) + +8 (Wave 4a) + +192
+// (Wave 5) = +216 bytes total.
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 19648;
+const SLAB_LEN: usize = 19840;
 
 #[cfg(feature = "small")]
 const MAX_ACCOUNTS: usize = 256;
 #[cfg(feature = "small")]
-const SLAB_LEN: usize = 94176;
+const SLAB_LEN: usize = 94368;
 
 #[cfg(feature = "medium")]
 const MAX_ACCOUNTS: usize = 1024;
 #[cfg(feature = "medium")]
-const SLAB_LEN: usize = 372288;
+const SLAB_LEN: usize = 372480;
 
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
 const MAX_ACCOUNTS: usize = 4096;
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
-const SLAB_LEN: usize = 1484736;
+const SLAB_LEN: usize = 1484928;
 
 const ACCOUNTS_PER_CRANK: u16 = 128;
 // Keep this in sync with `percolator::LIQ_BUDGET_PER_CRANK`.
