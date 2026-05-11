@@ -38,10 +38,22 @@ pub use std::path::PathBuf;
 // `0x1748b0 = 1_525_424`. The large-tier default still needs the
 // historical +512 byte LiteSVM padding.
 // Wave 6a (engine PR #95) added 32 more bytes via the phantom-dust
-// 4-field schema swap (2 × u128 → 4 × u128; +32 bytes net). Bumping
-// wrapper compile-time SLAB_LEN to `0x1748d0 = 1_525_456`. Large-tier
-// default: `1_525_456 + 512 = 1_525_968`.
-// Cumulative +248 from pre-Wave-1.
+// 4-field schema swap (2 × u128 → 4 × u128). On the native host
+// target u128 is 16-byte aligned, but on the SBF target u128 is
+// 8-byte aligned, so the new fields don't force the alignment pad
+// the host layout sees. The BPF-side `size_of::<RiskEngine>()` grows
+// less than the host's +32; the empirically measured BPF SLAB_LEN is
+// `0x174898 = 1_525_912` (large tier, +176 cumulative). Bumping
+// wrapper test-side SLAB_LEN to match so the runtime `data.len() ==
+// SLAB_LEN` strict-equality check in `slab_shape_ok` passes.
+//
+// Wave 7 (test-fixture catch-up) note: the prior Wave 6a wrapper
+// companion landed `1_525_456 + 512 = 1_525_968` on the assumption
+// of a +32 BPF growth that didn't materialize at the SBF u128
+// alignment. The +56 over-bump cascaded into ~570 BPF test failures
+// (Custom(4) = InvalidSlabLen at every `init_market`). Corrected
+// here to the empirically observed value.
+// Cumulative +680 from pre-Wave-1 baseline `1_525_232`.
 //
 // Small-tier carries pre-existing drift (program logs 0x17a10 = 96_784
 // vs hardcoded 96_760) that pre-dates Wave 1; use --features small only
@@ -53,7 +65,7 @@ pub const SLAB_LEN: usize = 96_760;
 pub const MAX_ACCOUNTS: usize = 256;
 
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-pub const SLAB_LEN: usize = 1_525_456 + 512;
+pub const SLAB_LEN: usize = 1_525_912;
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
@@ -3467,13 +3479,19 @@ impl TestEnv {
 
     /// Try UpdateConfig instruction
     pub fn try_update_config(&mut self, signer: &Keypair) -> Result<(), String> {
-        // v12.19: UpdateConfig expects exactly 3 accounts (admin, slab, clock).
+        // PORT-4 (Wave 3): UpdateConfig is strict 4-account list — admin,
+        // slab, clock, oracle. The pre-PORT-4 form accepted 3-or-4 accounts
+        // with the 4th slot documented as a no-op; that "degenerate by
+        // omission" form let admin issue UpdateConfig without an oracle and
+        // accrue against engine's stale `last_oracle_price`. Closed by
+        // `accounts::expect_len(4)` in `handle_update_config`.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 3600,   // funding_horizon_slots
@@ -6075,13 +6093,15 @@ impl TestEnv {
         signer: &Keypair,
         funding_horizon_slots: u64,
     ) -> Result<(), String> {
-        // v12.19 UpdateConfig expects exactly 3 accounts: admin, slab, clock.
+        // PORT-4 (Wave 3): UpdateConfig is strict 4-account list — admin,
+        // slab, clock, oracle. See `try_update_config` for rationale.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 funding_horizon_slots,
