@@ -3479,13 +3479,19 @@ impl TestEnv {
 
     /// Try UpdateConfig instruction
     pub fn try_update_config(&mut self, signer: &Keypair) -> Result<(), String> {
-        // v12.19: UpdateConfig expects exactly 3 accounts (admin, slab, clock).
+        // PORT-4 (Wave 3): UpdateConfig is strict 4-account list — admin,
+        // slab, clock, oracle. The pre-PORT-4 form accepted 3-or-4 accounts
+        // with the 4th slot documented as a no-op; that "degenerate by
+        // omission" form let admin issue UpdateConfig without an oracle and
+        // accrue against engine's stale `last_oracle_price`. Closed by
+        // `accounts::expect_len(4)` in `handle_update_config`.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 3600,   // funding_horizon_slots
@@ -6087,13 +6093,15 @@ impl TestEnv {
         signer: &Keypair,
         funding_horizon_slots: u64,
     ) -> Result<(), String> {
-        // v12.19 UpdateConfig expects exactly 3 accounts: admin, slab, clock.
+        // PORT-4 (Wave 3): UpdateConfig is strict 4-account list — admin,
+        // slab, clock, oracle. See `try_update_config` for rationale.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 funding_horizon_slots,
