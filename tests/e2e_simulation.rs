@@ -56,11 +56,16 @@ const TAG_INIT_MATCHER_CTX: u8 = 75;
 const TAG_EXECUTE_ADL: u8 = 50;
 const TAG_RECLAIM_SLAB_RENT: u8 = 52;
 
+// Wave 11c (engine PR #97 + wrapper PR #280): B-tracking subsystem grows
+// the slab by +229_784 (engine +216 RiskEngine fields × MAX_ACCOUNTS=4096,
+// plus +56 Account fields × MAX_ACCOUNTS, plus engine struct growth).
+// Small-feature SLAB_LEN is recalibrated against the same fields with
+// MAX_ACCOUNTS=224.
 #[cfg(all(feature = "small", not(feature = "medium")))]
-const EXPECTED_SLAB_LEN: usize = 96_760;
+const EXPECTED_SLAB_LEN: usize = 109_312;
 
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-const EXPECTED_SLAB_LEN: usize = 1_525_720;
+const EXPECTED_SLAB_LEN: usize = 1_755_504;
 
 // ─── Encoder helpers ──────────────────────────────────────────────────────────
 

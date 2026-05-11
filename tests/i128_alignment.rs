@@ -31,7 +31,11 @@ use std::path::PathBuf;
 // (engine PR #94 @ a67ff66d).
 // Wave 6a (engine PR #95): phantom-dust 4-field schema swap, +32
 // bytes. Cumulative +248 from pre-Wave-1.
-const SLAB_LEN: usize = 1714552; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
+// Wave 11c (engine PR #97 + wrapper PR #280): B-tracking subsystem
+// adds +216 bytes to RiskEngine and +56 to Account.
+// Total cumulative: pre-Wave-1 baseline + 248 + 40_960 = +41_208 (per
+// MAX_ACCOUNTS × 10 bytes + the engine fields above), giving 1_755_504.
+const SLAB_LEN: usize = 1_755_504;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
