@@ -143,9 +143,13 @@ mod layout_constants {
     /// CONFIG_LEN: size_of::<MarketConfig>() — v12.19 trimmed to 480
     /// (legacy fields removed during ML9..ML12 sync).
     pub const CONFIG_LEN_EXPECTED: usize = 480;
-    /// ACCOUNT_SIZE: size_of::<Account>() — v12.19 expanded to 384
-    /// (Account gained per-account fields during the sync).
-    pub const ACCOUNT_SIZE_EXPECTED: usize = 384;
+    /// ACCOUNT_SIZE: size_of::<Account>() — Wave 11a-i added 4 B-tracking
+    /// fields (loss_weight: u128, b_snap: u128, b_rem: u128,
+    /// b_epoch_snap: u64). On x86_64 host with 16-byte u128 alignment,
+    /// the four new fields plus alignment padding bump the struct from
+    /// 384 to 448. (BPF-aligned size is 416 — see tests/common/mod.rs
+    /// `ACCOUNT_SIZE` and Wave 11c.)
+    pub const ACCOUNT_SIZE_EXPECTED: usize = 448;
     /// ENGINE_OFF: align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN)
     /// Computed live from the program's own constant — this is intentional:
     /// if the constant changes, the test catches it via other assertions.

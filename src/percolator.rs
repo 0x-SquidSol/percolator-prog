@@ -8952,32 +8952,82 @@ pub mod processor {
         let funding_rate = funding_rate_e9_pre;
         let admit_h_min = engine.params.h_min;
         let admit_h_max = engine.params.h_max;
-        // v12.19 keeper_crank_not_atomic signature added two new params:
-        //   admit_h_max_consumption_threshold_bps_opt: Option<u128>
-        //   rr_window_size: u64
-        // None = use engine default; rr_window_size matches FEE_SWEEP_BUDGET.
-        let _outcome = engine
-            .keeper_crank_not_atomic(
-                clock.slot,
-                price,
-                &candidates,
-                crate::constants::LIQ_BUDGET_PER_CRANK,
-                funding_rate,
+        // Wave 7c / PORT-24: replaced direct `keeper_crank_not_atomic` with
+        // the engine's permissionless-progress dispatcher (Wave 11a-ii-B
+        // engine API). The dispatcher routes Live markets to the ordinary
+        // keeper crank but lets the engine reserve the right to take a
+        // recovery branch when future waves wire up active-bankrupt-close
+        // continuation or global recovery. The wrapper only branches on
+        // `Cranked(_)` for post-crank dust-sweep / fee logic; other
+        // outcomes (ResolvedClose / Recovered / AccountBProgress /
+        // AccountBRecovered / ActiveCloseContinued) short-circuit the
+        // dust sweep because the market state changed in a way the
+        // wrapper-side dust accounting doesn't model.
+        //
+        // The wrapper-side resolved branch (8834-8890 above) still owns
+        // resolved-mode dust sweep semantics, so `resolved_scan_limit`
+        // and `resolved_fee_rate_per_slot` on the request are
+        // populated defensively but Live cranks won't reach the
+        // `ResolvedClose` branch of the engine dispatcher (it
+        // short-circuits on `market_mode == Resolved` which the wrapper
+        // already filtered above).
+        //
+        // `account_hint`: first candidate's idx when available; the
+        // engine validates the hint shape before routing it.
+        let account_hint = candidates.first().map(|(idx, _)| *idx);
+        // Wave 1 / KL-FORK-ENGINE-FIELDS (oracle-target REVOKED): the
+        // fork engine owns `oracle_target_price_e6`; the wrapper-side
+        // MarketConfig field was retired. Read the live target from the
+        // engine snapshot taken above the keeper-crank borrow.
+        let raw_target = if oracle::is_hyperp_mode(&config) {
+            config.hyperp_mark_e6
+        } else {
+            engine.oracle_target_price_e6
+        };
+        let progress_outcome = engine
+            .permissionless_progress_not_atomic(percolator::PermissionlessProgressRequest {
+                now_slot: clock.slot,
+                oracle_price: price,
+                authenticated_raw_target_price: raw_target,
+                ordered_candidates: &candidates,
+                account_hint,
+                max_revalidations: crate::constants::LIQ_BUDGET_PER_CRANK,
+                max_candidate_inspections: crate::constants::LIQ_BUDGET_PER_CRANK,
+                funding_rate_e9: funding_rate,
                 admit_h_min,
                 admit_h_max,
-                None,
-                crate::constants::RR_WINDOW_PER_CRANK,
-            )
+                admit_h_max_consumption_threshold_bps_opt: None,
+                rr_touch_limit: crate::constants::RR_WINDOW_PER_CRANK,
+                rr_scan_limit: u64::MAX,
+                // KeeperCrank's Live branch never reaches the engine's
+                // Resolved arm (the wrapper filters market_mode above),
+                // but we still populate these defensively for the
+                // request shape.
+                resolved_scan_limit: 1,
+                resolved_fee_rate_per_slot: 0,
+            })
             .map_err(map_risk_error)?;
+        // Wave 7c: only `Cranked(_)` continues to the post-crank
+        // dust-sweep path. Other outcomes (Resolved close, account-B
+        // progress / recovery, global recovery) mean the engine took a
+        // non-keeper path and the wrapper's dust-sweep accounting
+        // doesn't apply on this instruction.
+        let progress_was_crank = matches!(
+            progress_outcome,
+            percolator::PermissionlessProgressOutcome::Cranked(_)
+        );
         #[cfg(feature = "cu-audit")]
         {
             msg!("CU_CHECKPOINT: keeper_crank_end");
             sol_log_compute_units();
         }
 
-        // Dust sweep: if accumulated dust >= unit_scale, sweep to insurance fund
-        // Done before copying stats so insurance balance reflects the sweep
-        let remaining_dust = if unit_scale > 0 {
+        // Dust sweep: if accumulated dust >= unit_scale, sweep to insurance fund.
+        // Wave 7c: skip the sweep when the engine took a non-keeper branch
+        // (Resolved cursor, account-B recovery, etc.). On those paths the
+        // wrapper's dust tracking is out of sync with the engine's mode
+        // transition.
+        let remaining_dust = if progress_was_crank && unit_scale > 0 {
             let scale = unit_scale as u64;
             if dust_before >= scale {
                 let units_to_sweep = dust_before / scale;
