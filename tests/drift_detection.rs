@@ -1122,6 +1122,127 @@ fn risk_params_full_round_trip_via_init_market() {
 }
 
 // ============================================================================
+// Wave 9 — InitMarket v2 extended-tail: max_price_move_bps_per_slot override
+// ============================================================================
+
+/// Wave 9 / KL-FORK-MAX-PRICE-MOVE-CALIBRATION-1.
+///
+/// The v2 extended tail (74 bytes = v1 66 + max_price_move u64) overrides
+/// the wrapper-default `max_price_move_bps_per_slot` (4) baked into
+/// `read_risk_params`. Mirrors toly's per-market wire-configurable field
+/// (toly:2370).
+#[test]
+fn init_market_v2_tail_overrides_max_price_move() {
+    use solana_program::pubkey::Pubkey;
+    let admin = [0x11u8; 32];
+    let mint = [0x22u8; 32];
+    let feed = [0x33u8; 32];
+
+    let mut data = vec![TAG_INIT_MARKET];
+    data.extend_from_slice(&admin);
+    data.extend_from_slice(&mint);
+    data.extend_from_slice(&feed);
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    data.push(0u8); // invert
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+    data.extend_from_slice(&encode_risk_params_wire(
+        1, 500, 1000, 0, 64, 0, 0, 1, u64::MAX, 50,
+        1_000_000_000_000u128, 100, 0, 100, 21, 22,
+    ));
+    // v2 extended tail: v1 66 bytes + max_price_move (8 bytes) = 74 bytes
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    data.extend_from_slice(&1u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&7u64.to_le_bytes()); // max_price_move_bps_per_slot (v2 only)
+
+    let _ = Pubkey::new_unique(); // suppress dead_code
+    match Instruction::decode(&data) {
+        Ok(Instruction::InitMarket { risk_params, .. }) => {
+            assert_eq!(
+                risk_params.max_price_move_bps_per_slot, 7u64,
+                "v2 tail must override wrapper-default max_price_move_bps_per_slot"
+            );
+        }
+        other => panic!("Expected v2 InitMarket to decode, got {:?}", other),
+    }
+}
+
+/// Wave 9: zero `max_price_move_bps_per_slot` in the v2 tail is rejected
+/// at decode time as `InvalidConfigParam`. Matches toly:2378-2380.
+#[test]
+fn init_market_v2_tail_rejects_zero_max_price_move() {
+    let admin = [0x11u8; 32];
+    let mint = [0x22u8; 32];
+    let feed = [0x33u8; 32];
+
+    let mut data = vec![TAG_INIT_MARKET];
+    data.extend_from_slice(&admin);
+    data.extend_from_slice(&mint);
+    data.extend_from_slice(&feed);
+    data.extend_from_slice(&86400u64.to_le_bytes());
+    data.extend_from_slice(&500u16.to_le_bytes());
+    data.push(0u8);
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes());
+    data.extend_from_slice(&encode_risk_params_wire(
+        1, 500, 1000, 0, 64, 0, 0, 1, u64::MAX, 50,
+        1_000_000_000_000u128, 100, 0, 100, 21, 22,
+    ));
+    // v2 tail with max_price_move = 0
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&500u64.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    data.extend_from_slice(&500i64.to_le_bytes());
+    data.extend_from_slice(&1_000i64.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&1u64.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes()); // ← zero override → reject
+
+    assert!(matches!(Instruction::decode(&data), Err(_)));
+}
+
+/// Wave 9: a tail length between v1 (66) and v2 (74) — or anything else —
+/// is rejected as a malformed payload. Pins the all-or-nothing wire
+/// invariant against silent misparsing.
+#[test]
+fn init_market_unknown_tail_length_rejects() {
+    let admin = [0x11u8; 32];
+    let mint = [0x22u8; 32];
+    let feed = [0x33u8; 32];
+
+    let mut data = vec![TAG_INIT_MARKET];
+    data.extend_from_slice(&admin);
+    data.extend_from_slice(&mint);
+    data.extend_from_slice(&feed);
+    data.extend_from_slice(&86400u64.to_le_bytes());
+    data.extend_from_slice(&500u16.to_le_bytes());
+    data.push(0u8);
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes());
+    data.extend_from_slice(&encode_risk_params_wire(
+        1, 500, 1000, 0, 64, 0, 0, 1, u64::MAX, 50,
+        1_000_000_000_000u128, 100, 0, 100, 21, 22,
+    ));
+    // 70 bytes — between v1 (66) and v2 (74), must reject
+    data.extend(core::iter::repeat(0u8).take(70));
+
+    assert!(matches!(Instruction::decode(&data), Err(_)));
+}
+
+// ============================================================================
 // § 4 — Program ID Constants
 // ============================================================================
 

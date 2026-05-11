@@ -313,6 +313,14 @@ pub mod constants {
     /// guard (see InitMarket) still requires a non-zero value OR Hyperp mode,
     /// so an admin-free non-Hyperp market can't be shipped with this at 0.
     pub const DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 0;
+    /// Wrapper-deployment default for `RiskParams.max_price_move_bps_per_slot`.
+    /// Calibrated against the v12.19 solvency envelope:
+    ///   max_accrual_dt_slots(100) × max_price_move_bps_per_slot(4)
+    ///     + funding_budget(10) + liq_budget(50) = 460 ≤ maintenance_margin_bps(500)
+    /// New (Wave 9) clients may override via the v2 extended-tail
+    /// `max_price_move_bps_per_slot` field at InitMarket; legacy clients
+    /// (0 or v1 66-byte tail) inherit this default.
+    pub const DEFAULT_MAX_PRICE_MOVE_BPS_PER_SLOT: u64 = 4;
     /// Upper bound on `force_close_delay_slots` (Finding 6). Without a bound, an
     /// init-time config of `u64::MAX` passes the "nonzero" liveness guard but
     /// makes ForceCloseResolved unreachable — `resolved_slot + delay` saturates
@@ -1942,12 +1950,26 @@ pub mod ix {
                     let initial_mark_price_e6 = read_u64(&mut rest)?;
                     let maintenance_fee_per_slot = read_u128(&mut rest)?; // periodic fee per slot per account
                                                                           // Insurance withdrawal limits (immutable after init)
-                    let (risk_params, new_account_fee) = read_risk_params(&mut rest)?;
-                    // Extended fields: either ALL present (66 bytes) or NONE.
-                    // No partial tails — prevents silent misparsing of truncated payloads.
-                    // Total: insurance(2+8) + permissionless(8) + funding(8+8+8+8) +
-                    //        mark_min_fee(8) + force_close_delay(8) = 66 bytes
-                    const EXTENDED_TAIL_LEN: usize = 2 + 8 * 8;
+                    let (mut risk_params, new_account_fee) = read_risk_params(&mut rest)?;
+                    // Extended fields wire format (length-discriminated, all-or-nothing):
+                    //   - 0 bytes              → v0 (everything default)
+                    //   - 66 bytes             → v1 (insurance + permissionless + funding +
+                    //                            mark_min_fee + force_close_delay)
+                    //   - 74 bytes             → v2 (v1 + max_price_move_bps_per_slot u64 at end)
+                    //
+                    // Wave 9 / KL-FORK-MAX-PRICE-MOVE-CALIBRATION-1: the v2 tail makes
+                    // `max_price_move_bps_per_slot` a per-market wire parameter,
+                    // mirroring toly's wire surface (toly:2370). Legacy clients
+                    // sending 0 or 66 bytes inherit the wrapper-deployment default
+                    // (`crate::constants::DEFAULT_MAX_PRICE_MOVE_BPS_PER_SLOT = 4`)
+                    // already baked into `read_risk_params`. New clients send 74
+                    // bytes with the operator-chosen value as the last 8 bytes.
+                    // No partial tails — prevents silent misparsing.
+                    // v1 total: insurance(2+8) + permissionless(8) + funding(8+8+8+8) +
+                    //           mark_min_fee(8) + force_close_delay(8) = 66 bytes
+                    // v2 total: v1 + max_price_move_bps_per_slot(8)            = 74 bytes
+                    const EXTENDED_TAIL_LEN_V1: usize = 2 + 8 * 8;
+                    const EXTENDED_TAIL_LEN_V2: usize = EXTENDED_TAIL_LEN_V1 + 8;
                     let (
                         insurance_withdraw_max_bps,
                         insurance_withdraw_cooldown_slots,
@@ -1958,6 +1980,7 @@ pub mod ix {
                         funding_max_e9_per_slot,
                         mark_min_fee,
                         force_close_delay_slots,
+                        max_price_move_override,
                     ) = if rest.is_empty() {
                         // Minimal payload: all extended fields use defaults.
                         // permissionless_resolve_stale_slots seeds to
@@ -1978,9 +2001,12 @@ pub mod ix {
                             None,
                             0u64,
                             1u64,
+                            None::<u64>,
                         )
-                    } else if rest.len() >= EXTENDED_TAIL_LEN {
-                        // Full extended payload
+                    } else if rest.len() == EXTENDED_TAIL_LEN_V1
+                        || rest.len() == EXTENDED_TAIL_LEN_V2
+                    {
+                        // v1 fields are the leading 66 bytes; v2 appends max_price_move.
                         let iwm = read_u16(&mut rest)?;
                         let iwc = read_u64(&mut rest)?;
                         let prs = read_u64(&mut rest)?;
@@ -1990,6 +2016,19 @@ pub mod ix {
                         let fms = read_i64(&mut rest)?;
                         let mmf = read_u64(&mut rest)?;
                         let fcd = read_u64(&mut rest)?;
+                        // v2 trailer: max_price_move_bps_per_slot. `read_risk_params`
+                        // already validated `> 0` for any non-default value path;
+                        // re-validate here against the wire value to surface the
+                        // error as `InvalidConfigParam` (matches toly:2378-2380).
+                        let mpm = if rest.is_empty() {
+                            None
+                        } else {
+                            let v = read_u64(&mut rest)?;
+                            if v == 0 {
+                                return Err(crate::error::PercolatorError::InvalidConfigParam.into());
+                            }
+                            Some(v)
+                        };
                         (
                             iwm,
                             iwc,
@@ -2000,9 +2039,10 @@ pub mod ix {
                             Some(fms),
                             mmf,
                             fcd,
+                            mpm,
                         )
                     } else {
-                        // Partial tail: reject to prevent misparsing
+                        // Partial or unknown tail: reject to prevent misparsing.
                         return Err(ProgramError::InvalidInstructionData);
                     };
                     // Reject trailing bytes to prevent silent misparsing.
@@ -2010,6 +2050,17 @@ pub mod ix {
                     // client sent a malformed or future-version payload.
                     if !rest.is_empty() {
                         return Err(ProgramError::InvalidInstructionData);
+                    }
+                    // Wave 9: if the v2 tail provided a per-market value, override
+                    // the wrapper-default `max_price_move_bps_per_slot` baked into
+                    // `read_risk_params` (KL-FORK-MAX-PRICE-MOVE-CALIBRATION-1
+                    // REVOKED). The engine still re-validates the solvency
+                    // envelope at `init_in_place` via
+                    // `validate_exact_solvency_envelope`, so out-of-range values
+                    // surface as `Overflow` (not a wrapper-side
+                    // `InvalidConfigParam`).
+                    if let Some(mpm) = max_price_move_override {
+                        risk_params.max_price_move_bps_per_slot = mpm;
                     }
                     Ok(Instruction::InitMarket {
                         admin,
@@ -2618,7 +2669,10 @@ pub mod ix {
             max_abs_funding_e9_per_slot: 10_000,
             min_funding_lifetime_slots: 10_000_000,
             max_active_positions_per_side: max_accounts,
-            max_price_move_bps_per_slot: 4,
+            // Wave 9: wrapper-deployment default. The InitMarket parser
+            // overrides this with the v2 extended-tail value when the
+            // client opts in (KL-FORK-MAX-PRICE-MOVE-CALIBRATION-1 REVOKED).
+            max_price_move_bps_per_slot: crate::constants::DEFAULT_MAX_PRICE_MOVE_BPS_PER_SLOT,
         };
         Ok((params, new_account_fee.get()))
     }
