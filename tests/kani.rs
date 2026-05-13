@@ -4295,6 +4295,8 @@ fn kani_partial_crank_config_write_field_sources() {
         oracle_target_publish_time: kani::any(),
         fee_sweep_cursor_word: kani::any(),
         fee_sweep_cursor_bit: kani::any(),
+        oracle_leg_publish_times: [kani::any(), kani::any(), kani::any()],
+        oracle_leg_prices_e6: [kani::any(), kani::any(), kani::any()],
     };
     let after = PartialCrankConfigFields {
         last_effective_price_e6: kani::any(),
@@ -4305,6 +4307,8 @@ fn kani_partial_crank_config_write_field_sources() {
         oracle_target_publish_time: kani::any(),
         fee_sweep_cursor_word: kani::any(),
         fee_sweep_cursor_bit: kani::any(),
+        oracle_leg_publish_times: [kani::any(), kani::any(), kani::any()],
+        oracle_leg_prices_e6: [kani::any(), kani::any(), kani::any()],
     };
 
     let out = partial_crank_config_fields_to_write(before, after);
@@ -4320,6 +4324,8 @@ fn kani_partial_crank_config_write_field_sources() {
     );
     assert_eq!(out.fee_sweep_cursor_word, after.fee_sweep_cursor_word);
     assert_eq!(out.fee_sweep_cursor_bit, after.fee_sweep_cursor_bit);
+    assert_eq!(out.oracle_leg_publish_times, after.oracle_leg_publish_times);
+    assert_eq!(out.oracle_leg_prices_e6, after.oracle_leg_prices_e6);
 }
 
 // =============================================================================

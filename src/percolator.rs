@@ -759,6 +759,8 @@ pub mod policy {
         pub oracle_target_publish_time: i64,
         pub fee_sweep_cursor_word: u64,
         pub fee_sweep_cursor_bit: u64,
+        pub oracle_leg_publish_times: [i64; crate::constants::ORACLE_LEG_CAP],
+        pub oracle_leg_prices_e6: [u64; crate::constants::ORACLE_LEG_CAP],
     }
 
     /// Partial crank catchup preserves fresh target/liveness data, the
@@ -779,6 +781,8 @@ pub mod policy {
             oracle_target_publish_time: after_read_and_sweep.oracle_target_publish_time,
             fee_sweep_cursor_word: after_read_and_sweep.fee_sweep_cursor_word,
             fee_sweep_cursor_bit: after_read_and_sweep.fee_sweep_cursor_bit,
+            oracle_leg_publish_times: after_read_and_sweep.oracle_leg_publish_times,
+            oracle_leg_prices_e6: after_read_and_sweep.oracle_leg_prices_e6,
         }
     }
 
@@ -4818,6 +4822,8 @@ pub mod processor {
             oracle_target_publish_time: config.oracle_target_publish_time,
             fee_sweep_cursor_word: config.fee_sweep_cursor_word,
             fee_sweep_cursor_bit: config.fee_sweep_cursor_bit,
+            oracle_leg_publish_times: config.oracle_leg_publish_times,
+            oracle_leg_prices_e6: config.oracle_leg_prices_e6,
         }
     }
 
@@ -4833,6 +4839,8 @@ pub mod processor {
         config.oracle_target_publish_time = fields.oracle_target_publish_time;
         config.fee_sweep_cursor_word = fields.fee_sweep_cursor_word;
         config.fee_sweep_cursor_bit = fields.fee_sweep_cursor_bit;
+        config.oracle_leg_publish_times = fields.oracle_leg_publish_times;
+        config.oracle_leg_prices_e6 = fields.oracle_leg_prices_e6;
     }
 
     fn partial_crank_config_to_write(
