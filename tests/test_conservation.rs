@@ -420,6 +420,10 @@ fn test_attack_multi_lp_conservation() {
     // Price moves
     env.set_oracle_price_e6(1_200_000);
     env.set_slot(200);
+    // sync: set_slot jumped the clock directly so slot variable must match
+    // to keep advance_hyperp_target monotone (next crank slot = 201, eff 301)
+    slot = 200;
+
     env.crank();
 
     // Close positions
