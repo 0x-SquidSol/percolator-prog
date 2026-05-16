@@ -1212,6 +1212,114 @@ pub mod policy {
             anchor_slot <= last_market_slot
         }
     }
+
+    // =========================================================================
+    // Wave 12-K — additive parity helpers (ported from toly upstream main)
+    //
+    // Pure predicates / math helpers with no wiring side effects. Added to
+    // keep symbol parity with upstream so future cherry-picks compile.
+    // =========================================================================
+
+    /// Account index must fit inside both the compiled hard cap
+    /// (`MAX_ACCOUNTS`) and the per-market dynamic capacity
+    /// (`market_max_accounts`). Wraps the two checks into one call site.
+    #[inline]
+    pub fn market_idx_within_capacity(idx: usize, market_max_accounts: u64) -> bool {
+        idx < percolator::MAX_ACCOUNTS && (idx as u64) < market_max_accounts
+    }
+
+    /// True when the raw oracle target has not yet been observed by the engine
+    /// (target lag is pending). Hyperp markets read hyperp_target; non-Hyperp
+    /// read external_oracle_target.
+    #[inline]
+    pub fn target_lag_pending(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        engine_last_oracle_price: u64,
+    ) -> bool {
+        let target = if is_hyperp {
+            hyperp_target_price_e6
+        } else {
+            external_oracle_target_price_e6
+        };
+        target != 0 && target != engine_last_oracle_price
+    }
+
+    /// User value-changing instructions (deposit/withdraw/trade) must wait for
+    /// accrual to consume the pending raw-target lag before applying.
+    #[inline]
+    pub fn user_value_op_allowed_after_accrual(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        engine_last_oracle_price: u64,
+    ) -> bool {
+        !target_lag_pending(
+            is_hyperp,
+            external_oracle_target_price_e6,
+            hyperp_target_price_e6,
+            engine_last_oracle_price,
+        )
+    }
+
+    /// Account-free catchup is only safe when the market clock advance would
+    /// be a pure no-op (no price move, no funding to accrue against exposed
+    /// OI). When exposed OI exists and either a price move or funding step
+    /// could trigger PnL, the catchup path must NOT advance the market clock.
+    #[inline]
+    pub fn account_free_catchup_allows_accrual(
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+        last_oracle_price: u64,
+        fresh_price: u64,
+        funding_rate_e9: i128,
+        fund_px_last: u64,
+    ) -> bool {
+        let exposed = oi_eff_long_q != 0 || oi_eff_short_q != 0;
+        if !exposed {
+            return true;
+        }
+        let price_move_active = last_oracle_price > 0 && fresh_price != last_oracle_price;
+        let funding_active =
+            funding_rate_e9 != 0 && oi_eff_long_q != 0 && oi_eff_short_q != 0 && fund_px_last > 0;
+        !price_move_active && !funding_active
+    }
+
+    /// Force-close cooldown elapsed: zero `force_close_delay_slots` means the
+    /// cooldown is disabled (no force-close allowed via this path).
+    #[inline]
+    pub fn force_close_delay_elapsed(
+        clock_slot: u64,
+        resolved_slot: u64,
+        force_close_delay_slots: u64,
+    ) -> bool {
+        force_close_delay_slots != 0
+            && clock_slot.saturating_sub(resolved_slot) >= force_close_delay_slots
+    }
+
+    /// Effective EWMA alpha gated by fee threshold. Dust trades (fee_paid <
+    /// mark_min_fee) scale alpha down proportionally so they cannot move the
+    /// mark at full weight. Above the threshold, full alpha applies.
+    #[inline]
+    pub fn ewma_effective_alpha_bps(alpha_bps: u128, fee_paid: u64, mark_min_fee: u64) -> u128 {
+        if mark_min_fee == 0 || fee_paid >= mark_min_fee {
+            alpha_bps
+        } else {
+            alpha_bps * (fee_paid as u128) / (mark_min_fee as u128)
+        }
+    }
+
+    /// `ceil(num / den)` returning `None` for division by zero or arithmetic
+    /// overflow. Companion to `safe_mul_div_*` helpers; kept here so the
+    /// wrapper and downstream tests share one canonical definition.
+    #[inline]
+    pub fn ceil_div_u128(num: u128, den: u128) -> Option<u128> {
+        if den == 0 {
+            return None;
+        }
+        Some(num.checked_add(den.checked_sub(1)?)? / den)
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -6096,6 +6204,82 @@ pub mod processor {
 
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
     // which handles K-pair PnL, checked arithmetic, and all settlement internally.
+
+    // =========================================================================
+    // Wave 12-K — additive parity helpers (processor scope)
+    //
+    // Engine-touching predicates kept here so RiskEngine remains private to
+    // processor. Pure delegates: no behavior change to existing call sites.
+    // =========================================================================
+
+    /// True when the engine slot at `idx` is in use (non-empty account).
+    #[inline]
+    pub fn engine_is_used(engine: &RiskEngine, idx: usize) -> bool {
+        engine.is_used(idx)
+    }
+
+    /// Wrapper over `policy::market_idx_within_capacity` that reads the cap
+    /// directly off the engine's RiskParams.
+    #[inline]
+    pub fn idx_within_market_capacity(engine: &RiskEngine, idx: usize) -> bool {
+        crate::policy::market_idx_within_capacity(idx, engine.params.max_accounts)
+    }
+
+    /// Engine slot `idx` is both within the per-market cap and currently used.
+    #[inline]
+    pub fn idx_used_in_market(engine: &RiskEngine, idx: usize) -> bool {
+        idx_within_market_capacity(engine, idx) && engine_is_used(engine, idx)
+    }
+
+    /// Effective price = clamped(anchor → target) when exposed OI exists;
+    /// otherwise the raw target. Centralises the rate-limit choice for the
+    /// engine-target read path.
+    #[inline]
+    pub fn effective_price_from_target(
+        anchor: u64,
+        target: u64,
+        max_change_bps: u64,
+        price_move_dt_slots: u64,
+        oi_any: bool,
+    ) -> u64 {
+        if oi_any {
+            crate::oracle::clamp_toward_with_dt(anchor, target, max_change_bps, price_move_dt_slots)
+        } else {
+            target
+        }
+    }
+
+    /// Saturating-checked U256 multiply-divide-floor with `ProgramError`
+    /// surface for use in wrapper code paths. `d == 0` returns
+    /// `EngineOverflow`.
+    pub fn safe_mul_div_floor_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
+        if d == 0 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+        let q = percolator::wide_math::mul_div_floor_u256(
+            percolator::wide_math::U256::from_u128(a),
+            percolator::wide_math::U256::from_u128(b),
+            percolator::wide_math::U256::from_u128(d),
+        );
+        q.try_into_u128()
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
+    }
+
+    /// U256 multiply-divide-ceil with `ProgramError` surface. Errors on
+    /// overflow OR on `d == 0`.
+    pub fn safe_mul_div_ceil_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
+        if d == 0 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+        let q = percolator::wide_math::checked_mul_div_ceil_u256(
+            percolator::wide_math::U256::from_u128(a),
+            percolator::wide_math::U256::from_u128(b),
+            percolator::wide_math::U256::from_u128(d),
+        )
+        .ok_or(PercolatorError::EngineOverflow)?;
+        q.try_into_u128()
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
+    }
 
     /// Read oracle price for non-Hyperp markets and stamp
     /// `last_good_oracle_slot`. Any Pyth/Chainlink parse error propagates
