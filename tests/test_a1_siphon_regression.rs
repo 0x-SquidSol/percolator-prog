@@ -197,180 +197,37 @@ fn test_a1_external_pyth_siphon_defended() {
     outcome.assert_defended("A1a external-Pyth");
 }
 
-/// A1b: Hyperp (internal mark) market.
-///
-/// On a Hyperp market, `TradeNoCpi` is explicitly disabled
-/// (`HyperpTradeNoCpiDisabled`, error 0x1b) — positions can only be
-/// opened through `TradeCpi` with a registered matcher program. That
-/// makes the classic dual-keypair matched-pair setup impossible on
-/// Hyperp without the external `matcher_program.so` binary (see A1c).
-///
-/// What we *can* verify here is the closest independent surface: the
-/// hyperp mark-push authority cannot siphon insurance even when it
-/// adversely pushes the mark by ~25%, because every push is rate-
-/// limited by the engine's mark-smoothing cap
-/// (`clamp_toward_with_dt`, §hyperp index smoothing) and every crank
-/// runs through the same §1.4 solvency envelope as the non-Hyperp
-/// path. Without any open positions, the insurance balance is
-/// trivially unaffected — the real invariant being verified is that a
-/// succession of rate-limited mark pushes does not *create* an
-/// insurance-draining path via any lazy-settle side-effect.
-#[test]
-fn test_a1_hyperp_mark_siphon_defended() {
-    let mut env = TestEnv::new();
-    env.init_market_hyperp(1_000_000);
+// Wave 7d Phase 3 R2c-5a: `test_a1_hyperp_mark_siphon_defended` removed —
+// tests admin-push oracle behavior (`try_push_oracle_price` / tag 17
+// PushOraclePrice) that was PERMANENTLY removed in Phase G. The dispatcher
+// at src/percolator.rs:2243 now returns `InvalidInstructionData` for tags
+// 16/17 unconditionally:
+//
+//     16 | 17 => Err(ProgramError::InvalidInstructionData),
+//
+// The test's `try_push_oracle_price(&admin, 1_000_000, 100)` call at the
+// seed-mark step fails with InvalidInstructionData at 1100 CUs (tag dispatch
+// rejection), so the test never reaches its actual assertion. The A1b
+// security property (mark-push authority cannot siphon insurance) is now
+// vacuously true at the architectural level: there is no admin-push oracle
+// path to defend. The post-Phase-G equivalent path is `UpdateHyperpMark`
+// (tag 34), which reads DEX pool prices rather than accepting raw pushes —
+// the attacker surface is fundamentally different and is covered by the
+// dedicated Hyperp index-smoothing tests in tests/test_oracle.rs. The A1
+// suite's remaining live coverage (A1a external-Pyth, see
+// `test_a1_external_pyth_siphon_defended` above) exercises the real
+// modern attack surface.
 
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("set hyperp mark authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("seed hyperp mark");
-
-    env.top_up_insurance(&admin, 5_000_000_000);
-
-    let attacker_a = Keypair::new();
-    let a_idx = env.init_user(&attacker_a);
-    let deposit_a: u64 = 20_000_000_000;
-    env.deposit(&attacker_a, a_idx, deposit_a);
-
-    let attacker_b = Keypair::new();
-    let b_idx = env.init_lp(&attacker_b);
-    let deposit_b: u64 = 20_000_000_000;
-    env.deposit(&attacker_b, b_idx, deposit_b);
-
-    env.crank();
-    let insurance_before = env.read_insurance_balance();
-
-    // NOTE: no trade — TradeNoCpi is blocked on Hyperp, and TradeCpi needs
-    // an external matcher program (A1c). Exercise the authority-only flavor.
-
-    // Push the hyperp mark ~25% adverse over many small steps; each push
-    // is rate-limited by the engine's mark-smoothing cap. Some steps will
-    // be rejected by the rate limiter — tolerate with let _ = ....
-    let steps = 50;
-    let start_px: i64 = 1_000_000;
-    let end_px: i64 = 750_000; // -25%
-    for i in 1..=steps {
-        let slot = 200 + (i * 20) as u64;
-        let px = start_px + (end_px - start_px) * i / steps;
-        env.set_slot(slot);
-        let _ = env.try_push_oracle_price(&admin, px as u64, slot as i64);
-        let _ = env.try_crank();
-    }
-
-    for _ in 0..5 {
-        let _ = env.try_crank();
-    }
-
-    let cap_a = env.read_account_capital(a_idx);
-    let cap_b = env.read_account_capital(b_idx);
-    let pnl_a = env.read_account_pnl(a_idx);
-    let pnl_b = env.read_account_pnl(b_idx);
-    let insurance_after = env.read_insurance_balance();
-
-    let outcome = AttackOutcome {
-        attacker_a_deposit: deposit_a as u128,
-        attacker_b_deposit: deposit_b as u128,
-        attacker_a_equity: cap_a as i128 + pnl_a,
-        attacker_b_equity: cap_b as i128 + pnl_b,
-        insurance_before,
-        insurance_after,
-    };
-    outcome.assert_defended("A1b Hyperp mark-push (authority-only)");
-}
-
-/// A1c: TradeCpi (matcher-routed) — dual-keypair self-dealing attack.
-///
-/// Exercises the same self-dealing matched-pair setup as A1a but routes
-/// the trade through `TradeCpi` with the registered default matcher.
-/// This is the path where the pre-v12.19 attack had its fullest
-/// expression (the attacker could, in principle, pair any LP they own
-/// with any user they own against a tame matcher). v12.19's defenses
-/// (max_price_move_bps_per_slot, §1.4 envelope, admission threshold)
-/// apply identically across TradeCpi and TradeNoCpi — the crank pipeline
-/// is the same once a trade is admitted.
-///
-/// The TradeCpi-specific defenses (ABI echo check, matcher identity
-/// binding, LP PDA shape, nonce discipline, oracle-price echo) are
-/// exhaustively exercised by `tests/test_tradecpi.rs`. What remains
-/// specific to A1 is the `attacker_delta <= ROUNDING_TOLERANCE` +
-/// `insurance_drop <= ROUNDING_TOLERANCE` pair, which we assert here
-/// after an adverse oracle drop against a matched-pair position opened
-/// via TradeCpi.
-#[test]
-fn test_a1_tradecpi_siphon_defended() {
-    let mut env = TradeCpiTestEnv::new();
-    // Use Hyperp mode so the test can drive the oracle adversarially
-    // via PushHyperpMark — TradeCpi is legal on Hyperp, so this covers
-    // the same attack surface as A1c (attacker controlling both sides
-    // of a matched pair through the registered matcher).
-    env.init_market_hyperp(1_000_000);
-    let matcher_prog = env.matcher_program_id;
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("set hyperp mark authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("seed mark");
-
-    // Attacker controls both the LP and the taker.
-    let attacker_lp = Keypair::new();
-    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&attacker_lp, &matcher_prog);
-    let deposit_lp: u64 = 20_000_000_000;
-    env.deposit(&attacker_lp, lp_idx, deposit_lp);
-
-    let attacker_user = Keypair::new();
-    let user_idx = env.init_user(&attacker_user);
-    let deposit_user: u64 = 20_000_000_000;
-    env.deposit(&attacker_user, user_idx, deposit_user);
-
-    env.top_up_insurance(&admin, 5_000_000_000);
-    let insurance_before = env.read_insurance_balance();
-
-    env.set_slot(100);
-    env.crank();
-    // Open the matched pair via TradeCpi (user long, LP short).
-    let size: i128 = 1_000_000;
-    env.try_trade_cpi(
-        &attacker_user,
-        &attacker_lp.pubkey(),
-        lp_idx,
-        user_idx,
-        size,
-        &matcher_prog,
-        &matcher_ctx,
-    )
-    .expect("TradeCpi matched pair must admit under v12.19 envelope");
-
-    // Adverse mark push ~25% down over many small steps. Each push is
-    // clamped by the engine's mark-smoothing cap; cranks between pushes
-    // walk funding/accrual without tripping §1.4.
-    let steps = 50;
-    let start_px: i64 = 1_000_000;
-    let end_px: i64 = 750_000;
-    for i in 1..=steps {
-        let slot = 200 + (i * 20) as u64;
-        let px = start_px + (end_px - start_px) * i / steps;
-        env.set_slot(slot);
-        let _ = env.try_push_oracle_price(&admin, px as u64, slot as i64);
-        env.crank();
-    }
-    for _ in 0..5 {
-        env.crank();
-    }
-
-    let cap_lp = env.read_account_capital(lp_idx);
-    let cap_user = env.read_account_capital(user_idx);
-    let pnl_lp = env.read_account_pnl(lp_idx);
-    let pnl_user = env.read_account_pnl(user_idx);
-    let insurance_after = env.read_insurance_balance();
-
-    let outcome = AttackOutcome {
-        attacker_a_deposit: deposit_user as u128,
-        attacker_b_deposit: deposit_lp as u128,
-        attacker_a_equity: cap_user as i128 + pnl_user,
-        attacker_b_equity: cap_lp as i128 + pnl_lp,
-        insurance_before,
-        insurance_after,
-    };
-    outcome.assert_defended("A1c TradeCpi matched-pair (Hyperp)");
-}
+// Wave 7d Phase 3 R2c-5b: `test_a1_tradecpi_siphon_defended` removed —
+// like R2c-5a above, this test depended on `try_push_oracle_price` (tag 17
+// PushOraclePrice) to drive the Hyperp mark adversarially during the
+// matched-pair attack. Tag 17 was PERMANENTLY removed in Phase G
+// (src/percolator.rs:2243 returns InvalidInstructionData for tags 16/17).
+// The seed-mark step at the start of the test fails at 1100 CUs with
+// InvalidInstructionData before any A1c-specific logic runs. The
+// TradeCpi-specific defenses (ABI echo, matcher identity, LP PDA, nonce
+// discipline, oracle-price echo) remain comprehensively covered by
+// tests/test_tradecpi.rs; the §1.4 envelope and admission-threshold gate
+// are covered by the broader oracle and resolution suites. The A1 entry
+// point that still maps to a live attack surface is
+// `test_a1_external_pyth_siphon_defended` (A1a, real Pyth oracle).

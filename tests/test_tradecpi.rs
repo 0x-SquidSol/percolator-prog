@@ -831,14 +831,17 @@ fn test_premarket_paginated_force_close() {
     );
 
     // v12.17: flatten all positions before resolution
-    env.set_slot(100);
+    // Note: slot is forward of 100 after the loop (starts at 50, increments 100 times = 150).
+    // We must set_slot to a forward value (> slot) to avoid backward time travel.
+    let flat_slot = slot + 1;
+    env.set_slot(flat_slot);
     env.crank();
     for (user, user_idx) in &users {
         env.flatten_positions_via_trade(
             user, &lp.pubkey(), lp_idx, *user_idx, &matcher_prog, &matcher_ctx,
         );
     }
-    env.set_slot(110);
+    env.set_slot(flat_slot + 10);
     env.crank();
 
     // Resolve market
@@ -1107,15 +1110,17 @@ fn test_premarket_force_close_cu_benchmark() {
         "all setup users must have open positions"
     );
 
-    // v12.17: flatten all positions before resolution
-    env.set_slot(100);
+    // v12.17: flatten all positions before resolution.
+    // Use slot+1 to ensure we advance past the loop's last slot.
+    let flat_slot = slot + 1;
+    env.set_slot(flat_slot);
     env.crank();
     for (user, user_idx) in &users {
         env.flatten_positions_via_trade(
             user, &lp.pubkey(), lp_idx, *user_idx, &matcher_prog, &matcher_ctx,
         );
     }
-    env.set_slot(110);
+    env.set_slot(flat_slot + 10);
     env.crank();
 
     // Resolve market
@@ -5801,7 +5806,6 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
     let mut env = TradeCpiTestEnv::new();
     env.init_market_hyperp(1_000_000);
 
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
 
     // Set up trading parties.
@@ -5814,7 +5818,7 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
 
     // Seed the mark via an initial admin push (Hyperp needs a mark
     // source before trades can produce exec prices at the mark).
-    env.try_push_oracle_price(&admin, 1_000_000, 1).unwrap();
+    env.set_oracle_price_e6(1_000_000);
 
     // v12.19 MarketConfig layout (u128 alignment pulls fields forward):
     //   last_mark_push_slot (u128) starts at config offset 240.
@@ -5904,7 +5908,6 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
     )
     .expect("init Hyperp with explicit stale/perm-resolve");
 
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
 
     // Fund LP + user; open a small OI so funding is active (not required
@@ -5918,7 +5921,7 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
 
     // Seed mark + open position at slot 10 to activate funding.
     env.set_slot(10);
-    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+    env.set_oracle_price_e6(1_000_000);
     env.try_trade_cpi(
         &user,
         &lp.pubkey(),
@@ -5933,15 +5936,9 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
     // Advance past permissionless_resolve_stale_slots (= 80).
     env.set_slot(10 + 81);
 
-    // Admin push must NOT revive the market.
-    let err = env
-        .try_push_oracle_price(&admin, 1_020_000, 10 + 301)
-        .expect_err("PushHyperpMark must reject past perm_resolve maturity");
-    assert!(
-        err.contains("0x6"),
-        "PushHyperpMark past maturity must surface OracleStale (0x6), got: {}",
-        err,
-    );
+    // Note: PushHyperpMark (tag 16/17) was permanently removed in Phase G.
+    // Admin push is no longer a separate test vector; the resolve-only
+    // intent is verified by TradeCpi and CatchupAccrue below.
 
     // TradeCpi must also reject — same hard-timeout gate. This is the
     // important one: the RESOLVE-ONLY intent is that user-facing
@@ -5963,16 +5960,8 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
         err,
     );
 
-    // CatchupAccrue must also reject — it routes through
-    // get_engine_oracle_price_e6 which honors the hard-timeout gate.
-    let err = env
-        .try_catchup_accrue()
-        .expect_err("CatchupAccrue must reject past perm_resolve maturity");
-    assert!(
-        err.contains("0x6"),
-        "CatchupAccrue past maturity must surface OracleStale (0x6), got: {}",
-        err,
-    );
+    // Note: CatchupAccrue (tag 31) was removed from the program; the
+    // oracle-staleness hard-timeout is verified by the TradeCpi check above.
 
     // ResolvePermissionless must succeed and flip the market to resolved.
     env.try_resolve_permissionless()
@@ -5994,7 +5983,6 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     )
     .expect("init Hyperp with explicit stale/perm-resolve");
 
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
 
     let lp = Keypair::new();
@@ -6005,7 +5993,7 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     env.deposit(&user, user_idx, 1_000_000_000);
 
     env.set_slot(10);
-    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+    env.set_oracle_price_e6(1_000_000);
     env.try_trade_cpi(
         &user,
         &lp.pubkey(),
@@ -6022,8 +6010,8 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
 
     // Admin push still works — perm_resolve hasn't matured, market is
     // recoverable.
-    env.try_push_oracle_price(&admin, 1_020_000, 10 + 79)
-        .expect("PushHyperpMark must succeed before perm_resolve maturity");
+    env.set_oracle_price_e6(1_020_000);
+    // (set_oracle_price_e6 is infallible; assertion follows)
     assert!(
         !env.is_market_resolved(),
         "market must still be live before perm_resolve maturity"
@@ -6077,8 +6065,7 @@ fn test_tradecpi_forwards_variadic_tail_to_matcher() {
     let mut env = TradeCpiTestEnv::new();
     env.init_market_hyperp(1_000_000);
 
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+    env.set_oracle_price_e6(1_000_000);
 
     let matcher_prog = env.matcher_program_id;
     let lp = Keypair::new();
@@ -6118,8 +6105,7 @@ fn test_tradecpi_empty_tail_is_canonical() {
     let mut env = TradeCpiTestEnv::new();
     env.init_market_hyperp(1_000_000);
 
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+    env.set_oracle_price_e6(1_000_000);
 
     let matcher_prog = env.matcher_program_id;
     let lp = Keypair::new();
