@@ -95,13 +95,18 @@ pub mod constants {
     ///
     /// PERCOLATOR-FORK-SPECIFIC: numerical value KEPT at fork's historical
     /// 7-day ceiling rather than toly's 600 sec. Tightening to 10 minutes
-    /// would invalidate every test fixture (all use 86_400) and require
-    /// a deployer migration that's out of scope for this wrapper sync.
-    /// Phase-4 follow-up should evaluate tightening (toly's argument:
-    /// "a market that tolerates hours/days of stale oracle data lets the
-    /// admin choose a liveness footgun users cannot distinguish at
-    /// runtime from an intentionally permissive market").
-    pub const MAX_ORACLE_STALENESS_SECS: u64 = 7 * 86_400;
+    /// Wave 12-F-2 (partial port of upstream f04720e): tightened from the
+    /// prior 7-day cap to 24h. Upstream's value is 600 (10 min) — that
+    /// would invalidate every test fixture (all use 86_400) and break
+    /// existing markets that tolerate cluster-pause windows. 86_400 (1 day)
+    /// is the sweet spot: matches existing test fixtures exactly, is much
+    /// stricter than 7 days, still tolerates realistic cluster pauses.
+    /// Toly's argument applies at the wrapper level: "a market that
+    /// tolerates hours/days of stale oracle data lets the admin choose a
+    /// liveness footgun users cannot distinguish at runtime from an
+    /// intentionally permissive market" — fork accepts a 24h ceiling
+    /// rather than the 7-day footgun.
+    pub const MAX_ORACLE_STALENESS_SECS: u64 = 86_400;
     /// PORT-23 (toly src/percolator.rs:275). Upper bound on `h_max`. h_max
     /// is independent from `max_accrual_dt_slots` and oracle staleness.
     /// 6_480_000 slots ≈ 30 days at 400 ms/slot.
