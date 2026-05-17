@@ -6792,6 +6792,215 @@ pub mod processor {
         ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // Wave 12-E (port of upstream ede9587 "Fix issue 65 keeper crank
+    // coverage"): wrapper-side defense-in-depth that rejects keeper crank
+    // requests whose candidate list cannot cover every exposed account.
+    // Layered on top of fork's `permissionless_progress_not_atomic`
+    // engine-side recovery branches (Wave 11a-ii-C) — both gates are
+    // additive; if either rejects, the keeper retries with a complete list.
+    //
+    // The wrapper-side guard is cheap (a quick predicate walk before the
+    // engine call) and surfaces a clear `CatchupRequired` error before any
+    // CU is spent in the engine dispatcher. Without it, a keeper supplying
+    // an incomplete candidate list silently advances market time without
+    // touching the uncovered exposed accounts, leaving them stale until the
+    // next caller-supplied list happens to include them.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Predict whether the supplied liquidation policy CAN actually
+    /// liquidate this account at the given oracle price under the engine's
+    /// margin rules. Used as the predicate for
+    /// `phase1_reachable_liquidation`. Returns false for None policy,
+    /// for ExactPartial with malformed q_close_q, or whenever the
+    /// post-liquidation account would still be undercollateralised
+    /// (meaning Phase 1 wouldn't actually clear the exposure).
+    fn keeper_policy_can_liquidate(
+        engine: &RiskEngine,
+        idx: usize,
+        eff: i128,
+        price: u64,
+        policy: Option<percolator::LiquidationPolicy>,
+    ) -> bool {
+        match policy {
+            Some(percolator::LiquidationPolicy::FullClose) => true,
+            Some(percolator::LiquidationPolicy::ExactPartial(q_close_q)) => {
+                let abs_eff = eff.unsigned_abs();
+                if q_close_q == 0 || q_close_q >= abs_eff {
+                    return false;
+                }
+                let account = &engine.accounts[idx];
+                let notional_closed = percolator::wide_math::mul_div_floor_u128(
+                    q_close_q,
+                    price as u128,
+                    percolator::POS_SCALE,
+                );
+                let liq_fee_raw = percolator::wide_math::mul_div_ceil_u128(
+                    notional_closed,
+                    engine.params.liquidation_fee_bps as u128,
+                    10_000,
+                );
+                let liq_fee = core::cmp::min(
+                    core::cmp::max(liq_fee_raw, engine.params.min_liquidation_abs.get()),
+                    engine.params.liquidation_fee_cap.get(),
+                );
+
+                let cap = account.capital.get();
+                let fee_from_capital = core::cmp::min(liq_fee, cap);
+                let fee_shortfall = liq_fee.saturating_sub(fee_from_capital);
+                let current_fc = account.fee_credits.get();
+                let fc_headroom = match current_fc.checked_add(i128::MAX) {
+                    Some(h) if h > 0 => h as u128,
+                    _ => 0u128,
+                };
+                let fee_from_debt = core::cmp::min(fee_shortfall, fc_headroom);
+                let fee_applied = fee_from_capital.saturating_add(fee_from_debt);
+                if fee_applied > i128::MAX as u128 {
+                    return false;
+                }
+                let predicted_eq = match engine
+                    .account_equity_maint_raw(account)
+                    .checked_sub(fee_applied as i128)
+                {
+                    Some(v) => v,
+                    None => return false,
+                };
+
+                let rem_eff = abs_eff - q_close_q;
+                let rem_notional = percolator::wide_math::mul_div_ceil_u128(
+                    rem_eff,
+                    price as u128,
+                    percolator::POS_SCALE,
+                );
+                let proportional = percolator::wide_math::mul_div_floor_u128(
+                    rem_notional,
+                    engine.params.maintenance_margin_bps as u128,
+                    10_000,
+                );
+                let predicted_mm_req =
+                    core::cmp::max(proportional, engine.params.min_nonzero_mm_req);
+                if predicted_mm_req > i128::MAX as u128 {
+                    return false;
+                }
+                predicted_eq > predicted_mm_req as i128
+            }
+            None => false,
+        }
+    }
+
+    /// Walk the keeper-supplied candidate list looking for `idx`. Returns
+    /// true iff `idx` is reachable within the budget AND the policy can
+    /// actually liquidate it (per `keeper_policy_can_liquidate`).
+    fn phase1_reachable_liquidation(
+        engine: &RiskEngine,
+        combined: &[(u16, Option<percolator::LiquidationPolicy>)],
+        idx: u16,
+        price: u64,
+    ) -> Result<bool, ProgramError> {
+        let mut attempts: u16 = 0;
+        let max_candidate_inspections = core::cmp::min(
+            percolator::MAX_TOUCHED_PER_INSTRUCTION as u16,
+            crate::constants::LIQ_BUDGET_PER_CRANK.saturating_mul(4) as u16,
+        );
+        let mut inspected: u16 = 0;
+        for &(candidate_idx, policy) in combined.iter() {
+            if attempts >= crate::constants::LIQ_BUDGET_PER_CRANK as u16
+                || inspected >= max_candidate_inspections
+            {
+                break;
+            }
+            inspected = match inspected.checked_add(1) {
+                Some(v) => v,
+                None => return Ok(false),
+            };
+            let candidate_usize = candidate_idx as usize;
+            if candidate_usize >= percolator::MAX_ACCOUNTS || !engine.is_used(candidate_usize) {
+                continue;
+            }
+            attempts = match attempts.checked_add(1) {
+                Some(v) => v,
+                None => return Ok(false),
+            };
+            if candidate_idx == idx {
+                let eff = effective_pos_q_checked(engine, candidate_usize)?;
+                return Ok(keeper_policy_can_liquidate(
+                    engine,
+                    candidate_usize,
+                    eff,
+                    price,
+                    policy,
+                ));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Defense-in-depth: reject a keeper crank that would advance market
+    /// time (dt > 0 OR price changed) when the supplied candidate list
+    /// cannot Phase-1 liquidate every exposed account. Returns
+    /// CatchupRequired so the keeper retries with a complete list.
+    ///
+    /// The engine-side `permissionless_progress_not_atomic` recovery
+    /// branches (Wave 11a-ii-C) provide the canonical safety net; this
+    /// wrapper-side check surfaces the failure BEFORE the engine call so
+    /// the keeper learns sooner and CU isn't wasted on a recoverable
+    /// dispatch.
+    fn reject_keeper_crank_uncovered_market_progress(
+        engine: &RiskEngine,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        combined: &[(u16, Option<percolator::LiquidationPolicy>)],
+    ) -> Result<(), ProgramError> {
+        let dt_slots = now_slot.saturating_sub(engine.last_market_slot);
+        let _ = funding_rate_e9;
+        if dt_slots == 0 && price == engine.last_oracle_price {
+            return Ok(());
+        }
+
+        let max_accounts = core::cmp::min(
+            engine.params.max_accounts as usize,
+            percolator::MAX_ACCOUNTS,
+        );
+        for idx in 0..max_accounts {
+            if !engine.is_used(idx) {
+                continue;
+            }
+            let eff = effective_pos_q_checked(engine, idx)?;
+            if eff == 0 {
+                continue;
+            }
+            if !phase1_reachable_liquidation(engine, combined, idx as u16, price)? {
+                return Err(PercolatorError::CatchupRequired.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeper-crank-specific accrual wrapper. Combines the stuck-target
+    /// guard, the uncovered-progress guard, and the actual accrue. Replaces
+    /// `ensure_market_accrued_to_now_with_policy` at the keeper crank call
+    /// site.
+    #[allow(dead_code)]
+    fn ensure_market_accrued_to_now_for_keeper_crank(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        combined: &[(u16, Option<percolator::LiquidationPolicy>)],
+    ) -> Result<(), ProgramError> {
+        reject_stuck_target_accrual(config, engine, now_slot, price)?;
+        reject_keeper_crank_uncovered_market_progress(
+            engine,
+            now_slot,
+            price,
+            funding_rate_e9,
+            combined,
+        )?;
+        ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
+    }
+
     /// PORT-3-supporting (toly:3858). Sync per-account fee_slot to `now_slot`
     /// after an authoritative engine touch (settle_account_not_atomic, keeper
     /// touch). Gated by fee_sync_anchor_within_accrued_boundary so the sync
@@ -9216,6 +9425,25 @@ pub mod processor {
         } else {
             engine.last_oracle_price
         };
+
+        // Wave 12-E (port of upstream ede9587): wrapper-side defense-in-depth
+        // — reject the keeper crank BEFORE entering the engine dispatcher if
+        // the supplied candidate list cannot Phase-1 liquidate every exposed
+        // account. The engine's `permissionless_progress_not_atomic` recovery
+        // branches (Wave 11a-ii-C) provide the canonical safety net for the
+        // same class of attack; this guard surfaces the failure sooner +
+        // saves CU on a recoverable dispatch.
+        //
+        // Skipped when `dt == 0 && price unchanged` (no market progress to
+        // gate). When triggered, returns CatchupRequired so the keeper
+        // retries with a complete list.
+        reject_keeper_crank_uncovered_market_progress(
+            engine,
+            clock.slot,
+            price,
+            funding_rate,
+            &candidates,
+        )?;
         let progress_outcome = engine
             .permissionless_progress_not_atomic(percolator::PermissionlessProgressRequest {
                 now_slot: clock.slot,
