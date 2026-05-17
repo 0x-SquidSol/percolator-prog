@@ -1152,6 +1152,43 @@ pub mod policy {
     }
 
     /// PORT-3-supporting (toly src/percolator.rs:620). Account-limited
+    /// Wave 12-F-5 (port of upstream 774fc96): pre-touch recurring fee
+    /// safety. A wrapper may charge recurring maintenance fees BEFORE an
+    /// engine local touch only when the account is already flat/current
+    /// and fee collection cannot outrank same-account mark/funding losses
+    /// or already-materialized negative PnL.
+    ///
+    /// Pure shape predicate (Kani-friendly). All 8 conditions must hold:
+    /// - `used`: slot is allocated
+    /// - `position_basis_q == 0`: no raw basis
+    /// - `effective_pos_q == 0`: no effective position after ADL
+    /// - `pnl >= 0`: no materialized negative PnL
+    /// - `reserved_pnl == 0`: no pending PnL conversion
+    /// - `sched_present == 0`: no scheduled liquidation
+    /// - `pending_present == 0`: no pending close
+    /// - `fee_credits <= 0`: no fee credit reservation
+    /// - `fee_credits != i128::MIN`: avoid arithmetic landmines
+    #[inline]
+    pub fn recurring_fee_pre_touch_safe_shape(
+        used: bool,
+        position_basis_q: i128,
+        effective_pos_q: i128,
+        pnl: i128,
+        reserved_pnl: u128,
+        sched_present: u8,
+        pending_present: u8,
+        fee_credits: i128,
+    ) -> bool {
+        used && position_basis_q == 0
+            && effective_pos_q == 0
+            && pnl >= 0
+            && reserved_pnl == 0
+            && sched_present == 0
+            && pending_present == 0
+            && fee_credits <= 0
+            && fee_credits != i128::MIN
+    }
+
     /// operations may advance the market clock only when no per-slot
     /// price-move or funding signal would accrue against open interest.
     /// Spec §1.4 progress separation: market progress on exposed positions
@@ -6343,6 +6380,16 @@ pub mod processor {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
+        check_idx(engine, idx)?;
+        // Wave 12-F-5 (port of upstream 774fc96): only pre-touch fee-sync
+        // accounts that are already flat/current. Nonflat/stale accounts
+        // must first be touched by an engine path that settles lazy A/K/F
+        // and side effects — otherwise the recurring fee debt would
+        // outrank same-account mark/funding losses or negative PnL,
+        // letting fees be senior to losses (which is a soundness break).
+        if !recurring_fee_pre_touch_safe(engine, idx as usize)? {
+            return Ok(());
+        }
         engine
             .sync_account_fee_to_slot_not_atomic(idx, now_slot, config.maintenance_fee_per_slot)
             .map_err(map_risk_error)
@@ -6367,6 +6414,14 @@ pub mod processor {
         wallclock_slot: u64,
     ) -> Result<(), ProgramError> {
         if config.maintenance_fee_per_slot == 0 {
+            return Ok(());
+        }
+        check_idx(engine, idx)?;
+        // Wave 12-F-5 (port of upstream 774fc96): same loss-senior policy
+        // as sync_account_fee — only pre-touch fee-sync accounts that are
+        // flat/current. Nonflat/stale accounts will be touched later via
+        // an engine path that settles lazy A/K/F first.
+        if !recurring_fee_pre_touch_safe(engine, idx as usize)? {
             return Ok(());
         }
         // Anchor: upper-bound by last_market_slot (no accrue in this
@@ -7206,6 +7261,16 @@ pub mod processor {
                 if idx >= percolator::MAX_ACCOUNTS {
                     continue;
                 }
+                // Wave 12-F-5 (port of upstream 774fc96): bitmap sweep is
+                // loss-senior — only charge recurring fees from
+                // flat/current accounts. Nonflat/stale/reserved/negative
+                // accounts must first be touched by an engine path
+                // (settle/liquidate/close) that resolves their lazy
+                // K/F/mark losses, otherwise fees would outrank the same
+                // account's unsettled position loss.
+                if !recurring_fee_pre_touch_safe(engine, idx)? {
+                    continue;
+                }
                 engine
                     .sync_account_fee_to_slot_not_atomic(
                         idx as u16,
@@ -7443,6 +7508,64 @@ pub mod processor {
             return Err(PercolatorError::EngineAccountNotFound.into());
         }
         Ok(())
+    }
+
+    /// Wave 12-F-5 (port of upstream 774fc96): engine-aware wrapper around
+    /// `policy::recurring_fee_pre_touch_safe_shape`. Loads the account's
+    /// state from `engine.accounts[idx]`, computes `effective_pos_q`
+    /// (lazy A/K/F resolved), and runs the shape predicate.
+    ///
+    /// Returns `Ok(true)` if pre-touch maintenance fees are safe to charge,
+    /// `Ok(false)` if the account is nonflat/stale/reserved/negative and
+    /// must first be touched by an engine path, `Err(EngineCorruptState)`
+    /// if the account holds i128::MIN landmines.
+    ///
+    /// Used by:
+    /// - `sync_account_fee` (the wrapper-level fee sync helper)
+    /// - `sync_account_fee_bounded_to_market` (no-oracle fee sync)
+    /// - keeper crank candidate fee loop
+    /// - keeper crank bitmap fee sweep
+    /// - TradeNoCpi / TradeCpi pre-trade fee sync
+    fn recurring_fee_pre_touch_safe(
+        engine: &RiskEngine,
+        idx: usize,
+    ) -> Result<bool, ProgramError> {
+        if idx >= MAX_ACCOUNTS || !engine.is_used(idx) {
+            return Ok(false);
+        }
+        let acc = &engine.accounts[idx];
+        let fc = acc.fee_credits.get();
+        // Corrupt-state landmines: i128::MIN values would break later
+        // arithmetic, and fc > 0 means the account already has fee CREDIT
+        // (the engine's fee-debt model treats positive fee_credits as
+        // pre-paid; recurring fee sync would re-pay).
+        if acc.position_basis_q == i128::MIN
+            || acc.pnl == i128::MIN
+            || fc == i128::MIN
+            || fc > 0
+        {
+            return Err(PercolatorError::EngineCorruptState.into());
+        }
+        // For flat-basis accounts, compute effective_pos_q (catches the
+        // case where K/F lazy effects still imply a nonzero effective
+        // position). For nonflat-basis accounts, short-circuit with a
+        // sentinel `1` so the shape predicate rejects without the cost
+        // of effective_pos_q computation.
+        let effective_pos_q = if acc.position_basis_q == 0 {
+            effective_pos_q_checked(engine, idx)?
+        } else {
+            1
+        };
+        Ok(crate::policy::recurring_fee_pre_touch_safe_shape(
+            true,
+            acc.position_basis_q,
+            effective_pos_q,
+            acc.pnl,
+            acc.reserved_pnl,
+            acc.sched_present,
+            acc.pending_present,
+            fc,
+        ))
     }
 
     fn verify_vault(
