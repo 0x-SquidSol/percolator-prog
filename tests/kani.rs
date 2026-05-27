@@ -26,6 +26,9 @@ use percolator_prog::matcher_abi::{
     validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_REJECTED, FLAG_VALID,
 };
 use percolator_prog::oracle::{clamp_oracle_price, clamp_toward_with_dt, restart_detected};
+use percolator_prog::oracle_ring::{
+    pyth_price_to_p_yes_e6, value_deviation_e6, POLY_CLAMP_HI, POLY_CLAMP_LO,
+};
 use percolator_prog::policy::{
     abi_ok,
     admin_ok,
@@ -3035,5 +3038,110 @@ fn kani_restart_detected_universal() {
         restart_detected(init, current),
         current > init,
         "restart_detected must return (current > init_restart_slot)"
+    );
+}
+
+// =============================================================================
+// VI. PYTH VALUE-ANCHORING FORMULA (3 proofs)
+// =============================================================================
+//
+// `pyth_price_to_p_yes_e6` is the deterministic price→probability mapping the
+// wrapper computes inside `PushOracleSnapshot` to bound the caller-supplied
+// `p_yes_e6`. Three properties are proven universally:
+//
+//   (a) Output domain: every legitimate input (threshold > 0) yields a value
+//       in [POLY_CLAMP_LO, POLY_CLAMP_HI] = [10_000, 990_000].
+//   (b) At-threshold midpoint: when pyth_price == threshold (delta = 0), the
+//       formula returns exactly 500_000 regardless of the scale value. This
+//       is the load-bearing identity that makes scale-sign-error markets
+//       "stall at midpoint" rather than drift.
+//   (c) Deviation symmetry: `value_deviation_e6(a, b) == value_deviation_e6(b, a)`
+//       for every (a, b). The deviation guard's reject decision must not
+//       depend on argument order.
+//
+// Kani bounds: small enough to keep the SAT solver tractable while still
+// covering the bug classes that matter (sign, clamp boundary, divide-by-zero
+// fallback). The function uses i128 widening internally; with these bounded
+// inputs Kani symbolically explores the full i128 arithmetic path.
+
+const KANI_THRESHOLD_LO: u64 = 1;
+const KANI_THRESHOLD_HI: u64 = 1_000_000_000_000; // $1M in e6 — covers BTC/ETH/SOL etc.
+const KANI_PRICE_HI: u64 = 2_000_000_000_000;
+const KANI_SCALE_ABS: i32 = 10_000;
+
+/// Property (a): For every (price, threshold > 0, scale) within plausible
+/// bounds, the formula's output is in the engine's clamp domain. The
+/// `scale != 0` assume is intentionally omitted — the formula handles
+/// zero scale correctly (numerator = 0, returns exactly the midpoint),
+/// and including zero in the symbolic search exercises the trivial
+/// branch as well.
+#[kani::proof]
+fn kani_pyth_formula_output_in_clamp_domain() {
+    let pyth_price_e6: u64 = kani::any();
+    let threshold_e6: u64 = kani::any();
+    let scale_bps_per_pct: i32 = kani::any();
+
+    kani::assume(pyth_price_e6 <= KANI_PRICE_HI);
+    kani::assume(threshold_e6 >= KANI_THRESHOLD_LO && threshold_e6 <= KANI_THRESHOLD_HI);
+    kani::assume(scale_bps_per_pct >= -KANI_SCALE_ABS && scale_bps_per_pct <= KANI_SCALE_ABS);
+
+    let p = pyth_price_to_p_yes_e6(pyth_price_e6, threshold_e6, scale_bps_per_pct);
+    assert!(p >= POLY_CLAMP_LO, "formula output below LO clamp");
+    assert!(p <= POLY_CLAMP_HI, "formula output above HI clamp");
+}
+
+/// Property (d): For fixed (threshold > 0, scale > 0), the formula is
+/// monotonically non-decreasing in price. This is the load-bearing
+/// semantic the deviation guard relies on: higher price under positive
+/// scale must not produce a lower `p_yes`, otherwise a sign-flip bug
+/// would slip past the clamp-domain proof and let an attacker submit
+/// nonsensical-direction snapshots. Clamp can only make the property
+/// "weakly" hold (== vs strict <) at the boundary; the assertion
+/// `q_a <= q_b` accepts both equality and strict ordering.
+#[kani::proof]
+fn kani_pyth_formula_monotonic_in_price_positive_scale() {
+    let price_a: u64 = kani::any();
+    let price_b: u64 = kani::any();
+    let threshold_e6: u64 = kani::any();
+    let scale_bps_per_pct: i32 = kani::any();
+
+    kani::assume(price_a <= KANI_PRICE_HI);
+    kani::assume(price_b <= KANI_PRICE_HI);
+    kani::assume(price_a <= price_b);
+    kani::assume(threshold_e6 >= KANI_THRESHOLD_LO && threshold_e6 <= KANI_THRESHOLD_HI);
+    kani::assume(scale_bps_per_pct > 0 && scale_bps_per_pct <= KANI_SCALE_ABS);
+
+    let q_a = pyth_price_to_p_yes_e6(price_a, threshold_e6, scale_bps_per_pct);
+    let q_b = pyth_price_to_p_yes_e6(price_b, threshold_e6, scale_bps_per_pct);
+    assert!(q_a <= q_b, "p_yes must be monotonically non-decreasing in price for positive scale");
+}
+
+/// Property (b): `pyth_price == threshold` ⇒ `p_yes == 500_000` for all
+/// non-zero scales. The at-threshold reading is the formula's anchoring
+/// invariant — it makes scale-sign mistakes recoverable (the market stalls
+/// at the midpoint rather than drifting one-sided).
+#[kani::proof]
+fn kani_pyth_formula_at_threshold_is_midpoint() {
+    let threshold_e6: u64 = kani::any();
+    let scale_bps_per_pct: i32 = kani::any();
+
+    kani::assume(threshold_e6 >= KANI_THRESHOLD_LO && threshold_e6 <= KANI_THRESHOLD_HI);
+    kani::assume(scale_bps_per_pct >= -KANI_SCALE_ABS && scale_bps_per_pct <= KANI_SCALE_ABS);
+
+    let p = pyth_price_to_p_yes_e6(threshold_e6, threshold_e6, scale_bps_per_pct);
+    assert_eq!(p, 500_000, "at-threshold reading must be exactly the midpoint");
+}
+
+/// Property (c): The deviation helper is symmetric in its arguments. The
+/// deviation guard in `PushOracleSnapshot` is `|caller - formula|`; the
+/// reject condition must not depend on which argument is which.
+#[kani::proof]
+fn kani_value_deviation_is_symmetric() {
+    let a: u64 = kani::any();
+    let b: u64 = kani::any();
+    assert_eq!(
+        value_deviation_e6(a, b),
+        value_deviation_e6(b, a),
+        "deviation must be symmetric in its arguments"
     );
 }

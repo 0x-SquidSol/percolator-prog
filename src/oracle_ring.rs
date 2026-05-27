@@ -157,6 +157,100 @@ pub fn ring_buf_twap(buf: &[OracleSnapshotEntry; 60], now_slot: u64) -> Option<u
     sum_p.checked_div(count)
 }
 
+/// On-chain price → probability formula for Pyth-typed Polymarket-perp
+/// markets. Pure-fn, deterministic, bounded-domain output. The function
+/// is the value-anchoring half of `PushOracleSnapshot`: when a keeper
+/// submits a `p_yes_e6`, the wrapper computes this independently from
+/// the Pyth price and the per-market `(threshold, scale)` configuration,
+/// then rejects the submission if `|caller - on_chain|` exceeds the
+/// per-market `value_deviation_bps * 100` tolerance.
+///
+/// Formula:
+/// ```text
+///   delta_e6   = pyth_price_e6 - threshold_e6                  (signed i128)
+///   p_change   = scale_bps_per_pct × delta_e6 × 10_000 / threshold_e6
+///   p_yes_e6   = clamp(500_000 + p_change, POLY_CLAMP_LO, POLY_CLAMP_HI)
+/// ```
+///
+/// Algebraic derivation:
+///   * `delta_e6 / threshold_e6 × 100` is the percent change in price.
+///   * Multiplied by `scale_bps_per_pct` gives the change in `p_yes` in
+///     bps of probability.
+///   * One bps of probability = `e6 / 10_000 = 100` in e6 units, so the
+///     change in e6 is `× 100`.
+///   * Combined: `p_change_e6 = scale × delta × 100 × 100 / threshold
+///     = scale × delta × 10_000 / threshold`. The order
+///     `scale × delta × 10_000` first, then `/ threshold` last, keeps
+///     integer-truncation error to at most one e6 unit per division.
+///
+/// Domain assumptions (caller must enforce; otherwise the function
+/// returns a clamped-but-meaningless value):
+///   * `threshold_e6 > 0` — the `SetPythPriceMapping` setter rejects
+///     zero, so this is held by every configured market.
+///   * `scale_bps_per_pct != 0` — likewise rejected by the setter.
+///
+/// # Integer-overflow analysis
+///
+/// All intermediate arithmetic uses `i128` (`scale * delta * 10_000`
+/// followed by `/ threshold`). Bounds:
+///   * `scale_bps_per_pct: i32` → at most `≈ 2^31` in absolute value.
+///   * `delta_e6: i128` → bounded above by `pyth_price_e6: u64` (≈ 2^64)
+///     when threshold = 0, but `threshold > 0` is required; in any
+///     legitimate use `|delta| ≤ pyth_price + threshold < 2^65`.
+///   * `10_000 ≈ 2^14`.
+///   * Worst-case product: `2^31 × 2^65 × 2^14 = 2^110`.
+///   * `i128::MAX ≈ 2^127`, leaving `2^17` headroom — comfortable.
+///
+/// In `release` profile, `overflow-checks = true`, so any unexpected
+/// overflow would panic rather than silently wrap. On the bounded
+/// inputs above, overflow is unreachable.
+///
+/// Edge cases the function handles cleanly:
+///   * `pyth_price_e6 == threshold_e6` → `delta = 0` → `p_change = 0`
+///     → returns exactly `500_000` (midpoint).
+///   * `scale_bps_per_pct < 0` → returns a probability that falls as
+///     price rises (supports "X stays below threshold" market phrasing).
+///   * Very large `|delta_e6|` → output clamps to `POLY_CLAMP_LO` or
+///     `POLY_CLAMP_HI`.
+///   * `scale_bps_per_pct == i32::MIN` does NOT trigger any abs/negation
+///     bug; the function multiplies through with widened `i128` only.
+pub fn pyth_price_to_p_yes_e6(
+    pyth_price_e6: u64,
+    threshold_e6: u64,
+    scale_bps_per_pct: i32,
+) -> u64 {
+    if threshold_e6 == 0 {
+        // Defensive: callers should already reject zero-threshold, but
+        // a fallback to midpoint avoids a panicking division. Returning
+        // midpoint is the most conservative reading.
+        return 500_000;
+    }
+    let price = pyth_price_e6 as i128;
+    let threshold = threshold_e6 as i128;
+    let delta = price - threshold;
+
+    // Plain `*` (not `wrapping_mul`) so the release profile's
+    // `overflow-checks = true` setting catches any future bounds drift
+    // as a panic rather than a silent wrap that would corrupt the
+    // deviation guard. The overflow-proof in the module header shows
+    // that on the legitimate input domain `(scale ∈ [-2^31, 2^31),
+    // |delta| < 2^65, 10_000 < 2^14)` the product stays under `2^110`
+    // — well within `i128::MAX ≈ 2^127`.
+    let numerator = (scale_bps_per_pct as i128) * delta * 10_000;
+    let p_change = numerator / threshold;
+    let p_signed = 500_000i128 + p_change;
+
+    p_signed.clamp(POLY_CLAMP_LO as i128, POLY_CLAMP_HI as i128) as u64
+}
+
+/// Absolute difference between two e6 probabilities. Symmetric in its
+/// arguments. Cheap helper used by `PushOracleSnapshot`'s deviation
+/// guard: `value_deviation_e6(caller_p, formula_p) <= deviation_bps × 100`.
+#[inline]
+pub fn value_deviation_e6(a: u64, b: u64) -> u64 {
+    a.abs_diff(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +497,140 @@ mod tests {
         // is 470_000 + (59 * 1_000) / 2 = 470_000 + 29_500 = 499_500.
         let twap = ring_buf_twap(&buf, 100).unwrap();
         assert_eq!(twap, 499_500);
+    }
+
+    // ----- pyth_price_to_p_yes_e6 -----
+
+    /// $100k threshold in e6 USD = 100_000 * 1_000_000.
+    const BTC_THRESHOLD_E6: u64 = 100_000_000_000;
+
+    #[test]
+    fn formula_at_threshold_returns_midpoint() {
+        // delta = 0 => p_change = 0 => 500_000.
+        assert_eq!(
+            pyth_price_to_p_yes_e6(BTC_THRESHOLD_E6, BTC_THRESHOLD_E6, 100),
+            500_000
+        );
+        assert_eq!(
+            pyth_price_to_p_yes_e6(BTC_THRESHOLD_E6, BTC_THRESHOLD_E6, -100),
+            500_000
+        );
+        assert_eq!(
+            pyth_price_to_p_yes_e6(BTC_THRESHOLD_E6, BTC_THRESHOLD_E6, i32::MIN),
+            500_000
+        );
+    }
+
+    #[test]
+    fn formula_one_percent_above_with_unit_scale() {
+        // scale = 100 bps/pct => 1% price move = +100 bps p_yes = +10_000 e6.
+        let price = BTC_THRESHOLD_E6 + BTC_THRESHOLD_E6 / 100; // +1%
+        assert_eq!(
+            pyth_price_to_p_yes_e6(price, BTC_THRESHOLD_E6, 100),
+            510_000
+        );
+    }
+
+    #[test]
+    fn formula_one_percent_below_with_unit_scale() {
+        // Price 1% below threshold with positive scale => p_yes falls.
+        let price = BTC_THRESHOLD_E6 - BTC_THRESHOLD_E6 / 100;
+        assert_eq!(
+            pyth_price_to_p_yes_e6(price, BTC_THRESHOLD_E6, 100),
+            490_000
+        );
+    }
+
+    #[test]
+    fn formula_negative_scale_inverts_direction() {
+        // Negative scale: price up => p_yes down. (Market: "price stays below.")
+        let price = BTC_THRESHOLD_E6 + BTC_THRESHOLD_E6 / 100;
+        assert_eq!(
+            pyth_price_to_p_yes_e6(price, BTC_THRESHOLD_E6, -100),
+            490_000
+        );
+    }
+
+    #[test]
+    fn formula_clamps_at_extremes() {
+        // Massive +price with positive scale should clamp HIGH.
+        let price = BTC_THRESHOLD_E6 * 2; // +100% price move
+        assert_eq!(
+            pyth_price_to_p_yes_e6(price, BTC_THRESHOLD_E6, 10_000),
+            POLY_CLAMP_HI
+        );
+        // Massive -price (well below) should clamp LOW.
+        assert_eq!(
+            pyth_price_to_p_yes_e6(0, BTC_THRESHOLD_E6, 10_000),
+            POLY_CLAMP_LO
+        );
+    }
+
+    #[test]
+    fn formula_zero_threshold_returns_midpoint() {
+        // Defensive: never panic on divide-by-zero.
+        assert_eq!(pyth_price_to_p_yes_e6(1_000_000, 0, 100), 500_000);
+        assert_eq!(pyth_price_to_p_yes_e6(0, 0, i32::MIN), 500_000);
+    }
+
+    #[test]
+    fn formula_handles_scale_i32_min_without_panic() {
+        // i32::MIN is special: its abs() would overflow. We use i128
+        // widening (with plain `*`, not wrapping) so this must not
+        // panic on any input within the bounded-domain proof.
+        let price = BTC_THRESHOLD_E6 + BTC_THRESHOLD_E6 / 100;
+        let p = pyth_price_to_p_yes_e6(price, BTC_THRESHOLD_E6, i32::MIN);
+        // Extreme negative scale floors the output.
+        assert_eq!(p, POLY_CLAMP_LO);
+    }
+
+    #[test]
+    fn formula_zero_scale_returns_midpoint_everywhere() {
+        // scale = 0 makes the numerator identically zero regardless of
+        // price/threshold; output is exactly 500_000 for any input.
+        // The setter rejects scale = 0, so this is the "what if it
+        // slips through" defensive case.
+        let prices_to_try = [
+            0u64,
+            1,
+            BTC_THRESHOLD_E6 / 2,
+            BTC_THRESHOLD_E6,
+            BTC_THRESHOLD_E6 * 2,
+            u64::MAX / 2,
+        ];
+        for &price in &prices_to_try {
+            assert_eq!(
+                pyth_price_to_p_yes_e6(price, BTC_THRESHOLD_E6, 0),
+                500_000,
+                "zero scale must return midpoint for price={}",
+                price
+            );
+        }
+    }
+
+    #[test]
+    fn formula_price_zero_with_positive_scale_clamps_low() {
+        // Price = 0 means delta = -threshold, p_change = -scale * 10_000
+        // = -100 * 10_000 = -1_000_000. p_signed = 500_000 - 1_000_000
+        // = -500_000, clamp pulls it up to POLY_CLAMP_LO.
+        assert_eq!(
+            pyth_price_to_p_yes_e6(0, BTC_THRESHOLD_E6, 100),
+            POLY_CLAMP_LO
+        );
+        // Same scenario with negative scale floods the output high.
+        assert_eq!(
+            pyth_price_to_p_yes_e6(0, BTC_THRESHOLD_E6, -100),
+            POLY_CLAMP_HI
+        );
+    }
+
+    // ----- value_deviation_e6 -----
+
+    #[test]
+    fn deviation_symmetric_and_bounded() {
+        assert_eq!(value_deviation_e6(500_000, 510_000), 10_000);
+        assert_eq!(value_deviation_e6(510_000, 500_000), 10_000);
+        assert_eq!(value_deviation_e6(500_000, 500_000), 0);
+        assert_eq!(value_deviation_e6(0, u64::MAX), u64::MAX);
     }
 }

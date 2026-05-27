@@ -17541,6 +17541,18 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // Mapping presence: refuse any push on a market whose Pyth
+        // price→probability mapping has not yet been configured. The
+        // sentinel is `value_deviation_bps == 0` — every successful
+        // `SetPythPriceMapping` sets it strictly positive. Without the
+        // mapping, the deviation guard has no formula to compare against
+        // and the value-injection class would be open. Treat unmapped
+        // markets as not-yet-tradeable.
+        if config.value_deviation_bps == 0 {
+            msg!("PushOracleSnapshot: market not mapped yet (call SetPythPriceMapping first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         let clock = Clock::get()?;
 
         // Pyth read: validates owner, verification level, feed_id,
@@ -17592,6 +17604,39 @@ pub mod processor {
         // attempt).
         let p_yes_clamped = oracle_ring::ring_buf_clamp(p_yes_e6);
 
+        // Value-anchoring deviation guard. Compute the on-chain
+        // deterministic probability from the Pyth observation and the
+        // per-market mapping, then reject the push if the caller's
+        // (clamped) value diverges from it by more than the configured
+        // tolerance. This closes the value-injection class flagged on
+        // the prior `PushOracleSnapshot` commit: even with a permissionless
+        // crank, the caller cannot supply a `p_yes_e6` that materially
+        // disagrees with the deterministic function of the bound Pyth
+        // feed. The compare is against the *clamped* caller value so
+        // an out-of-domain input doesn't sneak past the guard via the
+        // clamp boundary.
+        let formula_p = oracle_ring::pyth_price_to_p_yes_e6(
+            pyth_price_e6,
+            config.pyth_threshold_e6,
+            config.pyth_scale_bps_per_pct,
+        );
+        // `value_deviation_bps × 100` converts the configured bps
+        // tolerance into e6 units. `as u64` is safe — `value_deviation_bps`
+        // is u16 (≤ 2_000 per the setter's MAX_DEVIATION_BPS cap), so
+        // `× 100` fits comfortably in u64.
+        let tolerance_e6 = (config.value_deviation_bps as u64) * 100;
+        let observed_dev = oracle_ring::value_deviation_e6(p_yes_clamped, formula_p);
+        if observed_dev > tolerance_e6 {
+            msg!(
+                "PushOracleSnapshot: deviation guard rejects (observed={} > tolerance={}, p_caller={} p_formula={})",
+                observed_dev,
+                tolerance_e6,
+                p_yes_clamped,
+                formula_p
+            );
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
         let entry = state::OracleSnapshotEntry {
             p_yes_e6: p_yes_clamped,
             source_timestamp: publish_time,
@@ -17614,6 +17659,17 @@ pub mod processor {
             pyth_price_e6,
             publish_time,
             clock.slot
+        );
+        // Formula-output log: lets off-chain reconcilers tail program
+        // logs and compare `p_formula` against their independent
+        // recomputation. A drift in this number signals either a
+        // formula-implementation bug or a Pyth-feed substitution that
+        // bypassed the feed_id check (which would be a deeper bug).
+        msg!(
+            "PushOracleSnapshot: p_formula={} deviation_observed={} deviation_tolerance={}",
+            formula_p,
+            observed_dev,
+            tolerance_e6
         );
         Ok(())
     }
