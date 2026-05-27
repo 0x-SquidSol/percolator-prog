@@ -17057,24 +17057,51 @@ pub mod processor {
     // condition-id is set, the matcher CPI has no oracle to read from
     // (`ring_buf_last` returns None on the zero-default ring).
     //
-    // Security posture:
+    // Admin-trust assumption (DOCUMENTED IN-LINE, NOT CHECKABLE ON-CHAIN):
+    //   The 32-byte `condition_id` is the Polymarket CTF identifier for
+    //   the event on Polygon. There is NO cross-chain proof here that the
+    //   supplied bytes match a real Polymarket condition or that they
+    //   match what the front-end advertises to users. Users must trust
+    //   the admin (currently a 2-of-3 dev multisig) to bind correctly.
+    //   The structured success log emitted at the bottom of this handler
+    //   is the off-chain reconciliation primitive: indexers should
+    //   verify the logged condition_id against the advertised market.
+    //   A future Council-gated multisig + `metadata_uri_hash` + activation
+    //   timelock are the longer-term mitigations.
+    //
+    // Security posture (all gates are checked in order; first failure
+    // returns and writes nothing):
+    //
     //   * Admin-only (matches the rest of the wrapper's config setters).
-    //   * Refuses any market with `market_kind != 2` — legacy perp /
-    //     hyperp / native-prediction slabs can never carry a Polymarket
-    //     binding.
-    //   * One-shot: refuses to overwrite a non-zero `polymarket_condition_id`.
-    //     A subsequent change requires the future Council-gated
-    //     re-link instruction, which lives behind a higher authority
-    //     threshold and is intentionally not exposed here.
-    //   * Rejects the all-zero `condition_id` — it is the sentinel value
-    //     for "unbound" and must never appear as a valid binding.
-    //   * Rejects `oracle_source` values outside `{0, 1, 2}` — the
-    //     wrapper's future `PushOracleSnapshot` handler dispatches on
-    //     this byte and an unknown value would silently route to nothing.
+    //   * Refuses any market with `market_kind != 2`.
+    //   * Refuses any market with open positions (`num_used_accounts > 0`).
+    //     Without this gate, an admin could leave the market unlinked,
+    //     observe user deposit composition, then pick a binding that
+    //     favours pre-positioned admin trades. Linking must happen
+    //     against an empty slab.
+    //   * Refuses paused or resolved markets — descriptor binding on a
+    //     non-tradeable slab is operator confusion at best, ghost-fund
+    //     setup at worst.
+    //   * One-shot: refuses to overwrite a non-zero
+    //     `polymarket_condition_id`. The only legal change path is a
+    //     future Council-gated re-link instruction.
+    //   * Rejects the all-zero `condition_id` input (sentinel = "unbound").
+    //   * **V1 fail-closed: `oracle_source` MUST be 0 (Pyth).** Sources
+    //     1 (custom keeper) and 2 (Switchboard) are reserved in the
+    //     discriminator space but rejected at runtime until separate
+    //     commits add the corresponding authority/feed binding fields
+    //     to `MarketConfig`. Linking with `oracle_source = 1` today
+    //     would leave the market "discriminator-set but signer-unbound" —
+    //     `PushOracleSnapshot` would have no signer authority to verify
+    //     against. Fail-closed is the safe default.
+    //   * Pyth path additionally requires `MarketConfig.index_feed_id`
+    //     to be non-zero. Linking a market with `index_feed_id == [0;32]`
+    //     would yield a Pyth-typed market that cannot be priced — funds
+    //     would enter at deposit and get stuck.
     //
     // This handler intentionally does NOT touch the oracle ring buffer;
     // it sets only the binding fields. The first ring write is the
-    // responsibility of the keeper / `PushOracleSnapshot` flow.
+    // responsibility of the future `PushOracleSnapshot` handler.
     #[inline(never)]
     fn handle_link_polymarket_market<'a>(
         program_id: &Pubkey,
@@ -17093,14 +17120,38 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
+        // Gate: pause + resolved state. Cheap defence-in-depth — these
+        // states should not coexist with an unlinked kind=2 slab in
+        // legitimate flow, but the check costs nothing.
+        if state::is_paused(&data) {
+            msg!("LinkPolymarketMarket: refuses paused market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if state::is_resolved(&data) {
+            msg!("LinkPolymarketMarket: refuses resolved market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Gate: empty slab only. `engine_ref` is scoped to release the
+        // immutable borrow before the later `write_config` mutable
+        // re-borrow.
+        let has_accounts = {
+            let engine = zc::engine_ref(&data)?;
+            engine.num_used_accounts > 0
+        };
+        if has_accounts {
+            msg!(
+                "LinkPolymarketMarket: refuses non-empty slab (linking must precede any deposit/trade)"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         let header = state::read_header(&data);
         require_admin(header.admin, a_admin.key)?;
 
         let mut config = state::read_config(&data);
 
-        // Gate: only Polymarket-perp markets carry a binding. Refuse to
-        // pollute a legacy perp (kind=0) / native-prediction (kind=1) /
-        // hyperp slab.
+        // Gate: only Polymarket-perp markets carry a binding.
         if config.market_kind != 2 {
             msg!(
                 "LinkPolymarketMarket: refuses market_kind={} (only kind=2/PerpOnPolymarket eligible)",
@@ -17109,10 +17160,7 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Gate: one-shot. If a non-zero condition_id is already on file,
-        // re-linking is a privilege-escalation surface (admin could
-        // rebind to a different event mid-life and rug live positions).
-        // The future Council-gated re-link instruction is the only path.
+        // Gate: one-shot. Re-link path is Council-gated and not exposed here.
         if config.polymarket_condition_id != [0u8; 32] {
             msg!("LinkPolymarketMarket: condition_id already set; re-link requires Council path");
             return Err(ProgramError::InvalidAccountData);
@@ -17124,31 +17172,50 @@ pub mod processor {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        // Gate: oracle_source must be a known discriminator.
-        //   0 = Pyth
-        //   1 = custom keeper (2-of-3 Squads multisig)
-        //   2 = Switchboard On-Demand
-        if oracle_source > 2 {
+        // Gate: V1 fail-closed — Pyth-only. Sources 1 and 2 are reserved
+        // in the discriminator space but cannot ship until their
+        // authority/feed binding fields land. See handler preamble.
+        if oracle_source != 0 {
             msg!(
-                "LinkPolymarketMarket: oracle_source={} not in {{0=Pyth, 1=Keeper, 2=Switchboard}}",
+                "LinkPolymarketMarket: oracle_source={} rejected (V1 accepts only 0=Pyth; sources 1/2 reserved for future commits that bind keeper/Switchboard authority)",
                 oracle_source
             );
             return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Gate: Pyth-typed market must have a non-zero `index_feed_id`.
+        // Without it, the future PushOracleSnapshot Pyth-arm has nothing
+        // to verify the snapshot against.
+        if config.index_feed_id == [0u8; 32] {
+            msg!(
+                "LinkPolymarketMarket: oracle_source=0 (Pyth) requires non-zero index_feed_id (set at InitMarket)"
+            );
+            return Err(ProgramError::InvalidAccountData);
         }
 
         config.polymarket_condition_id = condition_id;
         config.oracle_source = oracle_source;
         state::write_config(&mut data, &config);
 
-        // Log only the first 8 bytes of the condition-id as a compact
-        // identifier; the full 32-byte value is recoverable from the
-        // post-tx account snapshot. Keeps Solana program log lines under
-        // the 10 kB-ish soft limit and avoids pulling in a base58 dep
-        // just for diagnostics.
+        // Structured success log — primary off-chain reconciliation
+        // primitive. Indexers MUST parse this and reconcile the full
+        // tuple (slab, condition_id, pyth_feed) against the front-end's
+        // advertised market. A mismatch on ANY leg is the signal of a
+        // misbound / malicious link. The 32-byte condition_id and
+        // index_feed_id are each logged as two u128 halves (no base58
+        // dep needed) so both values are precisely recoverable from
+        // program logs.
+        let cid_hi = u128::from_be_bytes(condition_id[..16].try_into().unwrap());
+        let cid_lo = u128::from_be_bytes(condition_id[16..].try_into().unwrap());
+        let feed_hi = u128::from_be_bytes(config.index_feed_id[..16].try_into().unwrap());
+        let feed_lo = u128::from_be_bytes(config.index_feed_id[16..].try_into().unwrap());
         msg!(
-            "LinkPolymarketMarket: bound slab {} to Polymarket condition (first 8 bytes: 0x{:016x}) (oracle_source={})",
+            "LinkPolymarketMarket: slab={} condition_id_hi=0x{:032x} condition_id_lo=0x{:032x} pyth_feed_hi=0x{:032x} pyth_feed_lo=0x{:032x} oracle_source={}",
             a_slab.key,
-            u64::from_be_bytes(condition_id[..8].try_into().unwrap()),
+            cid_hi,
+            cid_lo,
+            feed_hi,
+            feed_lo,
             oracle_source
         );
         Ok(())
