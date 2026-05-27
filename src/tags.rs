@@ -225,6 +225,23 @@ pub const TAG_LINK_POLYMARKET_MARKET: u8 = 84;
 /// Accounts: [caller(signer), slab(writable), pyth_feed]
 pub const TAG_PUSH_ORACLE_SNAPSHOT: u8 = 85;
 
+/// Polymarket-perp: set the deterministic Pyth value-anchoring fields
+/// for a linked `market_kind = 2` slab. One-shot — refuses to overwrite
+/// an already-configured mapping (sentinel: `value_deviation_bps != 0`).
+/// Admin-only. Requires the slab to be already linked
+/// (`polymarket_condition_id != 0`) and bound to Pyth
+/// (`oracle_source = 0`, `index_feed_id != 0`), and empty
+/// (`num_used_accounts == 0`, mirroring the link-time gate).
+///
+/// Writes `pyth_threshold_e6` (u64), `pyth_scale_bps_per_pct` (i32),
+/// `value_deviation_bps` (u16). The `PushOracleSnapshot` handler
+/// consumes these in a future commit to bound the caller-supplied
+/// `p_yes_e6` against an on-chain linear price→probability formula.
+///
+/// Data: tag(1) + threshold(8) + scale(4) + dev_bps(2) = 15 bytes.
+/// Accounts: [admin(signer), slab(writable)]
+pub const TAG_SET_PYTH_PRICE_MAPPING: u8 = 86;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +333,7 @@ mod tests {
             TAG_UPDATE_AUTHORITY,
             TAG_LINK_POLYMARKET_MARKET,
             TAG_PUSH_ORACLE_SNAPSHOT,
+            TAG_SET_PYTH_PRICE_MAPPING,
         ];
 
         for i in 0..tags.len() {
@@ -413,6 +431,7 @@ mod tests {
             TAG_UPDATE_AUTHORITY,
             TAG_LINK_POLYMARKET_MARKET,
             TAG_PUSH_ORACLE_SNAPSHOT,
+            TAG_SET_PYTH_PRICE_MAPPING,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)

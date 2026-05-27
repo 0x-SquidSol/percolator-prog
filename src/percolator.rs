@@ -2020,6 +2020,17 @@ pub mod ix {
         PushOracleSnapshot {
             p_yes_e6: u64,
         },
+        /// Polymarket-perp: admin-only one-shot configuration of the
+        /// Pyth value-anchoring fields for a linked kind=2 slab
+        /// (tag 86). Sets `pyth_threshold_e6`, `pyth_scale_bps_per_pct`,
+        /// and `value_deviation_bps`. These configure the deterministic
+        /// price→probability formula used by `PushOracleSnapshot`'s
+        /// deviation guard.
+        SetPythPriceMapping {
+            threshold_e6: u64,
+            scale_bps_per_pct: i32,
+            deviation_bps: u16,
+        },
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -2554,6 +2565,21 @@ pub mod ix {
                     // p_yes_e6(8) = 8 bytes payload.
                     let p_yes_e6 = read_u64(&mut rest)?;
                     Ok(Instruction::PushOracleSnapshot { p_yes_e6 })
+                }
+                86 => {
+                    // Tag 86: SetPythPriceMapping — admin-only one-shot
+                    // configuration of Pyth value-anchoring. Data:
+                    // threshold(8) + scale(4) + dev_bps(2) = 14 bytes.
+                    // `scale` is on-wire u32, reinterpreted as i32 (LE
+                    // bit pattern is identical for both types).
+                    let threshold_e6 = read_u64(&mut rest)?;
+                    let scale_bps_per_pct = read_u32(&mut rest)? as i32;
+                    let deviation_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::SetPythPriceMapping {
+                        threshold_e6,
+                        scale_bps_per_pct,
+                        deviation_bps,
+                    })
                 }
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
@@ -3468,22 +3494,81 @@ pub mod state {
         pub oracle_ring_buf: [OracleSnapshotEntry; 60],
 
         /// Trailing padding to keep `MarketConfig` size a multiple of its
-        /// 16-byte alignment after the Polymarket-perp extension.
-        ///
-        /// Functional-byte breakdown of the extension:
-        ///   `polymarket_condition_id`              32
-        ///   `oracle_source` + `_pad_oracle_source`  8
-        ///   `oracle_ring_buf` (24 × 60)          1440
-        ///   ─────────────────────────────────── ─────
-        ///   subtotal                             1480
-        ///
-        /// `1480 mod 16 = 8`, so 8 bytes here restore 16-alignment.
-        /// Total extension footprint is 1488 bytes.
-        ///
-        /// Future Polymarket-perp extensions may repurpose these bytes
-        /// the same way prior padding fields were repurposed; until
-        /// then it stays zero.
+        /// 16-byte alignment after the Polymarket-perp binding extension.
+        /// (Held over from the original binding-fields commit; new
+        /// extensions below add their own padding at their own tail.)
         pub _pad_polymarket_tail: [u8; 8],
+
+        /// Pyth value-anchoring fields. Define a deterministic linear
+        /// map from a Pyth spot reading to the engine's bounded
+        /// probability domain `[10_000, 990_000]` e6. The map's purpose
+        /// is NOT to perfectly replicate Polymarket's market-implied
+        /// probability (that depends on time-to-resolution, market
+        /// liquidity, etc. — Polymarket's UMA oracle remains the source
+        /// of truth for resolution). It is to provide an on-chain
+        /// sanity bound that the wrapper can check the caller's
+        /// `p_yes_e6` against on every `PushOracleSnapshot`, blocking
+        /// the value-injection class where a keeper supplies an
+        /// arbitrary probability unrelated to the underlying Pyth feed.
+        ///
+        /// Formula (computed inside `PushOracleSnapshot`):
+        /// ```text
+        ///   delta_e6   = pyth_price_e6 - pyth_threshold_e6   (signed)
+        ///   on_chain_p = 500_000 + (delta_e6 * scale_bps_per_pct
+        ///                            * 100 / pyth_threshold_e6)
+        ///   on_chain_p = clamp(on_chain_p, 10_000, 990_000)
+        /// ```
+        /// where `scale_bps_per_pct` is the number of bps that
+        /// `on_chain_p` moves per 1% change in price around the
+        /// threshold (positive = "YES rises with price",
+        /// negative = "YES falls with price"; the inversion supports
+        /// markets phrased like "X stays below threshold").
+        ///
+        /// The deviation guard then accepts a `PushOracleSnapshot` iff:
+        /// ```text
+        ///   |caller_p_yes_e6 - on_chain_p| <= value_deviation_bps * 100
+        /// ```
+        /// (`value_deviation_bps * 100` converts bps to e6.)
+        ///
+        /// All four fields are set together by `SetPythPriceMapping`
+        /// (tag 86), one-shot, before any trade can open. While
+        /// `value_deviation_bps == 0` the market is in a
+        /// "linked-but-unmapped" state and `PushOracleSnapshot` will
+        /// refuse to write to the ring.
+
+        /// Pyth price threshold for this market, in e6-scaled USD (or
+        /// whatever unit the underlying Pyth feed reports). Must be
+        /// non-zero for a configured mapping. Sentinel `0` = unmapped.
+        pub pyth_threshold_e6: u64,
+
+        /// Sensitivity of `on_chain_p` to price moves around the
+        /// threshold. Units: e6 bps per 1% of price change. Signed —
+        /// positive means "YES probability rises as Pyth price rises".
+        /// Zero is a degenerate "always-output-midpoint" configuration
+        /// and is refused by `SetPythPriceMapping`.
+        pub pyth_scale_bps_per_pct: i32,
+
+        /// Maximum allowed `|caller_p_yes_e6 - on_chain_p|` for the
+        /// deviation guard, in bps of the e6 probability space.
+        /// E.g., `value_deviation_bps = 1500` = ±15% deviation
+        /// allowed. Must be non-zero for a configured mapping;
+        /// sentinel `0` = unmapped (PushOracleSnapshot will refuse).
+        ///
+        /// Operator note on choosing the value: this is a per-market
+        /// hard ceiling on how far the caller-supplied `p_yes_e6` may
+        /// differ from the on-chain formula's reading. Typical
+        /// deployments pick `100-500` bps (1-5%) — small enough to
+        /// catch off-formula injections, large enough to absorb
+        /// legitimate keeper-side smoothing / confidence adjustments.
+        /// The hard upper cap enforced by `SetPythPriceMapping` is
+        /// significantly tighter than 50% to keep the guard meaningful
+        /// even at its loosest configured setting.
+        pub value_deviation_bps: u16,
+
+        /// 2-byte padding to align the value-anchoring extension to
+        /// 16 bytes (8 + 4 + 2 + 2 = 16). Keeps the struct's overall
+        /// 16-alignment invariant intact.
+        pub _pad_value_anchoring: [u8; 2],
     }
 
     // Compile-time pin: `MarketConfig` total size must be a multiple of 16
@@ -3496,6 +3581,17 @@ pub mod state {
     // build time — before `bytemuck::derive(Pod)` runs into the same bug
     // at a less obvious location.
     const _: [(); 0] = [(); core::mem::size_of::<MarketConfig>() % 16];
+
+    // Compile-time pin: the value-anchoring extension is exactly 16
+    // bytes (`pyth_threshold_e6` 8 + `pyth_scale_bps_per_pct` 4 +
+    // `value_deviation_bps` 2 + `_pad_value_anchoring` 2 = 16). If a
+    // future field-add reshapes this, the assertion fails and forces
+    // the author to update the alignment math explicitly rather than
+    // letting it drift.
+    const _: [(); 16] = [(); core::mem::size_of::<u64>()
+        + core::mem::size_of::<i32>()
+        + core::mem::size_of::<u16>()
+        + 2];
 
     pub fn slab_data_mut<'a, 'b>(
         ai: &'b AccountInfo<'a>,
@@ -8787,6 +8883,24 @@ pub mod processor {
             Instruction::PushOracleSnapshot { p_yes_e6 } => {
                 handle_push_oracle_snapshot(program_id, accounts, p_yes_e6)?;
             }
+
+            // Polymarket-perp (tag 86): admin-only one-shot configuration
+            // of the Pyth value-anchoring formula (threshold, scale,
+            // deviation tolerance).
+            // Accounts: [admin(signer), slab(writable)]
+            Instruction::SetPythPriceMapping {
+                threshold_e6,
+                scale_bps_per_pct,
+                deviation_bps,
+            } => {
+                handle_set_pyth_price_mapping(
+                    program_id,
+                    accounts,
+                    threshold_e6,
+                    scale_bps_per_pct,
+                    deviation_bps,
+                )?;
+            }
         }
         Ok(())
     }
@@ -9275,6 +9389,10 @@ pub mod processor {
                 on_chain_slot: 0,
             }; 60],
             _pad_polymarket_tail: [0u8; 8],
+            pyth_threshold_e6: 0,
+            pyth_scale_bps_per_pct: 0,
+            value_deviation_bps: 0,
+            _pad_value_anchoring: [0u8; 2],
         };
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
@@ -17496,6 +17614,190 @@ pub mod processor {
             pyth_price_e6,
             publish_time,
             clock.slot
+        );
+        Ok(())
+    }
+
+    // --- SetPythPriceMapping (tag 86) ---
+    //
+    // One-shot admin configuration of the on-chain Pyth value-anchoring
+    // formula for a linked `market_kind = 2` slab. Writes three fields:
+    // `pyth_threshold_e6`, `pyth_scale_bps_per_pct`, `value_deviation_bps`.
+    // The future `PushOracleSnapshot` deviation guard consumes these to
+    // bound the caller-supplied `p_yes_e6` against a deterministic
+    // on-chain price→probability mapping.
+    //
+    // Mirrors `LinkPolymarketMarket`'s gate posture (admin, empty slab,
+    // not-paused, not-resolved, kind=2, linked, Pyth-only, feed present)
+    // so the configurable lifecycle is symmetric: link, map, then
+    // accept the first trade. Re-mapping requires a future Council-gated
+    // path and is intentionally not exposed here.
+    //
+    // Reject gates (in evaluation order; first failure returns and
+    // writes nothing):
+    //
+    //   * Standard structural: slab_guard, require_initialized,
+    //     signer on admin, slab writable.
+    //   * Lifecycle: refuses paused / resolved markets.
+    //   * Emptiness: refuses any slab with `num_used_accounts > 0`.
+    //     Configuration must precede the first deposit / trade so that
+    //     no live position can be settled against a mapping the user
+    //     didn't agree to when entering.
+    //   * Admin: signer must match `header.admin`.
+    //   * Kind: refuses `market_kind != 2`.
+    //   * Oracle-source: refuses `oracle_source != 0`. V1 fail-closed
+    //     to Pyth; mirrors the linker.
+    //   * Link presence: refuses an unlinked slab
+    //     (`polymarket_condition_id == [0; 32]`) and refuses a
+    //     Pyth-typed slab with no `index_feed_id` set. Both are
+    //     `LinkPolymarketMarket` invariants but re-checked here as
+    //     defence against any future drift between handlers.
+    //   * One-shot: refuses to overwrite a non-zero `value_deviation_bps`.
+    //     `value_deviation_bps == 0` is the "unmapped" sentinel and the
+    //     only state where a mapping write is accepted.
+    //   * Input domain:
+    //       - `threshold_e6 > 0` (zero would divide by zero in the
+    //         on-chain formula).
+    //       - `scale_bps_per_pct != 0` (zero is a degenerate "always
+    //         output midpoint" mapping — not a meaningful market).
+    //       - `deviation_bps > 0` (zero would always reject every
+    //         push) and `deviation_bps <= MAX_DEVIATION_BPS`. The cap
+    //         is `2_000` bps (= 20%); at this ceiling a malicious
+    //         caller can still shift `caller_p` from the on-chain
+    //         formula by 20 percentage points of the e6 probability
+    //         space, which is meaningful but bounded. A 50% ceiling
+    //         (the obvious "half the clamp domain" choice) was
+    //         rejected at audit time as too loose — at 50% a caller
+    //         could push `p_yes_e6` anywhere from "formula-50%" to
+    //         "formula+50%", which leaves no daylight between
+    //         "anchored" and "freeform". Typical deployments choose
+    //         100-500 bps (1-5%); 2_000 is the hard ceiling.
+    //
+    // After all gates pass, the three fields are written and a
+    // structured log emits the configured tuple for off-chain
+    // reconcilers.
+    #[inline(never)]
+    fn handle_set_pyth_price_mapping<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        threshold_e6: u64,
+        scale_bps_per_pct: i32,
+        deviation_bps: u16,
+    ) -> ProgramResult {
+        // Hard upper bound on the deviation tolerance. 2_000 bps = 20%
+        // of the e6 probability space (after the guard's `× 100`
+        // bps-to-e6 conversion). A higher cap would let the
+        // caller-supplied `p_yes_e6` diverge so far from the on-chain
+        // formula that the guard adds no meaningful constraint;
+        // a lower cap risks false-positive rejects on legitimate
+        // keeper-side smoothing. Typical deployments choose 100-500
+        // bps; 2_000 is the loosest configuration the contract will
+        // accept.
+        const MAX_DEVIATION_BPS: u16 = 2_000;
+
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if state::is_paused(&data) {
+            msg!("SetPythPriceMapping: refuses paused market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if state::is_resolved(&data) {
+            msg!("SetPythPriceMapping: refuses resolved market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let has_accounts = {
+            let engine = zc::engine_ref(&data)?;
+            engine.num_used_accounts > 0
+        };
+        if has_accounts {
+            msg!(
+                "SetPythPriceMapping: refuses non-empty slab (mapping must precede any deposit/trade)"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+
+        if config.market_kind != 2 {
+            msg!(
+                "SetPythPriceMapping: refuses market_kind={} (only kind=2/PerpOnPolymarket eligible)",
+                config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.oracle_source != 0 {
+            msg!(
+                "SetPythPriceMapping: oracle_source={} unsupported in V1 (Pyth-only)",
+                config.oracle_source
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.polymarket_condition_id == [0u8; 32] {
+            msg!("SetPythPriceMapping: market not linked yet (call LinkPolymarketMarket first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.index_feed_id == [0u8; 32] {
+            msg!("SetPythPriceMapping: index_feed_id is zero on a Pyth-typed market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // One-shot: refuse to overwrite an already-configured mapping.
+        if config.value_deviation_bps != 0 {
+            msg!(
+                "SetPythPriceMapping: mapping already set; re-mapping requires Council path"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Input-domain validation.
+        if threshold_e6 == 0 {
+            msg!("SetPythPriceMapping: threshold_e6 must be non-zero");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if scale_bps_per_pct == 0 {
+            msg!("SetPythPriceMapping: scale_bps_per_pct must be non-zero (zero scale = degenerate always-midpoint formula)");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if deviation_bps == 0 {
+            msg!("SetPythPriceMapping: deviation_bps must be non-zero (zero = always-reject)");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if deviation_bps > MAX_DEVIATION_BPS {
+            msg!(
+                "SetPythPriceMapping: deviation_bps={} exceeds cap {}",
+                deviation_bps,
+                MAX_DEVIATION_BPS
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        config.pyth_threshold_e6 = threshold_e6;
+        config.pyth_scale_bps_per_pct = scale_bps_per_pct;
+        config.value_deviation_bps = deviation_bps;
+        state::write_config(&mut data, &config);
+
+        msg!(
+            "SetPythPriceMapping: slab={} threshold_e6={} scale_bps_per_pct={} deviation_bps={}",
+            a_slab.key,
+            threshold_e6,
+            scale_bps_per_pct,
+            deviation_bps
         );
         Ok(())
     }
