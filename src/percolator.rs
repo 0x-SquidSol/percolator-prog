@@ -2003,6 +2003,15 @@ pub mod ix {
         /// selects which authority slot to overwrite; `new_pubkey`
         /// is the next holder (default = burn).
         UpdateAuthority { kind: u8, new_pubkey: Pubkey },
+        /// Polymarket-perp: bind a `market_kind = 2` slab to a Polymarket
+        /// condition-id + oracle source (tag 84). One-shot: refuses to
+        /// re-bind a market whose `polymarket_condition_id` is already
+        /// non-zero. Admin-only. `oracle_source`: 0=Pyth, 1=custom-keeper,
+        /// 2=Switchboard.
+        LinkPolymarketMarket {
+            condition_id: [u8; 32],
+            oracle_source: u8,
+        },
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -2522,6 +2531,14 @@ pub mod ix {
                     let kind = read_u8(&mut rest)?;
                     let new_pubkey = read_pubkey(&mut rest)?;
                     Ok(Instruction::UpdateAuthority { kind, new_pubkey })
+                }
+                84 => {
+                    // Tag 84: LinkPolymarketMarket — bind a market_kind=2 slab
+                    // to a Polymarket condition-id + oracle source. Data:
+                    // condition_id(32) + oracle_source(1) = 33 bytes payload.
+                    let condition_id = read_bytes32(&mut rest)?;
+                    let oracle_source = read_u8(&mut rest)?;
+                    Ok(Instruction::LinkPolymarketMarket { condition_id, oracle_source })
                 }
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
@@ -3408,9 +3425,10 @@ pub mod state {
 
         /// Polymarket condition-id (32-byte event identifier from
         /// Polymarket's CTF framework on Polygon). Set once by
-        /// `LinkPolymarketMarket` (tag 40) at perp init; immutable
-        /// thereafter except via Council-gated `EmergencyRelink` (tag 44).
-        /// All-zeros = unbound (legacy perp or pre-link prediction slab).
+        /// `LinkPolymarketMarket` (tag 84) at perp init; immutable
+        /// thereafter except via a future Council-gated re-link
+        /// instruction. All-zeros = unbound (legacy perp / pre-link
+        /// prediction slab).
         pub polymarket_condition_id: [u8; 32],
 
         /// Oracle source discriminator.
@@ -3420,7 +3438,7 @@ pub mod state {
         ///       sentiment markets without Pyth coverage)
         ///   2 = Switchboard On-Demand (V2 middle-ground option)
         /// Determines which signer authority the wrapper accepts on
-        /// `PushOracleSnapshot` (tag 41) for this market.
+        /// the future `PushOracleSnapshot` handler for this market.
         pub oracle_source: u8,
         /// 7-byte padding to keep the following struct array 8-aligned.
         pub _pad_oracle_source: [u8; 7],
@@ -3430,17 +3448,21 @@ pub mod state {
         /// (~5 seconds), giving a ~5-minute TWAP window — long enough to
         /// defeat single-block manipulation, short enough that real
         /// news moves through. Read by the matcher CPI at trade time;
-        /// written by `PushOracleSnapshot` (tag 41) under signer +
-        /// monotonic-timestamp + deviation guards.
+        /// written by the future `PushOracleSnapshot` handler under
+        /// signer + monotonic-timestamp + deviation guards.
         pub oracle_ring_buf: [OracleSnapshotEntry; 60],
 
         /// Trailing padding to keep `MarketConfig` size a multiple of its
         /// 16-byte alignment after the Polymarket-perp extension.
         ///
-        /// Polymarket-perp adds 1480 functional bytes
-        /// (`polymarket_condition_id` 32 + `oracle_source` 1 +
-        /// `_pad_oracle_source` 7 + `oracle_ring_buf` 24 × 60 = 1440);
-        /// 1480 mod 16 = 8, so 8 bytes here restore 16-alignment.
+        /// Functional-byte breakdown of the extension:
+        ///   `polymarket_condition_id`              32
+        ///   `oracle_source` + `_pad_oracle_source`  8
+        ///   `oracle_ring_buf` (24 × 60)          1440
+        ///   ─────────────────────────────────── ─────
+        ///   subtotal                             1480
+        ///
+        /// `1480 mod 16 = 8`, so 8 bytes here restore 16-alignment.
         /// Total extension footprint is 1488 bytes.
         ///
         /// Future Polymarket-perp extensions may repurpose these bytes
@@ -8735,6 +8757,13 @@ pub mod processor {
             // SetOracleAuthority and standalone admin setters).
             Instruction::UpdateAuthority { kind, new_pubkey } => {
                 handle_update_authority(program_id, accounts, kind, new_pubkey)?;
+            }
+
+            // Polymarket-perp (tag 84): one-shot bind of a `market_kind = 2`
+            // slab to a Polymarket condition-id + oracle source.
+            // Accounts: [admin(signer), slab(writable)]
+            Instruction::LinkPolymarketMarket { condition_id, oracle_source } => {
+                handle_link_polymarket_market(program_id, accounts, condition_id, oracle_source)?;
             }
         }
         Ok(())
@@ -17017,6 +17046,111 @@ pub mod processor {
         state::write_config(&mut data, &config);
 
         msg!("SetDexPool: pinned pool {} for HYPERP market {}", pool, a_slab.key);
+        Ok(())
+    }
+
+    // --- LinkPolymarketMarket ---
+    //
+    // One-shot bind of a `market_kind = 2` (PerpOnPolymarket) slab to a
+    // Polymarket condition-id + oracle source. This is the gate that turns
+    // an empty Polymarket-perp slab into a tradeable market: until the
+    // condition-id is set, the matcher CPI has no oracle to read from
+    // (`ring_buf_last` returns None on the zero-default ring).
+    //
+    // Security posture:
+    //   * Admin-only (matches the rest of the wrapper's config setters).
+    //   * Refuses any market with `market_kind != 2` — legacy perp /
+    //     hyperp / native-prediction slabs can never carry a Polymarket
+    //     binding.
+    //   * One-shot: refuses to overwrite a non-zero `polymarket_condition_id`.
+    //     A subsequent change requires the future Council-gated
+    //     re-link instruction, which lives behind a higher authority
+    //     threshold and is intentionally not exposed here.
+    //   * Rejects the all-zero `condition_id` — it is the sentinel value
+    //     for "unbound" and must never appear as a valid binding.
+    //   * Rejects `oracle_source` values outside `{0, 1, 2}` — the
+    //     wrapper's future `PushOracleSnapshot` handler dispatches on
+    //     this byte and an unknown value would silently route to nothing.
+    //
+    // This handler intentionally does NOT touch the oracle ring buffer;
+    // it sets only the binding fields. The first ring write is the
+    // responsibility of the keeper / `PushOracleSnapshot` flow.
+    #[inline(never)]
+    fn handle_link_polymarket_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        condition_id: [u8; 32],
+        oracle_source: u8,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+
+        // Gate: only Polymarket-perp markets carry a binding. Refuse to
+        // pollute a legacy perp (kind=0) / native-prediction (kind=1) /
+        // hyperp slab.
+        if config.market_kind != 2 {
+            msg!(
+                "LinkPolymarketMarket: refuses market_kind={} (only kind=2/PerpOnPolymarket eligible)",
+                config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Gate: one-shot. If a non-zero condition_id is already on file,
+        // re-linking is a privilege-escalation surface (admin could
+        // rebind to a different event mid-life and rug live positions).
+        // The future Council-gated re-link instruction is the only path.
+        if config.polymarket_condition_id != [0u8; 32] {
+            msg!("LinkPolymarketMarket: condition_id already set; re-link requires Council path");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Gate: reject the all-zero condition_id (sentinel = "unbound").
+        if condition_id == [0u8; 32] {
+            msg!("LinkPolymarketMarket: condition_id must be non-zero");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Gate: oracle_source must be a known discriminator.
+        //   0 = Pyth
+        //   1 = custom keeper (2-of-3 Squads multisig)
+        //   2 = Switchboard On-Demand
+        if oracle_source > 2 {
+            msg!(
+                "LinkPolymarketMarket: oracle_source={} not in {{0=Pyth, 1=Keeper, 2=Switchboard}}",
+                oracle_source
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        config.polymarket_condition_id = condition_id;
+        config.oracle_source = oracle_source;
+        state::write_config(&mut data, &config);
+
+        // Log only the first 8 bytes of the condition-id as a compact
+        // identifier; the full 32-byte value is recoverable from the
+        // post-tx account snapshot. Keeps Solana program log lines under
+        // the 10 kB-ish soft limit and avoids pulling in a base58 dep
+        // just for diagnostics.
+        msg!(
+            "LinkPolymarketMarket: bound slab {} to Polymarket condition (first 8 bytes: 0x{:016x}) (oracle_source={})",
+            a_slab.key,
+            u64::from_be_bytes(condition_id[..8].try_into().unwrap()),
+            oracle_source
+        );
         Ok(())
     }
 

@@ -201,6 +201,16 @@ pub const TAG_ACCEPT_ADMIN: u8 = 82;
 /// kind: 0=ADMIN, 1=ORACLE, 2=INSURANCE, 3=CLOSE.
 pub const TAG_UPDATE_AUTHORITY: u8 = 83;
 
+/// Polymarket-perp: bind a `market_kind = 2` (PerpOnPolymarket) slab to a
+/// Polymarket condition-id and oracle source. One-shot — refuses to
+/// re-bind a market that already carries a non-zero `condition_id`.
+/// Admin-only. Requires `market_kind == 2` (rejects legacy perp /
+/// hyperp / prediction slabs).
+/// Data: tag(1) + condition_id(32) + oracle_source(1) = 34 bytes.
+/// `oracle_source`: 0=Pyth, 1=custom-keeper (2-of-3 multisig), 2=Switchboard.
+/// Accounts: [admin(signer), slab(writable)]
+pub const TAG_LINK_POLYMARKET_MARKET: u8 = 84;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +300,7 @@ mod tests {
             TAG_SET_LP_COLLATERAL_PARAMS,
             TAG_ACCEPT_ADMIN,
             TAG_UPDATE_AUTHORITY,
+            TAG_LINK_POLYMARKET_MARKET,
         ];
 
         for i in 0..tags.len() {
@@ -385,6 +396,7 @@ mod tests {
             TAG_SET_LP_COLLATERAL_PARAMS,
             TAG_ACCEPT_ADMIN,
             TAG_UPDATE_AUTHORITY,
+            TAG_LINK_POLYMARKET_MARKET,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)
