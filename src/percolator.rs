@@ -2012,6 +2012,14 @@ pub mod ix {
             condition_id: [u8; 32],
             oracle_source: u8,
         },
+        /// Polymarket-perp: permissionless oracle-ring crank for a linked
+        /// `market_kind = 2` slab (tag 85). Caller supplies `p_yes_e6`
+        /// (probability of YES, e6-scaled); the handler reads the bound
+        /// Pyth feed for freshness/feed-id validation and uses Pyth's
+        /// `publish_time` as the snapshot's `source_timestamp`.
+        PushOracleSnapshot {
+            p_yes_e6: u64,
+        },
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -2539,6 +2547,13 @@ pub mod ix {
                     let condition_id = read_bytes32(&mut rest)?;
                     let oracle_source = read_u8(&mut rest)?;
                     Ok(Instruction::LinkPolymarketMarket { condition_id, oracle_source })
+                }
+                85 => {
+                    // Tag 85: PushOracleSnapshot — permissionless oracle-ring
+                    // crank for a linked market_kind=2 slab. Data:
+                    // p_yes_e6(8) = 8 bytes payload.
+                    let p_yes_e6 = read_u64(&mut rest)?;
+                    Ok(Instruction::PushOracleSnapshot { p_yes_e6 })
                 }
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
@@ -6511,7 +6526,7 @@ pub mod processor {
         error::{map_risk_error, PercolatorError},
         funding_bps_to_e9, pack_ins_withdraw_meta, unpack_ins_withdraw_meta, INS_WITHDRAW_LAST_SLOT_NONE,
         ix::Instruction,
-        oracle,
+        oracle, oracle_ring,
         state::{self, MarketConfig, SlabHeader},
         zc,
     };
@@ -8764,6 +8779,13 @@ pub mod processor {
             // Accounts: [admin(signer), slab(writable)]
             Instruction::LinkPolymarketMarket { condition_id, oracle_source } => {
                 handle_link_polymarket_market(program_id, accounts, condition_id, oracle_source)?;
+            }
+
+            // Polymarket-perp (tag 85): permissionless oracle-ring crank.
+            // Reads bound Pyth feed for freshness; caller supplies p_yes_e6.
+            // Accounts: [caller(signer), slab(writable), pyth_feed]
+            Instruction::PushOracleSnapshot { p_yes_e6 } => {
+                handle_push_oracle_snapshot(program_id, accounts, p_yes_e6)?;
             }
         }
         Ok(())
@@ -17261,6 +17283,219 @@ pub mod processor {
             feed_hi,
             feed_lo,
             oracle_source
+        );
+        Ok(())
+    }
+
+    // --- PushOracleSnapshot (tag 85) ---
+    //
+    // Permissionless oracle-ring crank for a linked `market_kind = 2`
+    // (PerpOnPolymarket) slab. Reads the bound Pyth feed for freshness
+    // and feed-id validation; the caller supplies `p_yes_e6`. The
+    // snapshot's `source_timestamp` is Pyth's `publish_time` (not
+    // caller-supplied) so monotonicity is enforced against the network's
+    // own clock; `on_chain_slot` is sysvar-derived (not caller-supplied)
+    // so the staleness window in subsequent TWAP reads cannot be bypassed.
+    //
+    // V1 trust posture:
+    //   * Pyth feed validates "this read is fresh, signed by Pyth, for
+    //     the bound feed_id" — i.e., it pins the *time* of the
+    //     observation, not the *probability value*.
+    //   * Caller-supplied `p_yes_e6` is NOT cross-checked against the
+    //     Pyth price on-chain. The deterministic price→probability
+    //     mapping (per-market threshold + sensitivity) is a future
+    //     commit. Until that lands, the caller (typically an off-chain
+    //     keeper) is trusted to compute `p_yes_e6` correctly from the
+    //     Pyth observation.
+    //   * The ring's 60-entry uniform-weight TWAP and the asymmetric
+    //     leverage clamp downstream make single-block price-injection
+    //     costly: an attacker must push consistently divergent values
+    //     across many slots to move the trade-time TWAP, and each
+    //     push pays Solana tx fees.
+    //   * The matcher CPI MUST sanity-check the trade-time TWAP
+    //     against an independent source (indexer-PDA snapshot or a
+    //     simple |Δ| bound) — that gate is forwarded to the matcher
+    //     commit. Without it, this handler is the only line of defence
+    //     and is admittedly thin.
+    //
+    // Reject gates (checked in order; first failure returns and writes
+    // nothing):
+    //
+    //   * Standard structural: slab_guard, require_initialized, signer
+    //     on caller (tx-level accountability — anyone with SOL can
+    //     crank, but the tx must be signed for the runtime to accept it),
+    //     slab writable.
+    //   * State: refuses paused / resolved markets.
+    //   * Kind: refuses `market_kind != 2`. Legacy perp / hyperp /
+    //     native-prediction slabs don't carry an oracle ring.
+    //   * Oracle-source: V1 fail-closed to `oracle_source == 0` (Pyth).
+    //     Sources 1 (custom keeper) and 2 (Switchboard) will be unlocked
+    //     in their own dedicated commits that add the matching
+    //     authority/feed binding fields and their own push paths.
+    //   * Link presence: refuses an unlinked slab. The `condition_id`
+    //     must be set, and `index_feed_id` must be non-zero — both
+    //     gates are enforced by `LinkPolymarketMarket`, but checking
+    //     again here defends against any future drift between Link
+    //     and Push.
+    //   * Pyth: handler reads the supplied Pyth feed account via
+    //     `oracle::read_pyth_price_e6`, which verifies owner =
+    //     `PYTH_RECEIVER_PROGRAM_ID`, `PriceUpdateV2` verification level
+    //     = Full, `feed_id == config.index_feed_id`, price > 0, exponent
+    //     in range, age ≤ `config.max_staleness_secs`, confidence
+    //     interval ≤ `config.conf_filter_bps`.
+    //   * Timestamp sanity: Pyth `publish_time > 0` and
+    //     `publish_time <= i64::MAX / 2`. The upper bound prevents a
+    //     poisoned-monotonicity attack where a single write at
+    //     `i64::MAX` would lock out all future pushes.
+    //   * Monotonic: `publish_time` must be strictly greater than the
+    //     ring's existing most-recent `source_timestamp`. Defends
+    //     against replay of old Pyth observations.
+    //
+    // Side effects:
+    //   * Clamps caller's `p_yes_e6` into the engine's bounded domain
+    //     `[POLY_CLAMP_LO, POLY_CLAMP_HI] = [10_000, 990_000]` before
+    //     storing. Out-of-domain values silently pulled to the
+    //     boundary; the clamped value is what the matcher will read.
+    //   * Writes one `OracleSnapshotEntry { p_yes_e6, source_timestamp,
+    //     on_chain_slot }` into the ring at the slot with the oldest
+    //     existing `source_timestamp` (lowest-index on tie — see
+    //     `oracle_ring::ring_buf_push`).
+    //   * Emits a structured success log including the ring index
+    //     written, the input and clamped probabilities, the observed
+    //     Pyth price (for off-chain reconciliation against the
+    //     caller-supplied probability), and the timestamps used.
+    #[inline(never)]
+    fn handle_push_oracle_snapshot<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        p_yes_e6: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_caller = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_pyth = &accounts[2];
+
+        accounts::expect_signer(a_caller)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if state::is_paused(&data) {
+            msg!("PushOracleSnapshot: refuses paused market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if state::is_resolved(&data) {
+            msg!("PushOracleSnapshot: refuses resolved market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+
+        if config.market_kind != 2 {
+            msg!(
+                "PushOracleSnapshot: refuses market_kind={} (only kind=2/PerpOnPolymarket carries a ring)",
+                config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // V1 fail-closed: only Pyth is supported. Mirrors LinkPolymarketMarket.
+        if config.oracle_source != 0 {
+            msg!(
+                "PushOracleSnapshot: oracle_source={} unsupported in V1 (Pyth-only; sources 1/2 reserved for future commits)",
+                config.oracle_source
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.polymarket_condition_id == [0u8; 32] {
+            msg!("PushOracleSnapshot: market not linked yet (call LinkPolymarketMarket first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Belt-and-braces: LinkPolymarketMarket also enforces non-zero
+        // feed_id when oracle_source = 0. Re-check here in case of any
+        // future drift between the two handlers.
+        if config.index_feed_id == [0u8; 32] {
+            msg!("PushOracleSnapshot: index_feed_id is zero on a Pyth-typed market (Link invariant violated)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let clock = Clock::get()?;
+
+        // Pyth read: validates owner, verification level, feed_id,
+        // price > 0, exponent bounds, staleness, confidence.
+        let (pyth_price_e6, publish_time) = oracle::read_pyth_price_e6(
+            a_pyth,
+            &config.index_feed_id,
+            clock.unix_timestamp,
+            config.max_staleness_secs,
+            config.conf_filter_bps,
+        )?;
+
+        // Defensive: `read_pyth_price_e6` already requires price > 0 and
+        // age >= 0, which together imply publish_time > 0 in any
+        // observable timeline. Re-check anyway — the zero-timestamp
+        // sentinel meaning ("empty slot") is load-bearing for the ring.
+        if publish_time <= 0 {
+            msg!("PushOracleSnapshot: Pyth publish_time {} not strictly positive", publish_time);
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // Upper cap on publish_time leaves ~2^62 of monotonic headroom
+        // (~146 millennia of unix seconds) so a poisoned write at
+        // i64::MAX cannot lock out all future pushes via the
+        // monotonicity gate. Pyth publish_time is unix seconds in
+        // practice — well below this cap.
+        if publish_time > i64::MAX / 2 {
+            msg!("PushOracleSnapshot: Pyth publish_time {} exceeds safety cap", publish_time);
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // Monotonic gate against the ring's most-recent observation.
+        if let Some(last) = oracle_ring::ring_buf_last(&config.oracle_ring_buf) {
+            if publish_time <= last.source_timestamp {
+                msg!(
+                    "PushOracleSnapshot: publish_time={} not greater than ring_last={} (replay/stale)",
+                    publish_time,
+                    last.source_timestamp
+                );
+                return Err(PercolatorError::OracleStale.into());
+            }
+        }
+
+        // Clamp caller's p_yes_e6 into [POLY_CLAMP_LO, POLY_CLAMP_HI].
+        // Out-of-domain values silently pulled to the boundary; the
+        // emitted log records both the input and the clamped value so
+        // off-chain auditors can flag systematic clamping (which would
+        // indicate either a misconfigured market or a manipulation
+        // attempt).
+        let p_yes_clamped = oracle_ring::ring_buf_clamp(p_yes_e6);
+
+        let entry = state::OracleSnapshotEntry {
+            p_yes_e6: p_yes_clamped,
+            source_timestamp: publish_time,
+            on_chain_slot: clock.slot,
+        };
+        let idx = oracle_ring::ring_buf_push(&mut config.oracle_ring_buf, entry);
+        state::write_config(&mut data, &config);
+
+        // Success log split into two `msg!` calls. `solana_program::msg!`
+        // dispatches up to 5 format args via dedicated `sol_log_*`
+        // syscalls; with more, it falls back to a `format!` + `sol_log`
+        // path that allocates on the heap and burns considerably more
+        // CU. Two five-or-fewer-arg calls cost less than one seven-arg
+        // call.
+        msg!("PushOracleSnapshot: slab={} ring_idx={}", a_slab.key, idx);
+        msg!(
+            "PushOracleSnapshot: p_yes_in={} p_yes_clamped={} pyth_price_e6={} publish_time={} on_chain_slot={}",
+            p_yes_e6,
+            p_yes_clamped,
+            pyth_price_e6,
+            publish_time,
+            clock.slot
         );
         Ok(())
     }

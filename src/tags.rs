@@ -211,6 +211,20 @@ pub const TAG_UPDATE_AUTHORITY: u8 = 83;
 /// Accounts: [admin(signer), slab(writable)]
 pub const TAG_LINK_POLYMARKET_MARKET: u8 = 84;
 
+/// Polymarket-perp: push a single oracle snapshot into the
+/// `MarketConfig.oracle_ring_buf` of a linked `market_kind = 2` slab.
+/// Permissionless crank (anyone can call) — trust derives from the
+/// Pyth PriceUpdateV2 account read inside the handler, not from the
+/// signer's identity. The caller supplies `p_yes_e6` (probability of
+/// YES, e6-scaled); the handler reads the bound Pyth feed for
+/// freshness/feed-id validation and uses the Pyth `publish_time` as
+/// the snapshot's `source_timestamp`. Per-market price→probability
+/// derivation is a future commit; today the caller's `p_yes_e6` is
+/// stored after clamping to the engine's `[10_000, 990_000]` domain.
+/// Data: tag(1) + p_yes_e6(8) = 9 bytes.
+/// Accounts: [caller(signer), slab(writable), pyth_feed]
+pub const TAG_PUSH_ORACLE_SNAPSHOT: u8 = 85;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +315,7 @@ mod tests {
             TAG_ACCEPT_ADMIN,
             TAG_UPDATE_AUTHORITY,
             TAG_LINK_POLYMARKET_MARKET,
+            TAG_PUSH_ORACLE_SNAPSHOT,
         ];
 
         for i in 0..tags.len() {
@@ -397,6 +412,7 @@ mod tests {
             TAG_ACCEPT_ADMIN,
             TAG_UPDATE_AUTHORITY,
             TAG_LINK_POLYMARKET_MARKET,
+            TAG_PUSH_ORACLE_SNAPSHOT,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)
