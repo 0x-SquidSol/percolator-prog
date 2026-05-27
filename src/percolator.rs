@@ -43,6 +43,13 @@ declare_id!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
 #[path = "tags.rs"]
 pub mod tags;
 
+/// Polymarket oracle ring-buffer helpers — pure-function fixed-point
+/// math operating on `state::OracleSnapshotEntry` (the 60-entry ring
+/// stored on `MarketConfig.oracle_ring_buf` for `market_kind = 2`
+/// markets). Used by the matcher CPI (TWAP reads) and by
+/// `PushOracleSnapshot` (writes).
+pub mod oracle_ring;
+
 // 1. mod constants
 pub mod constants {
     use crate::state::{MarketConfig, SlabHeader};
