@@ -3240,6 +3240,86 @@ pub mod state {
         ///   requires permissionless_resolve_stale_slots > 0).
         /// - All-zeros: no transfer pending.
         pub pending_admin: [u8; 32],
+
+        // ========================================
+        // Prediction-market extension (V13 layout)
+        // ========================================
+        //
+        // All fields default to zero on a freshly-zeroed account, which is
+        // the legacy-perp interpretation:
+        //   - `market_kind == 0` reads as Perp (no behavior change)
+        //   - `resolution_oracle == [0; 32]` means no oracle bound — only
+        //     prediction-market handlers consult this field
+        //   - timestamps and counters default to 0 (inactive)
+        //
+        // New (Init/Resolve)PredictionMarket handlers populate these
+        // fields when initializing a market with `market_kind != 0`.
+        // Existing perp handlers MUST NOT read these fields when
+        // `market_kind == 0`.
+
+        /// Market-kind discriminator.
+        /// 0 = Perp (legacy default), 1 = PredictionBinary, 2 = PerpOnPrediction.
+        pub market_kind: u8,
+        /// 7-byte padding to align the next field to its natural u64/i64
+        /// alignment. Must remain zero on a zeroed slab.
+        pub _pad_kind: [u8; 7],
+
+        /// Resolution-oracle pubkey — the signer required to call
+        /// `ResolvePredictionMarket` for `market_kind == 1` markets.
+        /// Distinct from `hyperp_authority` (which only pushes hyperp mark
+        /// prices). Burnable post-resolution by the admin via `UpdateAuthority`.
+        pub resolution_oracle: [u8; 32],
+
+        /// Unix timestamp at which the resolution window opens.
+        /// `ResolvePredictionMarket` rejects with `InvalidConfigParam` before
+        /// this time. 0 = unset (resolution rejected unconditionally).
+        pub resolution_open_unix: i64,
+
+        /// Unix timestamp after which permissionless settlement may kick in
+        /// if the resolution oracle has not acted. Bounded above by
+        /// `MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS`. 0 = no permissionless
+        /// fallback configured.
+        pub resolution_deadline_unix: i64,
+
+        /// Lamports posted by the V2 creator as a bond at
+        /// `InitPredictionMarket`. Refunded on clean YES/NO resolution;
+        /// partially slashed on INVALID-mode resolution per `7.2` of the
+        /// proposal. 0 in V1 (admin-gated markets do not post a creator
+        /// bond).
+        pub creator_bond_lamports: u64,
+
+        /// Outcome encoding once a market has finalized:
+        ///   0 = unresolved, 1 = NO, 2 = YES, 3 = INVALID (refund mode).
+        /// Set by `ResolvePredictionMarket` for YES/NO and by
+        /// `ResolveInvalidFinalize` for INVALID after the ratification
+        /// window expires without an upheld dispute.
+        pub resolution_outcome: u8,
+        /// 7-byte padding to keep the following fields naturally aligned.
+        pub _pad_outcome: [u8; 7],
+
+        /// Pending outcome (always 3 when set) recorded during the 48h
+        /// INVALID-mode auto-ratification window. The wrapper transitions
+        /// `resolution_outcome` from 0 to 3 only after
+        /// `ratification_deadline_unix` passes without an upheld dispute.
+        /// 0 = no INVALID proposal in flight.
+        pub resolution_outcome_pending: u8,
+        /// 7-byte padding to keep the following i64 naturally aligned.
+        pub _pad_outcome_pending: [u8; 7],
+
+        /// Unix timestamp at which the 48h INVALID auto-ratification window
+        /// expires and `ResolveInvalidFinalize` becomes permissionlessly
+        /// callable. Set when the resolver signs `ResolvePredictionMarket`
+        /// with outcome=3; reverts to 0 on Council dispute upheld within
+        /// the window. 0 = no ratification in flight.
+        pub ratification_deadline_unix: i64,
+
+        /// Trailing padding to keep `MarketConfig` size a multiple of its
+        /// 16-byte alignment (driven by the u128 fields earlier in the
+        /// struct). Required for `bytemuck::Pod` to derive cleanly. Future
+        /// V13.x extensions may repurpose these bytes the same way prior
+        /// padding fields were repurposed (e.g. `_iw_padding2`,
+        /// `_pad_obsolete_stale_slot`); until then it stays zero.
+        pub _pad_v13_tail: [u8; 8],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -8974,6 +9054,23 @@ pub mod processor {
             // Two-step admin transfer (Phase E, 2026-04-17).
             // No transfer pending at market creation.
             pending_admin: [0u8; 32],
+            // Prediction-market extension (V13 layout). InitMarket creates
+            // legacy perp markets: every field below defaults to zero so
+            // `market_kind == 0` reads as Perp and the prediction-specific
+            // handlers do nothing on this slab. New prediction-market
+            // launches go through InitPredictionMarket (separate handler).
+            market_kind: 0,
+            _pad_kind: [0u8; 7],
+            resolution_oracle: [0u8; 32],
+            resolution_open_unix: 0,
+            resolution_deadline_unix: 0,
+            creator_bond_lamports: 0,
+            resolution_outcome: 0,
+            _pad_outcome: [0u8; 7],
+            resolution_outcome_pending: 0,
+            _pad_outcome_pending: [0u8; 7],
+            ratification_deadline_unix: 0,
+            _pad_v13_tail: [0u8; 8],
         };
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
