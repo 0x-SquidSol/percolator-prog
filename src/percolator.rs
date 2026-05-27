@@ -13903,11 +13903,24 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
+        let config = state::read_config(&data);
+
+        // Refuse Polymarket-perp markets (`market_kind = 2`). Resolution
+        // for kind=2 flows from Polymarket's off-chain UMA optimistic
+        // oracle on Polygon — there is no on-chain dispute window for
+        // these markets. Allowing a challenger to post a bond against a
+        // kind=2 resolution would lock collateral against a dispute
+        // path that has no resolver and no payout.
+        if config.market_kind == 2 {
+            drop(data);
+            msg!("ChallengeSettlement: refuses market_kind=2 (Polymarket-perp uses off-chain UMA dispute)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         if !state::is_resolved(&data) {
             return Err(PercolatorError::MarketNotResolved.into());
         }
 
-        let config = state::read_config(&data);
         drop(data);
 
         let dispute_window_slots = state::get_dispute_window_slots(&config);
@@ -14037,6 +14050,21 @@ pub mod processor {
         let header = state::read_header(&data);
         let config = state::read_config(&data);
         drop(data);
+
+        // Refuse Polymarket-perp markets (`market_kind = 2`). Polymarket
+        // resolution flows from the off-chain UMA optimistic oracle on
+        // Polygon; the wrapper has no on-chain dispute path for kind=2
+        // and `ChallengeSettlement` is gated against creating a dispute
+        // PDA on such a market. Defence-in-depth: even if a legacy
+        // dispute PDA somehow exists from a pre-gate state, the
+        // adjudication path here must not be reachable on kind=2 —
+        // otherwise an admin (legitimate or compromised) could slash /
+        // refund bonds against a resolution Polymarket itself has not
+        // produced.
+        if config.market_kind == 2 {
+            msg!("ResolveDispute: refuses market_kind=2 (Polymarket-perp uses off-chain UMA dispute)");
+            return Err(ProgramError::InvalidAccountData);
+        }
 
         if !crate::policy::admin_ok(header.admin, a_admin.key.to_bytes()) {
             return Err(PercolatorError::EngineUnauthorized.into());
@@ -16893,6 +16921,23 @@ pub mod processor {
         let header = state::read_header(&data);
         require_admin(header.admin, a_admin.key)?;
 
+        let mut config = state::read_config(&data);
+
+        // Refuse Polymarket-perp markets (`market_kind = 2`). The
+        // dispute-window + bond mechanism is the wrapper's native
+        // settlement-challenge path, designed for `market_kind = 1`
+        // (native prediction) markets where the engine itself produces
+        // the resolution price. Polymarket-perp markets resolve
+        // off-chain via Polymarket's UMA optimistic oracle on Polygon;
+        // there is no on-chain dispute window for kind=2, and writing
+        // dispute params here would silently sit on `MarketConfig`
+        // never consulted — a misleading operator state at best, a
+        // foothold for the legacy `ChallengeSettlement` path at worst.
+        if config.market_kind == 2 {
+            msg!("SetDisputeParams: refuses market_kind=2 (Polymarket-perp uses off-chain UMA dispute)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         // Sanity caps to prevent DoS via absurd values:
         // window_slots max ~= 2M (about 8 days at 400ms slots). Anything larger
         // would freeze the market's settlement forever.
@@ -16902,7 +16947,6 @@ pub mod processor {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        let mut config = state::read_config(&data);
         state::set_dispute_window_slots(&mut config, window_slots);
         state::set_dispute_bond_amount(&mut config, bond_amount);
         state::write_config(&mut data, &config);
