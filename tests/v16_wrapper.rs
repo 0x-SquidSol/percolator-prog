@@ -1358,6 +1358,7 @@ fn v16_wrapper_underfunded_flat_sync_sweeps_remaining_capital_once() {
         group
             .accrue_asset_to_not_atomic(0, 1, 100, 0, true)
             .unwrap();
+        group.assets[0].raw_oracle_target_price = 100;
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
     let insurance_before_nonflat_sync = state::read_market(&market.data).unwrap().1.insurance;
@@ -3700,6 +3701,7 @@ fn v16_wrapper_maintenance_fee_sync_charges_recurring_fee_without_forcing_local_
     {
         let (cfg, mut group) = state::read_market(&market.data).unwrap();
         group.accrue_asset_to_not_atomic(0, 1, 50, 0, true).unwrap();
+        group.assets[0].raw_oracle_target_price = 50;
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
 
