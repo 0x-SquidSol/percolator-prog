@@ -3004,6 +3004,51 @@ pub mod state {
     // after _reserved, so this offset is stable at 48.
     const _: [(); 48] = [(); RESERVED_OFF];
 
+    /// One slot in the Polymarket oracle ring buffer carried on
+    /// `MarketConfig` for `market_kind = 2` (PerpOnPolymarket) markets.
+    ///
+    /// 24 bytes, naturally 8-aligned (max field alignment = 8). Pod +
+    /// Zeroable so it embeds inside the bytemuck-derived `MarketConfig`.
+    ///
+    /// Read by the matcher CPI at trade time (the matcher already reads
+    /// `MarketConfig`; no extra account-meta required). Written by
+    /// `PushOracleSnapshot` (tag 41) — see the wrapper handlers — with
+    /// signer + monotonic-timestamp + deviation guards.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct OracleSnapshotEntry {
+        // Layout pinning. Catches accidental field additions / reorderings
+        // at compile time, before bytemuck's `derive(Pod)` would catch the
+        // same class of bug at a less obvious location. The `[(); N] = [();
+        // EXPR]` idiom matches the codebase's existing layout assertions
+        // (RESERVED_OFF at line 3005, ENGINE_ALIGN at line 77).
+        //
+        // If a future change adds a field here, update the size constant
+        // intentionally — that forced edit IS the safety check.
+        /// Implied probability of YES outcome in e6 units (e.g.
+        /// `420_000` = 0.42). Clamped on write to `[10_000, 990_000]`
+        /// (1% – 99%) — leverage math diverges outside that band and
+        /// the engine's bound-asymmetric leverage cap rejects opens
+        /// against an out-of-band mark.
+        pub p_yes_e6: u64,
+        /// Polymarket-side timestamp (unix seconds) at which the
+        /// underlying probability was observed. Strictly monotonic
+        /// across the ring; `PushOracleSnapshot` rejects writes that
+        /// don't advance this value.
+        pub source_timestamp: i64,
+        /// Solana slot at which this snapshot was written on-chain.
+        /// Used for staleness checks (`clock.slot - on_chain_slot`)
+        /// and as the time-weight in `ring_buf_twap` (the helper
+        /// added in the follow-up wrapper commit).
+        pub on_chain_slot: u64,
+    }
+
+    // Compile-time layout pins for the Polymarket-perp extension. Match
+    // the existing `[(); N] = [(); EXPR]` idiom from RESERVED_OFF (line
+    // 3005) and ENGINE_ALIGN (line 77).
+    const _: [(); 24] = [(); core::mem::size_of::<OracleSnapshotEntry>()];
+    const _: [(); 8] = [(); core::mem::align_of::<OracleSnapshotEntry>()];
+
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
     pub struct MarketConfig {
@@ -3201,14 +3246,22 @@ pub mod state {
         /// 0 = enforcement disabled. Set via SetOiCapMultiplier (admin-only).
         pub oi_cap_multiplier_bps: u64,
 
-        /// PERC-314: Dispute window in slots after ResolveMarket during which
-        /// users can ChallengeSettlement. 0 = disputes disabled.
-        /// Set at InitMarket or via SetDisputeParams (admin-only).
+        /// PERC-314 (pre-pivot): Dispute window in slots after ResolveMarket
+        /// during which users could ChallengeSettlement.
+        ///
+        /// DEPRECATED UNDER POLYMARKET-PERP PIVOT — no native dispute system
+        /// on our side; Polymarket runs UMA on the underlying. Field stays in
+        /// the layout for backwards-compatibility with already-initialised
+        /// perp slabs; new prediction-market slabs leave it at zero. Do not
+        /// reintroduce dispute-handling logic without re-opening the
+        /// dispute-system design.
         pub dispute_window_slots: u64,
 
-        /// PERC-314: Bond amount (collateral tokens) required to open a dispute.
-        /// Refunded if dispute is upheld; forfeited to vault if rejected.
-        /// 0 = no bond required. Set at InitMarket or via SetDisputeParams.
+        /// PERC-314 (pre-pivot): Bond amount required to open a dispute.
+        ///
+        /// DEPRECATED UNDER POLYMARKET-PERP PIVOT — paired with
+        /// `dispute_window_slots` above; same rationale. Field stays at zero
+        /// on new slabs.
         pub dispute_bond_amount: u64,
 
         /// PERC-315: LP collateral toggle. 1 = enabled, 0 = disabled.
@@ -3258,7 +3311,10 @@ pub mod state {
         // `market_kind == 0`.
 
         /// Market-kind discriminator.
-        /// 0 = Perp (legacy default), 1 = PredictionBinary, 2 = PerpOnPrediction.
+        /// 0 = Perp (legacy default), 1 = reserved (was `PredictionBinary`
+        /// under the pre-pivot native-prediction-markets plan; no current
+        /// consumer), 2 = PerpOnPolymarket (leveraged perp on a Polymarket
+        /// prediction market via the oracle adapter; the V1 product).
         pub market_kind: u8,
         /// 7-byte padding to align the next field to its natural u64/i64
         /// alignment. Must remain zero on a zeroed slab.
@@ -3270,15 +3326,20 @@ pub mod state {
         /// prices). Burnable post-resolution by the admin via `UpdateAuthority`.
         pub resolution_oracle: [u8; 32],
 
-        /// Unix timestamp at which the resolution window opens.
-        /// `ResolvePredictionMarket` rejects with `InvalidConfigParam` before
-        /// this time. 0 = unset (resolution rejected unconditionally).
+        /// Unix timestamp at which the native resolution window opened.
+        ///
+        /// DEPRECATED UNDER POLYMARKET-PERP PIVOT — Polymarket controls
+        /// resolution timing; we read the equivalent off the oracle adapter,
+        /// not off on-chain config. Stays at zero on new slabs.
         pub resolution_open_unix: i64,
 
-        /// Unix timestamp after which permissionless settlement may kick in
-        /// if the resolution oracle has not acted. Bounded above by
-        /// `MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS`. 0 = no permissionless
-        /// fallback configured.
+        /// Unix timestamp after which native permissionless settlement could
+        /// kick in.
+        ///
+        /// DEPRECATED UNDER POLYMARKET-PERP PIVOT — the equivalent under the
+        /// new product is the `EmergencyUnwind` (tag 43) staleness-trigger
+        /// path, which reads on-chain slot age rather than a configured
+        /// unix deadline. Stays at zero on new slabs.
         pub resolution_deadline_unix: i64,
 
         /// Lamports posted by the V2 creator as a bond at
@@ -3297,30 +3358,100 @@ pub mod state {
         /// 7-byte padding to keep the following fields naturally aligned.
         pub _pad_outcome: [u8; 7],
 
-        /// Pending outcome (always 3 when set) recorded during the 48h
-        /// INVALID-mode auto-ratification window. The wrapper transitions
-        /// `resolution_outcome` from 0 to 3 only after
-        /// `ratification_deadline_unix` passes without an upheld dispute.
-        /// 0 = no INVALID proposal in flight.
+        /// Pending outcome (always 3 when set) recorded during a native
+        /// INVALID auto-ratification window.
+        ///
+        /// DEPRECATED UNDER POLYMARKET-PERP PIVOT — we do not run a native
+        /// ratification window; Polymarket's UMA dispute window runs upstream
+        /// and we wait for the final outcome before calling `TerminalSnap`.
+        /// Stays at zero on new slabs.
         pub resolution_outcome_pending: u8,
         /// 7-byte padding to keep the following i64 naturally aligned.
         pub _pad_outcome_pending: [u8; 7],
 
-        /// Unix timestamp at which the 48h INVALID auto-ratification window
-        /// expires and `ResolveInvalidFinalize` becomes permissionlessly
-        /// callable. Set when the resolver signs `ResolvePredictionMarket`
-        /// with outcome=3; reverts to 0 on Council dispute upheld within
-        /// the window. 0 = no ratification in flight.
+        /// Unix timestamp at which the native INVALID auto-ratification
+        /// window expired.
+        ///
+        /// DEPRECATED UNDER POLYMARKET-PERP PIVOT — paired with
+        /// `resolution_outcome_pending` above; no native ratification under
+        /// the new product. Stays at zero on new slabs.
         pub ratification_deadline_unix: i64,
 
         /// Trailing padding to keep `MarketConfig` size a multiple of its
-        /// 16-byte alignment (driven by the u128 fields earlier in the
-        /// struct). Required for `bytemuck::Pod` to derive cleanly. Future
-        /// V13.x extensions may repurpose these bytes the same way prior
-        /// padding fields were repurposed (e.g. `_iw_padding2`,
-        /// `_pad_obsolete_stale_slot`); until then it stays zero.
+        /// 16-byte alignment after the V13 extensions (driven by the u128
+        /// fields earlier in the struct). Required for `bytemuck::Pod` to
+        /// derive cleanly. The Polymarket-perp extension below adds further
+        /// fields and its own trailing padding.
         pub _pad_v13_tail: [u8; 8],
+
+        // ========================================
+        // Polymarket-perp extension (post-pivot)
+        // ========================================
+        //
+        // Fields appended after the V13 tail under the leveraged-Polymarket-
+        // perp pivot. All default to zero on a freshly-zeroed slab; the
+        // oracle adapter only consults them when `market_kind == 2`
+        // (PerpOnPolymarket).
+        //
+        // Backwards-compatibility note: legacy perp slabs allocated under
+        // an earlier `MarketConfig` size will fail `slab_guard`'s size
+        // check after this commit lands. This is acceptable on the
+        // feature branch (no mainnet exposure) and is documented in the
+        // commit body; the migration story sits with the V1 deploy plan.
+
+        /// Polymarket condition-id (32-byte event identifier from
+        /// Polymarket's CTF framework on Polygon). Set once by
+        /// `LinkPolymarketMarket` (tag 40) at perp init; immutable
+        /// thereafter except via Council-gated `EmergencyRelink` (tag 44).
+        /// All-zeros = unbound (legacy perp or pre-link prediction slab).
+        pub polymarket_condition_id: [u8; 32],
+
+        /// Oracle source discriminator.
+        ///   0 = Pyth (used for price-threshold markets like
+        ///       "BTC > $X on date Y" — fully trust-decentralized)
+        ///   1 = custom keeper (2-of-3 Squads multisigned bot for
+        ///       sentiment markets without Pyth coverage)
+        ///   2 = Switchboard On-Demand (V2 middle-ground option)
+        /// Determines which signer authority the wrapper accepts on
+        /// `PushOracleSnapshot` (tag 41) for this market.
+        pub oracle_source: u8,
+        /// 7-byte padding to keep the following struct array 8-aligned.
+        pub _pad_oracle_source: [u8; 7],
+
+        /// Ring buffer of the last 60 Polymarket-derived probability
+        /// snapshots. Nominal cadence is one push every ~12 Solana slots
+        /// (~5 seconds), giving a ~5-minute TWAP window — long enough to
+        /// defeat single-block manipulation, short enough that real
+        /// news moves through. Read by the matcher CPI at trade time;
+        /// written by `PushOracleSnapshot` (tag 41) under signer +
+        /// monotonic-timestamp + deviation guards.
+        pub oracle_ring_buf: [OracleSnapshotEntry; 60],
+
+        /// Trailing padding to keep `MarketConfig` size a multiple of its
+        /// 16-byte alignment after the Polymarket-perp extension.
+        ///
+        /// Polymarket-perp adds 1480 functional bytes
+        /// (`polymarket_condition_id` 32 + `oracle_source` 1 +
+        /// `_pad_oracle_source` 7 + `oracle_ring_buf` 24 × 60 = 1440);
+        /// 1480 mod 16 = 8, so 8 bytes here restore 16-alignment.
+        /// Total extension footprint is 1488 bytes.
+        ///
+        /// Future Polymarket-perp extensions may repurpose these bytes
+        /// the same way prior padding fields were repurposed; until
+        /// then it stays zero.
+        pub _pad_polymarket_tail: [u8; 8],
     }
+
+    // Compile-time pin: `MarketConfig` total size must be a multiple of 16
+    // (the alignment driven by the u128 fields earlier in the struct).
+    // `% 16 == 0` is expressed as a zero-length array — `N == 0` iff the
+    // remainder is zero. Matches the codebase's `[(); N] = [(); EXPR]`
+    // idiom (RESERVED_OFF line 3005, ENGINE_ALIGN line 77).
+    //
+    // If a future field-add breaks 16-alignment, this assertion fails at
+    // build time — before `bytemuck::derive(Pod)` runs into the same bug
+    // at a less obvious location.
+    const _: [(); 0] = [(); core::mem::size_of::<MarketConfig>() % 16];
 
     pub fn slab_data_mut<'a, 'b>(
         ai: &'b AccountInfo<'a>,
@@ -9071,6 +9202,21 @@ pub mod processor {
             _pad_outcome_pending: [0u8; 7],
             ratification_deadline_unix: 0,
             _pad_v13_tail: [0u8; 8],
+            // Polymarket-perp extension. InitMarket creates legacy perp
+            // markets: every field below defaults to zero so the oracle
+            // adapter sees an unbound slab and the matcher continues to
+            // read the legacy oracle source. Polymarket-bound prediction
+            // markets are initialised via `LinkPolymarketMarket` (tag 40)
+            // which populates these fields after the perp slab exists.
+            polymarket_condition_id: [0u8; 32],
+            oracle_source: 0,
+            _pad_oracle_source: [0u8; 7],
+            oracle_ring_buf: [state::OracleSnapshotEntry {
+                p_yes_e6: 0,
+                source_timestamp: 0,
+                on_chain_slot: 0,
+            }; 60],
+            _pad_polymarket_tail: [0u8; 8],
         };
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
