@@ -106,8 +106,22 @@ pub mod constants {
     pub const LP_VAULT_REGISTRY_SEED: &[u8] = b"lp_vault";
     pub const LP_VAULT_MINT_SEED: &[u8] = b"lp_vault_mint";
     pub const LP_REDEMPTION_SEED: &[u8] = b"lp_redemption";
+    /// LP Vault's backing-domain ledger PDA: ["lp_backing_ledger", market, domain_le].
+    /// Deterministic (vs TopUpBackingBucket's client-managed ledger) so deposit /
+    /// redeem / crank all address the same `BackingDomainLedgerAccountV16`.
+    pub const LP_BACKING_LEDGER_SEED: &[u8] = b"lp_backing_ledger";
 
     pub const LP_VAULT_VERSION: u8 = 1;
+
+    /// Expiry slot stamped on the LP Vault's backing bucket. LP-provided backing
+    /// is permanent until redeemed, so it must never "expire". A large sentinel
+    /// (NOT u64::MAX) is used so that any future `expiry_slot + N` arithmetic
+    /// cannot overflow — verified 2026-05-27 that ALL expiry comparisons in the
+    /// engine + wrapper backing path are bare `<= / >= / < / > / == / !=` with NO
+    /// addition (lp_vault_design.md §5.5 expiry audit). `u64::MAX / 2` is ~4.6e18
+    /// slots ≈ billions of years at Solana's slot rate, and leaves `u64::MAX/2`
+    /// of headroom above it.
+    pub const LP_VAULT_BACKING_EXPIRY_SLOT: u64 = u64::MAX / 2;
 
     /// LP Vault instruction tags. The synced wrapper baseline uses tags
     /// 0-64 densely; 65-71 is the first free contiguous block. (BREAKING_
@@ -751,6 +765,22 @@ pub mod state {
                 crate::constants::LP_REDEMPTION_SEED,
                 registry.as_ref(),
                 redeemer.as_ref(),
+            ],
+            program_id,
+        )
+    }
+
+    /// LP Vault backing-domain ledger PDA: `["lp_backing_ledger", market, domain_le]`.
+    pub fn derive_lp_backing_ledger(
+        program_id: &Pubkey,
+        market_group: &Pubkey,
+        domain: u16,
+    ) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[
+                crate::constants::LP_BACKING_LEDGER_SEED,
+                market_group.as_ref(),
+                &domain.to_le_bytes(),
             ],
             program_id,
         )
@@ -2308,6 +2338,9 @@ pub mod ix {
             oi_reservation_threshold_bps: u16,
             domain: u16,
         },
+        DepositToLpVault {
+            amount: u128,
+        },
     }
 
     impl Instruction {
@@ -2537,6 +2570,9 @@ pub mod ix {
                     redemption_cooldown_slots: read_u64(&mut rest)?,
                     oi_reservation_threshold_bps: read_u16(&mut rest)?,
                     domain: read_u16(&mut rest)?,
+                },
+                66 => Self::DepositToLpVault {
+                    amount: read_u128(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -2926,6 +2962,10 @@ pub mod ix {
                     push_u64(&mut out, redemption_cooldown_slots);
                     push_u16(&mut out, oi_reservation_threshold_bps);
                     push_u16(&mut out, domain);
+                }
+                Self::DepositToLpVault { amount } => {
+                    out.push(66);
+                    push_u128(&mut out, amount);
                 }
             }
             out
@@ -4921,6 +4961,9 @@ pub mod processor {
                 oi_reservation_threshold_bps,
                 domain,
             ),
+            Instruction::DepositToLpVault { amount } => {
+                handle_deposit_to_lp_vault(program_id, accounts, amount)
+            }
         }
     }
 
@@ -5066,6 +5109,263 @@ pub mod processor {
             _reserved: [0u8; 16],
         };
         state::init_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+        Ok(())
+    }
+
+    /// LP Vault — DepositToLpVault (tag 66). Phase 2.B Tier 3 Workstream 4B / Phase D.
+    ///
+    /// Permissionless deposit: moves the depositor's collateral into the LP
+    /// Vault's backing bucket and mints pro-rata LP shares.
+    ///
+    /// Sequence (lp_vault_design.md §5.5): read NAV (Note 2 — strictly from the
+    /// BackingDomainLedger counters via `lp_vault_nav_atoms`, never a token
+    /// balance) → compute shares (`lp_shares_for_deposit`, round DOWN), reject 0
+    /// (Note 1 — `LpVaultZeroSharesMinted`, never silently absorb) → transfer
+    /// depositor→vault (depositor signs as token authority — owns the funds) →
+    /// update backing + ledger via the SAME helpers `handle_top_up_backing_bucket`
+    /// uses (Option A: no duplication; backing-authority asserted as the registry
+    /// PDA in-program rather than carried by the signer) → mint shares (registry
+    /// PDA signs as mint authority) → bump `total_lp_shares_outstanding`.
+    ///
+    /// AUDIT MIRROR: the backing-bucket + BackingDomainLedger update sequence
+    /// below is mirrored from `handle_top_up_backing_bucket` — change BOTH
+    /// together. The differential test `lp_deposit_backing_state_matches_top_up`
+    /// fails mechanically if the two sequences ever drift.
+    ///
+    /// Conservation (design §8 DepositToLpVault row): TokenValueFlowProofV16
+    /// (depositor→vault, balanced), StockReconciliationProofV16 (LP supply++ vs
+    /// vault principal++), ReservationEncumbranceProofV16 +
+    /// SourceCreditLienAggregateProofV16 (backing reservation grows) — all
+    /// produced by the engine's `add_fresh_counterparty_backing_*` /
+    /// `validate_shape` path (which internally validates the reservation
+    /// encumbrance + source-credit lien proofs) plus the explicit token-flow
+    /// (transfer == amount) and stock reconciliation (shares minted == math).
+    #[inline(never)]
+    fn handle_deposit_to_lp_vault<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+    ) -> ProgramResult {
+        let depositor = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let mint_ai = account(accounts, 3)?;
+        let depositor_lp_ata = account(accounts, 4)?;
+        let source_token = account(accounts, 5)?;
+        let vault_token = account(accounts, 6)?;
+        let ledger_ai = account(accounts, 7)?;
+        let token_program = account(accounts, 8)?;
+        let system_program_ai = account(accounts, 9)?;
+
+        expect_signer(depositor)?;
+        expect_writable(depositor)?;
+        expect_writable(market_ai)?;
+        expect_writable(registry_ai)?;
+        expect_writable(mint_ai)?;
+        expect_writable(depositor_lp_ata)?;
+        expect_writable(source_token)?;
+        expect_writable(vault_token)?;
+        expect_writable(ledger_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        // Registry shape + PDA binding.
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        if registry.paused != 0 {
+            return Err(PercolatorError::LpVaultPaused.into());
+        }
+        let (registry_pda, registry_bump) =
+            state::derive_lp_vault_registry(program_id, market_ai.key);
+        expect_key(registry_ai, &registry_pda)?;
+        if registry.market_group != market_ai.key.to_bytes()
+            || mint_ai.key.to_bytes() != registry.lp_mint
+        {
+            return Err(PercolatorError::LpVaultNotFound.into());
+        }
+        let domain = registry.domain as usize;
+
+        // Market preflight: Live + the registry PDA is the backing-bucket
+        // authority for this domain (Note 5 fail-closed — until the operator's
+        // UpdateAssetLifecycle step, deposits reject with LpVaultAuthorityMismatch).
+        let (cfg, mode, configured_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let asset_index = domain / 2;
+        if domain >= configured_slots.saturating_mul(2) || asset_index >= configured_slots {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        {
+            let market_data = market_ai.try_borrow_data()?;
+            let profile = read_oracle_profile_for_asset(&market_data, &cfg, asset_index)?;
+            let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
+        }
+
+        // Token-account checks: depositor owns source; vault is the program vault;
+        // LP ATA belongs to depositor for the LP mint.
+        let mint = primary_collateral_mint(&cfg);
+        let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+        verify_user_token_account(source_token, depositor.key, &mint)?;
+        verify_vault_token_account(vault_token, &vault_authority, &mint)?;
+        verify_user_token_account(depositor_lp_ata, depositor.key, mint_ai.key)?;
+        let amount_u64 = amount_to_u64(amount)?;
+        require_token_balance(source_token, amount_u64)?;
+
+        // Backing-domain ledger PDA: lazily create (program-owned) on first deposit.
+        let (ledger_pda, ledger_bump) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(ledger_ai, &ledger_pda)?;
+        if ledger_ai.data_is_empty() {
+            let rent = Rent::get()?;
+            let len = state::backing_domain_ledger_account_len();
+            invoke_signed(
+                &system_instruction::create_account(
+                    depositor.key,
+                    ledger_ai.key,
+                    rent.minimum_balance(len),
+                    len as u64,
+                    program_id,
+                ),
+                &[depositor.clone(), ledger_ai.clone(), system_program_ai.clone()],
+                &[&[
+                    crate::constants::LP_BACKING_LEDGER_SEED,
+                    market_ai.key.as_ref(),
+                    &registry.domain.to_le_bytes(),
+                    &[ledger_bump],
+                ]],
+            )?;
+        }
+
+        let backing_num = amount
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+
+        // ── Phase 1: NAV (pre-deposit) + shares, no mutation, no token move. ──
+        let shares = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            let ledger_data = ledger_ai.try_borrow_data()?;
+            let (mut ledger, _) = read_or_new_backing_domain_ledger(
+                &ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                &bucket,
+            )?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            let nav = percolator::lp_vault::lp_vault_nav_atoms(
+                ledger.total_principal_atoms,
+                ledger.total_earnings_atoms,
+                ledger.total_earnings_withdrawn_atoms,
+                ledger.cumulative_loss_atoms,
+                ledger.cumulative_recovery_atoms,
+                registry.fee_share_bps,
+            )
+            .map_err(map_v16_error)?;
+            percolator::lp_vault::lp_shares_for_deposit(
+                amount,
+                registry.total_lp_shares_outstanding,
+                nav,
+            )
+            .map_err(map_v16_error)?
+        };
+        // Note 1: never silently mint 0 and absorb the deposit.
+        if shares == 0 {
+            return Err(PercolatorError::LpVaultZeroSharesMinted.into());
+        }
+        let shares_u64 = u64::try_from(shares).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+
+        // ── Phase 2: move depositor collateral into the backing vault. ──
+        transfer_tokens(token_program, source_token, vault_token, depositor, amount_u64)?;
+
+        // ── Phase 3: backing-bucket + ledger update — MIRRORS handle_top_up_backing_bucket. ──
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+            let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+                &ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                &bucket,
+            )?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            let next_vault = group
+                .header
+                .vault
+                .get()
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            add_fresh_counterparty_backing_view(
+                &mut group,
+                domain,
+                backing_num,
+                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+            )?;
+            ledger.total_principal_atoms = ledger
+                .total_principal_atoms
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            ledger.total_deposited_atoms = ledger
+                .total_deposited_atoms
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            group.header.vault = percolator::V16PodU128::new(next_vault);
+            group.validate_shape().map_err(map_v16_error)?;
+            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+        }
+
+        // ── Phase 4: mint LP shares to the depositor (registry PDA signs). ──
+        let mint_ix = spl_token::instruction::mint_to(
+            token_program.key,
+            mint_ai.key,
+            depositor_lp_ata.key,
+            &registry_pda,
+            &[],
+            shares_u64,
+        )?;
+        invoke_signed(
+            &mint_ix,
+            &[
+                mint_ai.clone(),
+                depositor_lp_ata.clone(),
+                registry_ai.clone(),
+                token_program.clone(),
+            ],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_ai.key.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+
+        // ── Phase 5: bump outstanding shares (mirrors the SPL mint supply). ──
+        {
+            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            reg.total_lp_shares_outstanding = reg
+                .total_lp_shares_outstanding
+                .checked_add(shares)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
         Ok(())
     }
 
@@ -6555,6 +6855,13 @@ pub mod processor {
     }
 
     #[inline(never)]
+    // AUDIT MIRROR: the backing-bucket + BackingDomainLedger update sequence in
+    // this handler (add_fresh_counterparty_backing_view + total_principal/
+    // total_deposited increment + vault increment + validate_shape +
+    // write_or_init_backing_domain_ledger) is mirrored inside
+    // `handle_deposit_to_lp_vault` (LP Vault Phase D, Option A). Change BOTH
+    // together. The differential test `lp_deposit_backing_state_matches_top_up`
+    // fails mechanically if the two sequences ever drift.
     fn handle_top_up_backing_bucket<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
