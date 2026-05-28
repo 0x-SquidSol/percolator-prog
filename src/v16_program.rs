@@ -90,6 +90,33 @@ pub mod constants {
     // largest active-leg count that fits the audited stale-trade and crank CU
     // envelope. Additional markets remain usable through separate portfolios.
     pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 14;
+
+    // ── Fork LP Vault (Phase 2.B Tier 3, Workstream 4B) ──────────────────
+    // Account kinds 1-4 are MARKET / PORTFOLIO / BACKING_DOMAIN_LEDGER /
+    // INSURANCE_LEDGER. LP Vault adds two new kinds.
+    pub const KIND_LP_VAULT_REGISTRY: u8 = 5;
+    pub const KIND_LP_REDEMPTION: u8 = 6;
+
+    /// PDA seeds: registry = ["lp_vault", market_group]; mint =
+    /// ["lp_vault_mint", market_group]; redemption =
+    /// ["lp_redemption", registry, redeemer].
+    pub const LP_VAULT_REGISTRY_SEED: &[u8] = b"lp_vault";
+    pub const LP_VAULT_MINT_SEED: &[u8] = b"lp_vault_mint";
+    pub const LP_REDEMPTION_SEED: &[u8] = b"lp_redemption";
+
+    pub const LP_VAULT_VERSION: u8 = 1;
+
+    /// LP Vault instruction tags. The synced wrapper baseline uses tags
+    /// 0-64 densely; 65-71 is the first free contiguous block. (BREAKING_
+    /// CHANGES.md §4's "unused 38-49" snapshot is stale — see
+    /// lp_vault_design.md tag-allocation correction.)
+    pub const TAG_CREATE_LP_VAULT: u8 = 65;
+    pub const TAG_DEPOSIT_TO_LP_VAULT: u8 = 66;
+    pub const TAG_REQUEST_REDEEM_LP_SHARES: u8 = 67;
+    pub const TAG_EXECUTE_REDEMPTION: u8 = 68;
+    pub const TAG_LP_VAULT_CRANK_FEES: u8 = 69;
+    pub const TAG_SET_LP_VAULT_PAUSED: u8 = 70;
+    pub const TAG_CLOSE_LP_VAULT: u8 = 71;
 }
 
 pub mod error {
@@ -128,6 +155,21 @@ pub mod error {
         OracleStale,
         OracleConfTooWide,
         InvalidOracleKey,
+        // ── Fork LP Vault (Phase 2.B Tier 3, Workstream 4B) ──────────────
+        // Appended at the end so existing discriminants (0-29) are unshifted.
+        // Actual Custom() codes: 30-41 in enum order below.
+        LpVaultAlreadyExists,        // Custom(30)
+        LpVaultNotFound,             // Custom(31)
+        LpVaultPaused,               // Custom(32)
+        LpVaultSharesOutstanding,    // Custom(33)
+        LpVaultZeroAmount,           // Custom(34)
+        LpVaultInsufficientShares,   // Custom(35)
+        LpVaultCooldownActive,       // Custom(36)
+        LpVaultOiReservationViolated, // Custom(37)
+        LpVaultNoFeesToCrank,        // Custom(38)
+        LpVaultSupplyMismatch,       // Custom(39)
+        LpVaultAuthorityMismatch,    // Custom(40)
+        LpVaultZeroSharesMinted,     // Custom(41) — Note 1 round-to-zero reject
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -159,7 +201,8 @@ pub mod state {
     use crate::{
         constants::{
             ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, HEADER_LEN,
-            KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_MARKET, KIND_PORTFOLIO, MAGIC,
+            KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_LP_REDEMPTION,
+            KIND_LP_VAULT_REGISTRY, KIND_MARKET, KIND_PORTFOLIO, LP_VAULT_VERSION, MAGIC,
             MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
             ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
             ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
@@ -183,6 +226,7 @@ pub mod state {
         PortfolioLegV16, ResolvedPayoutReceiptV16, V16_MAX_PORTFOLIO_ASSETS_N,
     };
     use solana_program::program_error::ProgramError;
+    use solana_program::pubkey::Pubkey;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -303,6 +347,59 @@ pub mod state {
         pub cumulative_loss_atoms: u128,
         pub last_observed_insurance_atoms: u128,
     }
+
+    /// Fork LP Vault registry — the per-(market_group) overlay that runs a
+    /// per-depositor share layer on top of v16's `BackingDomainLedgerAccountV16`
+    /// (Phase 2.B Tier 3, Workstream 4B; see lp_vault_design.md).
+    ///
+    /// LP shares themselves live in a standard SPL Token-2022 mint
+    /// (`lp_mint`, authority = this registry PDA). This struct holds the
+    /// vault config + bookkeeping. NAV is computed from the bound backing
+    /// domain's `BackingDomainLedgerAccountV16` counters
+    /// (`percolator::lp_vault::lp_vault_nav_atoms`), NEVER from a raw token
+    /// balance — sign-off Note 2 donation-inflation defense.
+    ///
+    /// Layout pins every u128 to a 16-byte-aligned offset so the byte image
+    /// is identical on host (u128 align 16) and SBF (u128 align 8) — the
+    /// same discipline `BackingDomainLedgerAccountV16` uses. Size 160 bytes.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct LpVaultRegistryV16 {
+        pub market_group: [u8; 32],                // 0..32
+        pub lp_mint: [u8; 32],                     // 32..64
+        pub total_lp_shares_outstanding: u128,     // 64..80
+        pub insurance_fee_snapshot_atoms: u128,    // 80..96
+        pub fee_distribution_total_atoms: u128,    // 96..112
+        pub epoch: u64,                            // 112..120
+        pub redemption_cooldown_slots: u64,        // 120..128
+        pub fee_share_bps: u16,                    // 128..130
+        pub oi_reservation_threshold_bps: u16,     // 130..132
+        pub domain: u16,                           // 132..134
+        pub paused: u8,                            // 134
+        pub version: u8,                           // 135
+        pub bump: u8,                              // 136
+        pub mint_bump: u8,                         // 137
+        pub _padding: [u8; 6],                     // 138..144
+        pub _reserved: [u8; 16],                   // 144..160
+    }
+
+    /// Fork LP Vault queued-redemption escrow — one per (registry, redeemer)
+    /// in-flight request. Shares are burned-to-escrow at RequestRedeem and
+    /// finalized at ExecuteRedemption after the registry's cooldown. Size 96.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct LpRedemptionV16 {
+        pub registry: [u8; 32],   // 0..32
+        pub redeemer: [u8; 32],   // 32..64
+        pub shares: u128,         // 64..80
+        pub request_slot: u64,    // 80..88
+        pub version: u8,          // 88
+        pub bump: u8,             // 89
+        pub _padding: [u8; 6],    // 90..96
+    }
+
+    const _: () = assert!(core::mem::size_of::<LpVaultRegistryV16>() == 160);
+    const _: () = assert!(core::mem::size_of::<LpRedemptionV16>() == 96);
 
     pub type AssetOracleStorageV16 = [u8; ASSET_ORACLE_WRAPPER_LEN];
     pub type MarketViewMutV16<'a> = MarketGroupV16ViewMut<'a, AssetOracleStorageV16>;
@@ -493,6 +590,167 @@ pub mod state {
         }
         write_header(data, KIND_INSURANCE_LEDGER)?;
         write_insurance_ledger(data, ledger)
+    }
+
+    // ── Fork LP Vault account helpers (Phase 2.B Tier 3, Workstream 4B) ──
+
+    pub const fn lp_vault_registry_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<LpVaultRegistryV16>()
+    }
+
+    pub const fn lp_redemption_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<LpRedemptionV16>()
+    }
+
+    #[inline]
+    fn validate_lp_vault_registry(reg: &LpVaultRegistryV16) -> Result<(), ProgramError> {
+        if reg.market_group == [0u8; 32]
+            || reg.lp_mint == [0u8; 32]
+            || reg.version != LP_VAULT_VERSION
+            || reg.paused > 1
+            || reg.fee_share_bps > 10_000
+            || reg.oi_reservation_threshold_bps > 10_000
+            || reg._padding != [0u8; 6]
+            || reg._reserved != [0u8; 16]
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn read_lp_vault_registry(data: &[u8]) -> Result<LpVaultRegistryV16, ProgramError> {
+        if data.len() < lp_vault_registry_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, KIND_LP_VAULT_REGISTRY)?;
+        let bytes = data
+            .get(HEADER_LEN..lp_vault_registry_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let reg = bytemuck::pod_read_unaligned(bytes);
+        validate_lp_vault_registry(&reg)?;
+        Ok(reg)
+    }
+
+    #[inline]
+    pub fn write_lp_vault_registry(
+        data: &mut [u8],
+        reg: &LpVaultRegistryV16,
+    ) -> Result<(), ProgramError> {
+        if data.len() < lp_vault_registry_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, KIND_LP_VAULT_REGISTRY)?;
+        validate_lp_vault_registry(reg)?;
+        data.get_mut(HEADER_LEN..lp_vault_registry_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(reg));
+        Ok(())
+    }
+
+    #[inline]
+    pub fn init_lp_vault_registry(
+        data: &mut [u8],
+        reg: &LpVaultRegistryV16,
+    ) -> Result<(), ProgramError> {
+        if data.len() < lp_vault_registry_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        write_header(data, KIND_LP_VAULT_REGISTRY)?;
+        write_lp_vault_registry(data, reg)
+    }
+
+    #[inline]
+    fn validate_lp_redemption(red: &LpRedemptionV16) -> Result<(), ProgramError> {
+        if red.registry == [0u8; 32]
+            || red.redeemer == [0u8; 32]
+            || red.version != LP_VAULT_VERSION
+            || red._padding != [0u8; 6]
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn read_lp_redemption(data: &[u8]) -> Result<LpRedemptionV16, ProgramError> {
+        if data.len() < lp_redemption_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, KIND_LP_REDEMPTION)?;
+        let bytes = data
+            .get(HEADER_LEN..lp_redemption_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let red = bytemuck::pod_read_unaligned(bytes);
+        validate_lp_redemption(&red)?;
+        Ok(red)
+    }
+
+    #[inline]
+    pub fn write_lp_redemption(data: &mut [u8], red: &LpRedemptionV16) -> Result<(), ProgramError> {
+        if data.len() < lp_redemption_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, KIND_LP_REDEMPTION)?;
+        validate_lp_redemption(red)?;
+        data.get_mut(HEADER_LEN..lp_redemption_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(red));
+        Ok(())
+    }
+
+    #[inline]
+    pub fn init_lp_redemption(data: &mut [u8], red: &LpRedemptionV16) -> Result<(), ProgramError> {
+        if data.len() < lp_redemption_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        write_header(data, KIND_LP_REDEMPTION)?;
+        write_lp_redemption(data, red)
+    }
+
+    /// LP Vault Registry PDA: `["lp_vault", market_group]`.
+    pub fn derive_lp_vault_registry(program_id: &Pubkey, market_group: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[crate::constants::LP_VAULT_REGISTRY_SEED, market_group.as_ref()],
+            program_id,
+        )
+    }
+
+    /// LP Vault Mint PDA: `["lp_vault_mint", market_group]`. Mint authority
+    /// is the LP Vault Registry PDA.
+    pub fn derive_lp_vault_mint(program_id: &Pubkey, market_group: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[crate::constants::LP_VAULT_MINT_SEED, market_group.as_ref()],
+            program_id,
+        )
+    }
+
+    /// LP redemption escrow PDA: `["lp_redemption", registry, redeemer]`.
+    pub fn derive_lp_redemption(
+        program_id: &Pubkey,
+        registry: &Pubkey,
+        redeemer: &Pubkey,
+    ) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[
+                crate::constants::LP_REDEMPTION_SEED,
+                registry.as_ref(),
+                redeemer.as_ref(),
+            ],
+            program_id,
+        )
     }
 
     #[inline]
