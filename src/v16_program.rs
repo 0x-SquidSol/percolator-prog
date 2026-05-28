@@ -26,6 +26,9 @@ use solana_program::{
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
+    rent::Rent,
+    system_instruction,
+    system_program,
     sysvar::Sysvar,
 };
 
@@ -2298,6 +2301,13 @@ pub mod ix {
         SwapSecondaryForPrimary {
             amount: u128,
         },
+        // ── Fork LP Vault (Phase 2.B Tier 3, Workstream 4B) — tags 65-71 ──
+        CreateLpVault {
+            fee_share_bps: u16,
+            redemption_cooldown_slots: u64,
+            oi_reservation_threshold_bps: u16,
+            domain: u16,
+        },
     }
 
     impl Instruction {
@@ -2521,6 +2531,12 @@ pub mod ix {
                 },
                 48 => Self::SyncMaintenanceFee {
                     now_slot: read_u64(&mut rest)?,
+                },
+                65 => Self::CreateLpVault {
+                    fee_share_bps: read_u16(&mut rest)?,
+                    redemption_cooldown_slots: read_u64(&mut rest)?,
+                    oi_reservation_threshold_bps: read_u16(&mut rest)?,
+                    domain: read_u16(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -2898,6 +2914,18 @@ pub mod ix {
                 Self::SyncMaintenanceFee { now_slot } => {
                     out.push(48);
                     push_u64(&mut out, now_slot);
+                }
+                Self::CreateLpVault {
+                    fee_share_bps,
+                    redemption_cooldown_slots,
+                    oi_reservation_threshold_bps,
+                    domain,
+                } => {
+                    out.push(65);
+                    push_u16(&mut out, fee_share_bps);
+                    push_u64(&mut out, redemption_cooldown_slots);
+                    push_u16(&mut out, oi_reservation_threshold_bps);
+                    push_u16(&mut out, domain);
                 }
             }
             out
@@ -4880,7 +4908,165 @@ pub mod processor {
             Instruction::SwapSecondaryForPrimary { amount } => {
                 handle_swap_secondary_for_primary(program_id, accounts, amount)
             }
+            Instruction::CreateLpVault {
+                fee_share_bps,
+                redemption_cooldown_slots,
+                oi_reservation_threshold_bps,
+                domain,
+            } => handle_create_lp_vault(
+                program_id,
+                accounts,
+                fee_share_bps,
+                redemption_cooldown_slots,
+                oi_reservation_threshold_bps,
+                domain,
+            ),
         }
+    }
+
+    /// LP Vault — CreateLpVault (tag 65). Phase 2.B Tier 3 Workstream 4B / Phase C.
+    ///
+    /// Admin-gated. Creates the per-market LpVaultRegistry PDA (program-owned)
+    /// and the LP-share SPL mint PDA (authority = registry PDA, supply 0,
+    /// decimals 0 — shares are integer collateral atoms, 1:1 on the fresh
+    /// epoch). The registry is NOT yet the backing-bucket authority: the
+    /// operator runs UpdateAssetLifecycle as a separate step (lp_vault_design.md
+    /// §6 two-step create; deposits fail closed with LpVaultAuthorityMismatch
+    /// until then).
+    ///
+    /// Conservation: structurally pure-meta — creates accounts (rent lamports
+    /// only, via System) and inits a mint at supply 0. No collateral moves, no
+    /// LP shares minted, no backing/source/lien/reservation state touched. All
+    /// 4 conservation-proof obligations are N/A (design §8 CreateLpVault row).
+    /// No Kani harness (no share-math executed; account-init only).
+    #[inline(never)]
+    fn handle_create_lp_vault<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        fee_share_bps: u16,
+        redemption_cooldown_slots: u64,
+        oi_reservation_threshold_bps: u16,
+        domain: u16,
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let mint_ai = account(accounts, 3)?;
+        let system_program_ai = account(accounts, 4)?;
+        let token_program = account(accounts, 5)?;
+
+        expect_signer(admin)?;
+        expect_writable(admin)?;
+        expect_writable(registry_ai)?;
+        expect_writable(mint_ai)?;
+        expect_owner(market_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if fee_share_bps > 10_000 || oi_reservation_threshold_bps > 10_000 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        // admin authorization + domain bound, read from the market.
+        let (cfg, mode, configured_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if admin.key.to_bytes() != cfg.admin {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        if (domain as usize) >= configured_slots.saturating_mul(2) {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        // Derive + bind the two PDAs.
+        let (registry_pda, registry_bump) =
+            state::derive_lp_vault_registry(program_id, market_ai.key);
+        expect_key(registry_ai, &registry_pda)?;
+        let (mint_pda, mint_bump) = state::derive_lp_vault_mint(program_id, market_ai.key);
+        expect_key(mint_ai, &mint_pda)?;
+
+        // Both PDAs must be fresh (system-owned, no data) — fail closed otherwise.
+        if registry_ai.owner != &system_program::ID
+            || mint_ai.owner != &system_program::ID
+            || !registry_ai.data_is_empty()
+            || !mint_ai.data_is_empty()
+        {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+
+        let rent = Rent::get()?;
+        let market_bytes = market_ai.key.to_bytes();
+
+        // Create the program-owned registry PDA account.
+        let registry_len = state::lp_vault_registry_account_len();
+        invoke_signed(
+            &system_instruction::create_account(
+                admin.key,
+                registry_ai.key,
+                rent.minimum_balance(registry_len),
+                registry_len as u64,
+                program_id,
+            ),
+            &[admin.clone(), registry_ai.clone(), system_program_ai.clone()],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_bytes.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+
+        // Create the spl_token-owned LP share mint PDA account.
+        let mint_len = spl_token::state::Mint::LEN;
+        invoke_signed(
+            &system_instruction::create_account(
+                admin.key,
+                mint_ai.key,
+                rent.minimum_balance(mint_len),
+                mint_len as u64,
+                token_program.key,
+            ),
+            &[admin.clone(), mint_ai.clone(), system_program_ai.clone()],
+            &[&[
+                crate::constants::LP_VAULT_MINT_SEED,
+                market_bytes.as_ref(),
+                &[mint_bump],
+            ]],
+        )?;
+
+        // Initialize the LP share mint: authority = registry PDA, no freeze.
+        let init_mint_ix = spl_token::instruction::initialize_mint2(
+            token_program.key,
+            mint_ai.key,
+            &registry_pda,
+            None,
+            0,
+        )?;
+        invoke(&init_mint_ix, &[mint_ai.clone(), token_program.clone()])?;
+
+        // Persist the registry config.
+        let registry = state::LpVaultRegistryV16 {
+            market_group: market_bytes,
+            lp_mint: mint_ai.key.to_bytes(),
+            total_lp_shares_outstanding: 0,
+            insurance_fee_snapshot_atoms: 0,
+            fee_distribution_total_atoms: 0,
+            epoch: 0,
+            redemption_cooldown_slots,
+            fee_share_bps,
+            oi_reservation_threshold_bps,
+            domain,
+            paused: 0,
+            version: crate::constants::LP_VAULT_VERSION,
+            bump: registry_bump,
+            mint_bump,
+            _padding: [0u8; 6],
+            _reserved: [0u8; 16],
+        };
+        state::init_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+        Ok(())
     }
 
     #[inline(never)]
