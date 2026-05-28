@@ -6727,6 +6727,22 @@ pub mod processor {
     /// prevents price-taking instructions (Trade, Withdraw, Crank,
     /// Settle, Convert, Catchup) from reviving a terminally dead market
     /// — they must route to ResolvePermissionless instead.
+    ///
+    /// Polymarket-perp branch (`config.market_kind == 2`): the trade-time
+    /// price comes from the on-chain ring TWAP, NOT from `a_oracle`. The
+    /// ring is populated by `PushOracleSnapshot` under the value-anchoring
+    /// deviation guard, so every consumed entry has already been
+    /// cross-checked against Pyth at write time. The TWAP smooths 60
+    /// entries (~5 minutes) and is itself the freshness check —
+    /// `ring_buf_twap` returns `None` when no entry is within
+    /// `MAX_STALENESS_SLOTS`. The `a_oracle` account is ignored on this
+    /// branch; callers may pass any account (typically the same Pyth
+    /// account used by the matcher's account-list, for ABI uniformity).
+    /// The Pyth replay-protection / baseline-update / engine
+    /// `oracle_target_publish_time` advancement logic is intentionally
+    /// skipped — the ring's own monotonic-timestamp + clamp + value-
+    /// anchoring guards apply at write time and the TWAP is a derived
+    /// read, not a single observation that needs replay defence.
     fn read_price_and_stamp(
         config: &mut state::MarketConfig,
         a_oracle: &AccountInfo,
@@ -6734,6 +6750,32 @@ pub mod processor {
         clock_slot: u64,
         slab_data: Option<&mut [u8]>,
     ) -> Result<u64, ProgramError> {
+        // Polymarket-perp branch. Must precede the Pyth/Chainlink read
+        // because `a_oracle` is irrelevant for kind=2 and would otherwise
+        // be rejected (the wrong owner / wrong feed_id) before we even
+        // looked at `market_kind`.
+        if config.market_kind == 2 {
+            // The ring's TWAP is the trade price. Returns None if the
+            // ring is empty or every entry is older than
+            // MAX_STALENESS_SLOTS; in either case the market has no
+            // current oracle and the caller cannot proceed.
+            let twap = oracle_ring::ring_buf_twap(&config.oracle_ring_buf, clock_slot)
+                .ok_or(PercolatorError::OracleStale)?;
+
+            // Stamp `last_good_oracle_slot` so the
+            // `permissionless_stale_matured` lifecycle still works for
+            // kind=2 markets: while pushes keep arriving the ring stays
+            // fresh and trades succeed; once pushes stop, the next
+            // trade fails with OracleStale (returning early above) and
+            // the stamp stays at its previous value, so the staleness
+            // window matures normally.
+            config.last_good_oracle_slot = clock_slot;
+            let _ = clock_unix_ts;
+            let _ = slab_data;
+            let _ = a_oracle;
+            return Ok(twap);
+        }
+
         // ML12 added p_last + price_move_dt_slots + oi_any to enforce the
         // engine's per-slot price-move cap. read_price_and_stamp doesn't
         // have richer context, so seed p_last = config.last_effective_price_e6
