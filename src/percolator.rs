@@ -8285,8 +8285,28 @@ pub mod processor {
         if config.market_kind != 2 {
             return Ok(());
         }
+        // Transitively, `SetPythPriceMapping` requires `oracle_source == 0`
+        // and `index_feed_id != [0; 32]` to succeed, so a fully-mapped
+        // slab implies both invariants. The explicit checks below are
+        // defence-in-depth: if a future commit ever introduces a new
+        // writer for `value_deviation_bps` that doesn't carry the
+        // pre-conditions forward, this gate fails closed rather than
+        // silently letting a Pyth-typed slab without an index_feed_id
+        // (or with an unexpected oracle_source) reach the user-entry
+        // path.
         if config.polymarket_condition_id == [0u8; 32] {
             msg!("Kind=2 slab not linked yet (call LinkPolymarketMarket first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if config.oracle_source != 0 {
+            msg!(
+                "Kind=2 slab has unexpected oracle_source={} (V1 expects 0=Pyth)",
+                config.oracle_source
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if config.index_feed_id == [0u8; 32] {
+            msg!("Kind=2 slab has no Pyth feed bound (LinkPolymarketMarket invariant violated)");
             return Err(ProgramError::InvalidAccountData);
         }
         if config.value_deviation_bps == 0 {
@@ -12125,6 +12145,20 @@ pub mod processor {
         }
 
         let mut config = state::read_config(&data);
+        // Refuse Polymarket-perp markets (`market_kind = 2`). Resolution for
+        // kind=2 must flow from Polymarket's off-chain UMA outcome via a
+        // dedicated kind=2 resolution handler (future commit), NOT through
+        // the legacy admin-driven `ResolveMarket` path that settles every
+        // position against the current ring TWAP. Allowing this handler on
+        // a kind=2 slab would let an admin (legitimate or compromised)
+        // pre-settle the market at whatever the TWAP happens to be when
+        // the call lands — orthogonal to whatever Polymarket itself
+        // resolved to. Mirrors the dispute-tag lockout pattern applied
+        // to tags 80 / 43 / 44 in an earlier kind=2 hardening commit.
+        if config.market_kind == 2 {
+            msg!("ResolveMarket: refuses market_kind=2 (Polymarket-perp uses off-chain UMA resolution)");
+            return Err(ProgramError::InvalidAccountData);
+        }
         // Per-slot price-move cap (init-immutable via RiskParams).
         let max_change_bps =
             zc::engine_ref(&data)?.params.max_price_move_bps_per_slot;
@@ -13323,6 +13357,19 @@ pub mod processor {
         }
 
         let mut config = state::read_config(&data);
+
+        // Refuse Polymarket-perp markets (`market_kind = 2`). Same
+        // rationale as the `ResolveMarket` reject above: kind=2 resolution
+        // must come from the off-chain UMA outcome via a dedicated kind=2
+        // handler. The permissionless-resolution path was designed for
+        // kind=0/1 stale-oracle scenarios — for kind=2, an empty ring is
+        // not "the oracle died", it's just "the keeper stopped pushing".
+        // Letting anyone resolve a kind=2 slab at the last cached TWAP
+        // would be a permissionless settlement-rug.
+        if config.market_kind == 2 {
+            msg!("ResolvePermissionless: refuses market_kind=2 (Polymarket-perp uses off-chain UMA resolution)");
+            return Err(ProgramError::InvalidAccountData);
+        }
 
         // PORT (Hunk 2 / SIMD-0047 cluster-restart bypass): a post-init
         // `LastRestartSlot` bump invalidates the slot-based staleness
@@ -17925,18 +17972,21 @@ pub mod processor {
     //         on-chain formula).
     //       - `scale_bps_per_pct != 0` (zero is a degenerate "always
     //         output midpoint" mapping — not a meaningful market).
-    //       - `deviation_bps > 0` (zero would always reject every
-    //         push) and `deviation_bps <= MAX_DEVIATION_BPS`. The cap
-    //         is `2_000` bps (= 20%); at this ceiling a malicious
-    //         caller can still shift `caller_p` from the on-chain
-    //         formula by 20 percentage points of the e6 probability
-    //         space, which is meaningful but bounded. A 50% ceiling
-    //         (the obvious "half the clamp domain" choice) was
-    //         rejected at audit time as too loose — at 50% a caller
-    //         could push `p_yes_e6` anywhere from "formula-50%" to
-    //         "formula+50%", which leaves no daylight between
-    //         "anchored" and "freeform". Typical deployments choose
-    //         100-500 bps (1-5%); 2_000 is the hard ceiling.
+    //       - `MIN_DEVIATION_BPS <= deviation_bps <= MAX_DEVIATION_BPS`.
+    //         `MIN_DEVIATION_BPS = 50` (= 0.5%) prevents a permissionless
+    //         griefing class: at deviation = 1 bps an attacker who
+    //         frontruns each Pyth tick with a slightly-different
+    //         `p_yes_e6` consumes the monotonic-publish_time slot for
+    //         every honest keeper. A meaningful tolerance floor keeps
+    //         the deviation guard real without enabling DoS-by-precision.
+    //         `MAX_DEVIATION_BPS = 1_000` (= 10%). Tightened from an
+    //         earlier 2_000 ceiling after a full-feature audit found
+    //         that at the loose cap a permissionless attacker could
+    //         shift the TWAP by ~20pp over 60 pushes (~24 seconds of
+    //         Pyth ticks) for trivial tx-fee cost. At 10% the residual
+    //         attack moves at most ~10pp over 60 pushes; typical
+    //         deployments still choose 100-500 bps and the cap is the
+    //         hard outer bound.
     //
     // After all gates pass, the three fields are written and a
     // structured log emits the configured tuple for off-chain
@@ -17949,16 +17999,25 @@ pub mod processor {
         scale_bps_per_pct: i32,
         deviation_bps: u16,
     ) -> ProgramResult {
-        // Hard upper bound on the deviation tolerance. 2_000 bps = 20%
+        // Hard upper bound on the deviation tolerance. 1_000 bps = 10%
         // of the e6 probability space (after the guard's `× 100`
-        // bps-to-e6 conversion). A higher cap would let the
-        // caller-supplied `p_yes_e6` diverge so far from the on-chain
-        // formula that the guard adds no meaningful constraint;
-        // a lower cap risks false-positive rejects on legitimate
-        // keeper-side smoothing. Typical deployments choose 100-500
-        // bps; 2_000 is the loosest configuration the contract will
-        // accept.
-        const MAX_DEVIATION_BPS: u16 = 2_000;
+        // bps-to-e6 conversion). Tightened from an earlier 2_000 after
+        // a full-feature audit modelled the manipulation cost: at the
+        // loose cap, 60 pushes (~24s of Pyth ticks) for trivial tx-fee
+        // cost could shift the TWAP by ~20pp — meaningful at 5x
+        // leverage. At 10% the residual attack is half that. Typical
+        // deployments still choose 100-500 bps; 1_000 is the loosest
+        // configuration the contract will accept.
+        const MAX_DEVIATION_BPS: u16 = 1_000;
+        // Hard lower bound on the deviation tolerance. 50 bps = 0.5%
+        // tolerance. Below this, the deviation guard becomes a
+        // permissionless griefing surface: a sub-bps tolerance lets
+        // any attacker who frontruns each Pyth tick with a slightly-
+        // different `p_yes_e6` consume the monotonic-publish_time
+        // slot for honest keepers. A 50-bps floor keeps the guard
+        // tight enough to be meaningful while leaving room for
+        // legitimate keeper-side smoothing variation.
+        const MIN_DEVIATION_BPS: u16 = 50;
 
         accounts::expect_len(accounts, 2)?;
         let a_admin = &accounts[0];
@@ -18039,8 +18098,12 @@ pub mod processor {
             msg!("SetPythPriceMapping: scale_bps_per_pct must be non-zero (zero scale = degenerate always-midpoint formula)");
             return Err(ProgramError::InvalidInstructionData);
         }
-        if deviation_bps == 0 {
-            msg!("SetPythPriceMapping: deviation_bps must be non-zero (zero = always-reject)");
+        if deviation_bps < MIN_DEVIATION_BPS {
+            msg!(
+                "SetPythPriceMapping: deviation_bps={} below floor {} (avoids permissionless DoS via overly-tight tolerance)",
+                deviation_bps,
+                MIN_DEVIATION_BPS
+            );
             return Err(ProgramError::InvalidInstructionData);
         }
         if deviation_bps > MAX_DEVIATION_BPS {
