@@ -8256,6 +8256,46 @@ pub mod processor {
         Ok(())
     }
 
+    /// Refuse user-entry instructions (`InitUser`, `InitLP`,
+    /// `DepositCollateral`) when a `market_kind = 2` slab is not yet
+    /// fully configured. No-op for kind=0/1 markets — those have no
+    /// configuration sequence beyond `InitMarket`.
+    ///
+    /// A "fully configured" kind=2 slab has all of:
+    ///   * `polymarket_condition_id != [0; 32]`   — `LinkPolymarketMarket`
+    ///   * `value_deviation_bps != 0`             — `SetPythPriceMapping`
+    ///
+    /// Both `LinkPolymarketMarket` and `SetPythPriceMapping` themselves
+    /// require `num_used_accounts == 0` (empty slab) at call time —
+    /// they're admin-only handlers that must run before any user
+    /// state exists. If a user-entry instruction were allowed to
+    /// create state on an un-linked or un-mapped kind=2 slab, the
+    /// admin would be locked out of configuring the market forever
+    /// (a permanent brick), AND `read_price_and_stamp` would refuse
+    /// every subsequent trade with `OracleStale` (the ring is empty
+    /// until the keeper starts pushing, which it cannot do until the
+    /// mapping is set). Net effect: stuck deposits, no trades, no
+    /// admin recovery.
+    ///
+    /// This gate enforces the deployment ordering at the program
+    /// level — InitMarket → LinkPolymarketMarket → SetPythPriceMapping
+    /// → (first keeper pushes) → user-entry instructions — instead
+    /// of relying on the off-chain runbook to get the order right.
+    fn require_kind2_fully_configured(config: &MarketConfig) -> Result<(), ProgramError> {
+        if config.market_kind != 2 {
+            return Ok(());
+        }
+        if config.polymarket_condition_id == [0u8; 32] {
+            msg!("Kind=2 slab not linked yet (call LinkPolymarketMarket first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if config.value_deviation_bps == 0 {
+            msg!("Kind=2 slab not mapped yet (call SetPythPriceMapping first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
     /// PERC-298: Unpack oi_cap_multiplier_bps field.
     /// Lower 32 bits = OI cap multiplier. Bits 32..47 = skew_factor_bps.
     #[inline]
@@ -9499,6 +9539,11 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
         let config = state::read_config(&data);
+        // Refuse user entry on an un-configured kind=2 slab. See
+        // `require_kind2_fully_configured` rationale: without this
+        // gate, an early InitUser permanently bricks the admin's
+        // ability to configure the market.
+        require_kind2_fully_configured(&config)?;
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         let auth = accounts::derive_vault_authority_with_bump(
@@ -9640,6 +9685,9 @@ pub mod processor {
         }
 
         let config = state::read_config(&data);
+        // Refuse LP entry on an un-configured kind=2 slab — same
+        // brick-the-admin scenario as InitUser.
+        require_kind2_fully_configured(&config)?;
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         let auth = accounts::derive_vault_authority_with_bump(
@@ -9760,6 +9808,11 @@ pub mod processor {
         }
 
         let config = state::read_config(&data);
+        // Defence-in-depth: reject deposits on an un-configured kind=2
+        // slab. In practice an un-configured slab can have no users
+        // (InitUser already rejects), so this check is reachable only
+        // if state drifts; cheap to add.
+        require_kind2_fully_configured(&config)?;
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         let auth = accounts::derive_vault_authority_with_bump(
