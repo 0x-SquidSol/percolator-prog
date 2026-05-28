@@ -8296,6 +8296,101 @@ pub mod processor {
         Ok(())
     }
 
+    /// Asymmetric-leverage band gate for `market_kind = 2`
+    /// (Polymarket-perp) markets.
+    ///
+    /// Polymarket-perp probability is a binary-outcome forward: at
+    /// resolution it collapses to 0 or 1. Leveraged positions near
+    /// the deep edges (close to 0 or close to 1) have asymmetric
+    /// payoff: a small probability move can produce an outsized
+    /// percentage loss because the denominator (distance to the
+    /// nearer terminal) is small. Per the V1 risk model:
+    ///
+    ///   * Middle band `[0.20, 0.80]`: normal trading — admin's
+    ///     per-market `initial_margin_bps` governs effective leverage
+    ///     (typically 2_000 bps = 5x).
+    ///   * Edge bands `[0.10, 0.20)` and `(0.80, 0.90]`: still
+    ///     tradeable, but admin should configure tighter IM
+    ///     (typically 5_000 bps = 2x) on these markets. This commit
+    ///     does NOT enforce dynamic IM per band — that is a future
+    ///     commit. Today, admin policy at `InitMarket` is the
+    ///     calibration knob.
+    ///   * Deep-edge bands `[0.01, 0.10)` and `(0.90, 0.99]`: no new
+    ///     positions accepted. The probability discreteness makes
+    ///     liquidation-pass-through-zero-jump risk too high. Users
+    ///     who already hold positions in the deep edge can still
+    ///     reduce them (any trade that pushes `|position|` toward
+    ///     zero is allowed) — otherwise users would be trapped on
+    ///     mean-reverting price moves.
+    ///
+    /// No-op for kind=0/1 markets — those have their own perp /
+    /// native-prediction risk models.
+    fn check_kind2_trade_band(
+        data: &[u8],
+        config: &MarketConfig,
+        user_idx: u16,
+        size: i128,
+        price_e6: u64,
+    ) -> Result<(), ProgramError> {
+        if config.market_kind != 2 {
+            return Ok(());
+        }
+
+        /// Lower edge of the tradeable band (= 0.10 e6). Below this,
+        /// probability discreteness and clamp-domain interaction make
+        /// leveraged positions structurally unsafe.
+        const BAND_LO_E6: u64 = 100_000;
+        /// Upper edge of the tradeable band (= 0.90 e6). Symmetric.
+        const BAND_HI_E6: u64 = 900_000;
+
+        if price_e6 >= BAND_LO_E6 && price_e6 <= BAND_HI_E6 {
+            return Ok(());
+        }
+
+        // Deep-edge band. Allow only trades that reduce `|position|`
+        // toward zero on the SAME side, or close out exactly to zero.
+        // Sign-flip-to-non-zero trades (e.g., long +100 → short -50)
+        // are rejected because the short leg is itself a fresh
+        // position in the deep-edge band, which is what the V1
+        // policy refuses.
+        let engine = zc::engine_ref(data)?;
+        let current = engine
+            .try_effective_pos_q(user_idx as usize)
+            .unwrap_or(0);
+        // `size` is the signed delta supplied by the trade instruction;
+        // `i128 + i128` could overflow on adversarial inputs, but the
+        // wrapper already bounds `|size| <= MAX_TRADE_SIZE_Q` upstream
+        // and the engine bounds `|current|` similarly, so the sum
+        // stays well within `i128`. Use `checked_add` defensively
+        // anyway — overflow returns `InvalidInstructionData`.
+        let new = current
+            .checked_add(size)
+            .ok_or(ProgramError::InvalidInstructionData)?;
+
+        // Exact close to zero is always allowed (the user is exiting).
+        let closing = new == 0 && current != 0;
+        // Same-side reduction: sign preserved, magnitude strictly
+        // smaller. Sign-flip cases (current != 0, new != 0, signs
+        // differ) fall through to the reject path even if `|new|`
+        // happens to be smaller than `|current|` — that overshoot
+        // is opening a new position on the opposite side.
+        let reducing_same_side = current != 0
+            && new != 0
+            && current.signum() == new.signum()
+            && new.unsigned_abs() < current.unsigned_abs();
+        if closing || reducing_same_side {
+            return Ok(());
+        }
+
+        msg!(
+            "Kind=2: deep-edge band rejects non-reducing trade (price_e6={}, current={}, new={})",
+            price_e6,
+            current,
+            new
+        );
+        Err(ProgramError::InvalidAccountData)
+    }
+
     /// PERC-298: Unpack oi_cap_multiplier_bps field.
     /// Lower 32 bits = OI cap multiplier. Bits 32..47 = skew_factor_bps.
     #[inline]
@@ -10406,6 +10501,12 @@ pub mod processor {
             read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data))?;
         state::write_config(&mut data, &config);
 
+        // Kind=2 asymmetric-leverage band gate. No-op on kind=0/1.
+        // Rejects new positions outside [0.10, 0.90]; allows
+        // position-reducing trades in the deep-edge band so users
+        // can always exit.
+        check_kind2_trade_band(&data, &config, user_idx, size, price)?;
+
         // Bounds-check before gen table read (check_idx requires engine borrow,
         // but gen table read must happen before the mutable engine borrow).
         if (lp_idx as usize) >= percolator::MAX_ACCOUNTS
@@ -10744,6 +10845,19 @@ pub mod processor {
         } else {
             read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, None)?
         };
+
+        // Kind=2 asymmetric-leverage band gate. Hyperp markets are
+        // already excluded above (Hyperp ⇒ kind != 2 by the
+        // index_feed_id invariants), so this only fires on the
+        // `else` branch's Pyth path. Rejects new positions outside
+        // [0.10, 0.90]; allows position-reducing trades in the
+        // deep-edge band so users can always exit. Takes a fresh
+        // immutable borrow on the slab so the engine state read
+        // does not conflict with the later mutable-borrow scope.
+        {
+            let data_ro = a_slab.try_borrow_data()?;
+            check_kind2_trade_band(&data_ro, &config, user_idx, size, price)?;
+        }
 
         // Note: We don't zero the matcher_ctx before CPI because we don't own it.
         // Security is maintained by ABI validation which checks req_id (nonce),
