@@ -2031,6 +2031,15 @@ pub mod ix {
             scale_bps_per_pct: i32,
             deviation_bps: u16,
         },
+        /// Polymarket-perp: admin-only one-shot setting of the
+        /// force-close-before-resolution timestamp on a linked +
+        /// mapped kind=2 slab (tag 87). The permissionless
+        /// `ForceCloseKind2` crank becomes eligible to fire at or
+        /// after `force_close_unix_timestamp`, capturing the ring
+        /// TWAP as the market's resolution price.
+        SetForceCloseTimestamp {
+            force_close_unix_timestamp: i64,
+        },
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -2579,6 +2588,15 @@ pub mod ix {
                         threshold_e6,
                         scale_bps_per_pct,
                         deviation_bps,
+                    })
+                }
+                87 => {
+                    // Tag 87: SetForceCloseTimestamp — admin-only
+                    // one-shot setting of the force-close trigger
+                    // timestamp. Data: force_close_unix_ts(8) = 8 bytes.
+                    let force_close_unix_timestamp = read_i64(&mut rest)?;
+                    Ok(Instruction::SetForceCloseTimestamp {
+                        force_close_unix_timestamp,
                     })
                 }
                 // Fork-specific instructions
@@ -3569,6 +3587,49 @@ pub mod state {
         /// 16 bytes (8 + 4 + 2 + 2 = 16). Keeps the struct's overall
         /// 16-alignment invariant intact.
         pub _pad_value_anchoring: [u8; 2],
+
+        /// Force-close-before-resolution extension. Binary-outcome
+        /// prediction markets resolve via a single-block jump from
+        /// the trade-time TWAP to exactly 0 or 1 at Polymarket's UMA
+        /// finalisation. Leveraged positions held through that jump
+        /// face loss-beyond-margin in a single block — no continuous
+        /// liquidation window exists.
+        ///
+        /// The mitigation: a configurable on-chain timestamp at which
+        /// the wrapper force-closes all open positions at the current
+        /// ring TWAP. After the force-close fires, the market enters a
+        /// settled state (using the captured TWAP as the resolution
+        /// price); the discontinuous UMA jump never touches a live
+        /// leveraged position.
+
+        /// Unix timestamp (seconds) at which `ForceCloseKind2` (the
+        /// permissionless crank) becomes eligible to fire. Admin
+        /// sets this via `SetForceCloseTimestamp` (tag 87) at market
+        /// configuration time; recommended placement is several
+        /// hours BEFORE Polymarket's advertised UMA finalisation
+        /// time so the force-close races UMA conservatively.
+        ///
+        /// Sentinel `0` = unset; user-entry handlers refuse a kind=2
+        /// slab whose force-close timestamp is not configured (a slab
+        /// without a force-close date would expose users to the
+        /// resolution-jump risk this field is designed to eliminate).
+        ///
+        /// One-shot at the program level. If Polymarket extends their
+        /// resolution date, the wrapper still force-closes at the
+        /// originally-configured timestamp — strictly safer than
+        /// letting an admin extend trading, which would re-introduce
+        /// the resolution-jump exposure. A future Council-gated
+        /// re-set path is the only legitimate mutation surface.
+        pub force_close_unix_timestamp: i64,
+
+        /// Ring TWAP captured at the moment `ForceCloseKind2` fired,
+        /// in e6 probability units. Sentinel `0` = force-close has
+        /// not yet executed. Once set, this is the engine's
+        /// resolution price for the market — all subsequent
+        /// settlement / withdrawal flows pay out based on this
+        /// captured value. Written exactly once by the force-close
+        /// crank.
+        pub forced_close_price_e6: u64,
     }
 
     // Compile-time pin: `MarketConfig` total size must be a multiple of 16
@@ -8313,6 +8374,10 @@ pub mod processor {
             msg!("Kind=2 slab not mapped yet (call SetPythPriceMapping first)");
             return Err(ProgramError::InvalidAccountData);
         }
+        if config.force_close_unix_timestamp == 0 {
+            msg!("Kind=2 slab has no force-close timestamp (call SetForceCloseTimestamp first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(())
     }
 
@@ -9098,6 +9163,19 @@ pub mod processor {
                     deviation_bps,
                 )?;
             }
+
+            // Polymarket-perp (tag 87): admin-only one-shot setting of
+            // the force-close-before-resolution timestamp.
+            // Accounts: [admin(signer), slab(writable)]
+            Instruction::SetForceCloseTimestamp {
+                force_close_unix_timestamp,
+            } => {
+                handle_set_force_close_timestamp(
+                    program_id,
+                    accounts,
+                    force_close_unix_timestamp,
+                )?;
+            }
         }
         Ok(())
     }
@@ -9590,6 +9668,8 @@ pub mod processor {
             pyth_scale_bps_per_pct: 0,
             value_deviation_bps: 0,
             _pad_value_anchoring: [0u8; 2],
+            force_close_unix_timestamp: 0,
+            forced_close_price_e6: 0,
         };
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
@@ -18126,6 +18206,190 @@ pub mod processor {
             threshold_e6,
             scale_bps_per_pct,
             deviation_bps
+        );
+        Ok(())
+    }
+
+    // --- SetForceCloseTimestamp (tag 87) ---
+    //
+    // One-shot admin configuration of the force-close-before-resolution
+    // timestamp for a linked + mapped `market_kind = 2` slab. The
+    // permissionless `ForceCloseKind2` crank (future commit) becomes
+    // eligible to fire at or after `force_close_unix_timestamp`,
+    // capturing the ring TWAP as the market's resolution price.
+    //
+    // The motivation for force-close-before-resolution: binary-outcome
+    // prediction markets resolve via a single-block jump from the
+    // trade-time TWAP to exactly 0 or 1 at Polymarket's UMA
+    // finalisation. Leveraged positions held through that jump face
+    // loss-beyond-margin in a single block with no continuous
+    // liquidation window. The on-chain force-close fires hours BEFORE
+    // Polymarket's UMA finalisation, settling every position at the
+    // TWAP and freezing the market — the discontinuous resolution
+    // jump never touches a live leveraged position.
+    //
+    // Reject gates (admin-only, mirror `SetPythPriceMapping`'s posture):
+    //   * Structural: slab_guard, init, admin signer, slab writable.
+    //   * State: refuses paused / resolved markets.
+    //   * Kind: refuses `market_kind != 2`.
+    //   * Oracle source: refuses `oracle_source != 0` (V1 Pyth-only).
+    //   * Link presence: refuses unlinked / no-Pyth-feed slabs.
+    //   * Mapping presence: refuses if `value_deviation_bps == 0`
+    //     (the value-anchoring mapping must be set first).
+    //   * Emptiness: refuses any slab with `num_used_accounts > 0`.
+    //     Force-close timestamp must be configured BEFORE the first
+    //     user enters, so users cannot deposit into a market whose
+    //     auto-closure date they didn't agree to.
+    //   * One-shot: refuses if `force_close_unix_timestamp != 0`. A
+    //     legitimate "Polymarket extended their resolution" update
+    //     path is a future Council-gated commit; in V1 admin must
+    //     pick a conservatively-early timestamp at configuration time.
+    //   * Future-only: refuses timestamps in the past or within the
+    //     near future. `MIN_FUTURE_SECS = 3600` (1 hour) is the floor
+    //     — the admin cannot set a force-close that fires immediately
+    //     (which would brick the market before users can enter).
+    //   * Bounded: refuses timestamps more than `MAX_FUTURE_SECS`
+    //     from now. `MAX_FUTURE_SECS = 31_536_000` (1 year) caps the
+    //     planning horizon. Polymarket markets that resolve more than
+    //     a year out are out of V1 scope.
+    #[inline(never)]
+    fn handle_set_force_close_timestamp<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        force_close_unix_timestamp: i64,
+    ) -> ProgramResult {
+        /// Minimum gap between `now` and the force-close timestamp at
+        /// configuration time. Prevents admin from setting a timestamp
+        /// so close that the keeper can't react / users can't position.
+        const MIN_FUTURE_SECS: i64 = 3600;
+        /// Maximum horizon for the force-close timestamp. Caps planning
+        /// risk; markets resolving more than a year out are out of V1
+        /// scope.
+        const MAX_FUTURE_SECS: i64 = 31_536_000;
+
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if state::is_paused(&data) {
+            msg!("SetForceCloseTimestamp: refuses paused market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if state::is_resolved(&data) {
+            msg!("SetForceCloseTimestamp: refuses resolved market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let has_accounts = {
+            let engine = zc::engine_ref(&data)?;
+            engine.num_used_accounts > 0
+        };
+        if has_accounts {
+            msg!(
+                "SetForceCloseTimestamp: refuses non-empty slab (must be set before first user entry)"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+
+        if config.market_kind != 2 {
+            msg!(
+                "SetForceCloseTimestamp: refuses market_kind={} (kind=2 only)",
+                config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.oracle_source != 0 {
+            msg!(
+                "SetForceCloseTimestamp: oracle_source={} unsupported in V1 (Pyth-only)",
+                config.oracle_source
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.polymarket_condition_id == [0u8; 32] {
+            msg!("SetForceCloseTimestamp: market not linked yet (call LinkPolymarketMarket first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.index_feed_id == [0u8; 32] {
+            msg!("SetForceCloseTimestamp: index_feed_id is zero on a Pyth-typed market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.value_deviation_bps == 0 {
+            msg!("SetForceCloseTimestamp: mapping not set yet (call SetPythPriceMapping first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // One-shot: refuse if already configured.
+        if config.force_close_unix_timestamp != 0 {
+            msg!(
+                "SetForceCloseTimestamp: timestamp already set; re-set requires Council path"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Use the Clock sysvar syscall (not a passed account). An
+        // account-list clock would not be pubkey-checked by
+        // `Clock::from_account_info` — admin could pass a fake clock
+        // with an arbitrary unix_timestamp to bypass MIN_FUTURE_SECS.
+        // The syscall reads the runtime's authoritative Clock and
+        // cannot be spoofed at the instruction-data layer.
+        let clock = Clock::get()?;
+        let now_unix = clock.unix_timestamp;
+
+        if force_close_unix_timestamp <= now_unix {
+            msg!(
+                "SetForceCloseTimestamp: timestamp={} is in the past (now={})",
+                force_close_unix_timestamp,
+                now_unix
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // `delta` is the gap from now to the configured force-close.
+        // Both operands are i64; the subtraction cannot overflow given
+        // the inequality `force_close_unix_timestamp > now_unix` above
+        // and the i64 domain.
+        let delta = force_close_unix_timestamp.saturating_sub(now_unix);
+        if delta < MIN_FUTURE_SECS {
+            msg!(
+                "SetForceCloseTimestamp: timestamp too close (delta={}s < min {}s)",
+                delta,
+                MIN_FUTURE_SECS
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if delta > MAX_FUTURE_SECS {
+            msg!(
+                "SetForceCloseTimestamp: timestamp too far (delta={}s > max {}s)",
+                delta,
+                MAX_FUTURE_SECS
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        config.force_close_unix_timestamp = force_close_unix_timestamp;
+        state::write_config(&mut data, &config);
+
+        msg!(
+            "SetForceCloseTimestamp: slab={} force_close_unix_timestamp={} (delta={}s from now)",
+            a_slab.key,
+            force_close_unix_timestamp,
+            delta
         );
         Ok(())
     }

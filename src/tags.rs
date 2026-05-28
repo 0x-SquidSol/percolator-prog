@@ -242,6 +242,24 @@ pub const TAG_PUSH_ORACLE_SNAPSHOT: u8 = 85;
 /// Accounts: [admin(signer), slab(writable)]
 pub const TAG_SET_PYTH_PRICE_MAPPING: u8 = 86;
 
+/// Polymarket-perp: set the unix timestamp at which `ForceCloseKind2`
+/// becomes eligible to fire. One-shot at the program level — admin
+/// sets it once during market configuration, before user entry opens.
+/// Admin-only. Requires the slab to be linked + mapped (Pyth feed
+/// bound, deviation mapping configured) and empty (`num_used_accounts
+/// == 0`).
+///
+/// Recommended placement: several hours before Polymarket's advertised
+/// UMA finalisation time, giving the keeper a conservative race
+/// window. The wrapper accepts any timestamp at least one hour in the
+/// future and at most one year out; deployment runbook tightens these
+/// per-market.
+///
+/// Data: tag(1) + force_close_unix_ts(8) = 9 bytes.
+/// Accounts: [admin(signer), slab(writable)]
+/// (Clock is read via syscall, not passed as an account.)
+pub const TAG_SET_FORCE_CLOSE_TIMESTAMP: u8 = 87;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +352,7 @@ mod tests {
             TAG_LINK_POLYMARKET_MARKET,
             TAG_PUSH_ORACLE_SNAPSHOT,
             TAG_SET_PYTH_PRICE_MAPPING,
+            TAG_SET_FORCE_CLOSE_TIMESTAMP,
         ];
 
         for i in 0..tags.len() {
@@ -432,6 +451,7 @@ mod tests {
             TAG_LINK_POLYMARKET_MARKET,
             TAG_PUSH_ORACLE_SNAPSHOT,
             TAG_SET_PYTH_PRICE_MAPPING,
+            TAG_SET_FORCE_CLOSE_TIMESTAMP,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)
