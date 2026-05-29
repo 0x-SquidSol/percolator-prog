@@ -251,6 +251,44 @@ pub fn value_deviation_e6(a: u64, b: u64) -> u64 {
     a.abs_diff(b)
 }
 
+/// Compute the uniform-weight average of `p_yes_e6` across every
+/// non-empty entry in the ring, IGNORING the staleness filter. Returns
+/// `None` only when the ring is fully empty (every slot has
+/// `source_timestamp == 0`).
+///
+/// This is the terminal-settlement variant of `ring_buf_twap`. The
+/// trade-time path uses `ring_buf_twap` (with the 720-slot staleness
+/// gate) so trades are refused when the oracle has actually gone dark.
+/// The force-close path uses THIS function so a market whose keeper
+/// stopped pushing some time ago can still be settled at the last
+/// known TWAP rather than wedge with user capital trapped.
+///
+/// The semantic is: "what is the wrapper's best estimate of the
+/// market's last observed probability?" — a question the staleness
+/// gate is the wrong tool for at terminal-settlement time. The 60-
+/// entry uniform-weight average still smooths over single-block
+/// manipulation that might have happened during the market's active
+/// life; we just don't penalise "no recent activity" because no
+/// recent activity is the literal expected condition at force-close.
+///
+/// Domain bounds are identical to `ring_buf_twap`: each entry's
+/// `p_yes_e6` is clamped to `[POLY_CLAMP_LO, POLY_CLAMP_HI]` on write,
+/// `sum_p` fits comfortably in `u64` (60 × ~2^20 ≈ 2^26, with 2^38
+/// headroom), and `sum_p / count` is bounded above by `POLY_CLAMP_HI`
+/// itself.
+pub fn ring_buf_twap_unbounded(buf: &[OracleSnapshotEntry; 60]) -> Option<u64> {
+    let mut sum_p: u64 = 0;
+    let mut count: u64 = 0;
+    for entry in buf.iter() {
+        if entry.source_timestamp == 0 {
+            continue;
+        }
+        sum_p = sum_p.saturating_add(entry.p_yes_e6);
+        count += 1;
+    }
+    sum_p.checked_div(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +670,72 @@ mod tests {
         assert_eq!(value_deviation_e6(510_000, 500_000), 10_000);
         assert_eq!(value_deviation_e6(500_000, 500_000), 0);
         assert_eq!(value_deviation_e6(0, u64::MAX), u64::MAX);
+    }
+
+    // ----- ring_buf_twap_unbounded -----
+
+    #[test]
+    fn unbounded_twap_empty_ring_returns_none() {
+        assert!(ring_buf_twap_unbounded(&empty_buf()).is_none());
+    }
+
+    #[test]
+    fn unbounded_twap_includes_stale_entries() {
+        // A single push, no matter how stale, should be returned by
+        // the unbounded variant — this is the key behaviour the
+        // bounded variant doesn't have.
+        let mut buf = empty_buf();
+        ring_buf_push(
+            &mut buf,
+            OracleSnapshotEntry {
+                p_yes_e6: 700_000,
+                source_timestamp: 1,
+                // on_chain_slot well past MAX_STALENESS_SLOTS — would
+                // be excluded by ring_buf_twap, included here.
+                on_chain_slot: 10,
+            },
+        );
+        // Bounded variant excludes (now_slot = 100_000, age >> 720)
+        assert!(ring_buf_twap(&buf, 100_000).is_none());
+        // Unbounded includes — returns the single entry's value.
+        assert_eq!(ring_buf_twap_unbounded(&buf), Some(700_000));
+    }
+
+    #[test]
+    fn unbounded_twap_full_ring_of_stale_entries() {
+        // Realistic end-of-life condition: 60 pushes during active
+        // life, then keepers stop pushing. Unbounded variant averages
+        // them all.
+        let mut buf = empty_buf();
+        for i in 0..60u64 {
+            ring_buf_push(
+                &mut buf,
+                OracleSnapshotEntry {
+                    p_yes_e6: 400_000 + i * 1_000,
+                    source_timestamp: (i as i64) + 1,
+                    on_chain_slot: i + 1,
+                },
+            );
+        }
+        // Average is 400_000 + (59 * 1_000) / 2 = 429_500.
+        assert_eq!(ring_buf_twap_unbounded(&buf), Some(429_500));
+        // Bounded variant would also include these here (all within
+        // the 720-slot window from now_slot=100), so the two agree
+        // — the distinction matters at terminal settlement when
+        // staleness has crossed the window.
+        assert_eq!(ring_buf_twap(&buf, 100), Some(429_500));
+    }
+
+    #[test]
+    fn unbounded_twap_ignores_empty_slots() {
+        // Partial fill — only 3 entries pushed into the 60-slot ring.
+        // The remaining 57 slots have source_timestamp == 0 and must
+        // be skipped (not contribute zeros to the average).
+        let mut buf = empty_buf();
+        ring_buf_push(&mut buf, OracleSnapshotEntry { p_yes_e6: 300_000, source_timestamp: 1, on_chain_slot: 1 });
+        ring_buf_push(&mut buf, OracleSnapshotEntry { p_yes_e6: 400_000, source_timestamp: 2, on_chain_slot: 2 });
+        ring_buf_push(&mut buf, OracleSnapshotEntry { p_yes_e6: 500_000, source_timestamp: 3, on_chain_slot: 3 });
+        // Average of 300_000, 400_000, 500_000 = 400_000.
+        assert_eq!(ring_buf_twap_unbounded(&buf), Some(400_000));
     }
 }

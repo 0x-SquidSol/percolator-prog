@@ -2040,6 +2040,13 @@ pub mod ix {
         SetForceCloseTimestamp {
             force_close_unix_timestamp: i64,
         },
+        /// Polymarket-perp: permissionless crank that force-closes a
+        /// `market_kind = 2` slab at the captured ring TWAP, BEFORE
+        /// Polymarket's UMA finalisation can hit a live leveraged
+        /// position (tag 88). Eligible once
+        /// `clock.unix_timestamp >= force_close_unix_timestamp`. No
+        /// payload. One-shot per market.
+        ForceCloseKind2,
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -2598,6 +2605,11 @@ pub mod ix {
                     Ok(Instruction::SetForceCloseTimestamp {
                         force_close_unix_timestamp,
                     })
+                }
+                88 => {
+                    // Tag 88: ForceCloseKind2 — permissionless crank.
+                    // No payload.
+                    Ok(Instruction::ForceCloseKind2)
                 }
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
@@ -8416,6 +8428,7 @@ pub mod processor {
         user_idx: u16,
         size: i128,
         price_e6: u64,
+        clock_unix_ts: i64,
     ) -> Result<(), ProgramError> {
         if config.market_kind != 2 {
             return Ok(());
@@ -8427,17 +8440,38 @@ pub mod processor {
         const BAND_LO_E6: u64 = 100_000;
         /// Upper edge of the tradeable band (= 0.90 e6). Symmetric.
         const BAND_HI_E6: u64 = 900_000;
+        /// Soft pre-close window. In the last
+        /// `FORCE_CLOSE_SOFT_WINDOW_SECS` before
+        /// `force_close_unix_timestamp` the wrapper refuses NEW
+        /// positions on the same predicate the deep-edge gate uses
+        /// (reducing-only). This protects users from opening fresh
+        /// leveraged exposure that the force-close crank will
+        /// immediately wipe — and gives the keeper a clean
+        /// final-window of "only exits" for crank-side accounting.
+        const FORCE_CLOSE_SOFT_WINDOW_SECS: i64 = 3600;
 
-        if price_e6 >= BAND_LO_E6 && price_e6 <= BAND_HI_E6 {
+        let in_deep_edge = price_e6 < BAND_LO_E6 || price_e6 > BAND_HI_E6;
+
+        // Soft pre-close window: only enabled once admin has
+        // configured `force_close_unix_timestamp`. Sentinel `0` means
+        // "no force-close scheduled" so the soft window never fires
+        // (the user-entry gate already prevents reaching the trade
+        // path on an un-configured kind=2 slab; this is
+        // defence-in-depth).
+        let in_soft_close = config.force_close_unix_timestamp != 0
+            && clock_unix_ts.saturating_add(FORCE_CLOSE_SOFT_WINDOW_SECS)
+                >= config.force_close_unix_timestamp;
+
+        if !in_deep_edge && !in_soft_close {
             return Ok(());
         }
 
-        // Deep-edge band. Allow only trades that reduce `|position|`
-        // toward zero on the SAME side, or close out exactly to zero.
-        // Sign-flip-to-non-zero trades (e.g., long +100 → short -50)
-        // are rejected because the short leg is itself a fresh
-        // position in the deep-edge band, which is what the V1
-        // policy refuses.
+        // Either deep-edge or soft-pre-close band. Allow only trades
+        // that reduce `|position|` toward zero on the SAME side, or
+        // close out exactly to zero. Sign-flip-to-non-zero trades
+        // (e.g., long +100 → short -50) are rejected because the
+        // short leg is itself a fresh position in a band the policy
+        // refuses to accept new entries on.
         let engine = zc::engine_ref(data)?;
         let current = engine
             .try_effective_pos_q(user_idx as usize)
@@ -8468,7 +8502,9 @@ pub mod processor {
         }
 
         msg!(
-            "Kind=2: deep-edge band rejects non-reducing trade (price_e6={}, current={}, new={})",
+            "Kind=2: non-reducing trade rejected (in_deep_edge={} in_soft_close={} price_e6={} current={} new={})",
+            in_deep_edge,
+            in_soft_close,
             price_e6,
             current,
             new
@@ -9175,6 +9211,14 @@ pub mod processor {
                     accounts,
                     force_close_unix_timestamp,
                 )?;
+            }
+
+            // Polymarket-perp (tag 88): permissionless crank that
+            // force-closes a kind=2 slab at the captured ring TWAP
+            // before Polymarket UMA finalisation can hit a live position.
+            // Accounts: [caller(signer), slab(writable)]
+            Instruction::ForceCloseKind2 => {
+                handle_force_close_kind2(program_id, accounts)?;
             }
         }
         Ok(())
@@ -10605,7 +10649,7 @@ pub mod processor {
         // Rejects new positions outside [0.10, 0.90]; allows
         // position-reducing trades in the deep-edge band so users
         // can always exit.
-        check_kind2_trade_band(&data, &config, user_idx, size, price)?;
+        check_kind2_trade_band(&data, &config, user_idx, size, price, clock.unix_timestamp)?;
 
         // Bounds-check before gen table read (check_idx requires engine borrow,
         // but gen table read must happen before the mutable engine borrow).
@@ -10956,7 +11000,7 @@ pub mod processor {
         // does not conflict with the later mutable-borrow scope.
         {
             let data_ro = a_slab.try_borrow_data()?;
-            check_kind2_trade_band(&data_ro, &config, user_idx, size, price)?;
+            check_kind2_trade_band(&data_ro, &config, user_idx, size, price, clock.unix_timestamp)?;
         }
 
         // Note: We don't zero the matcher_ctx before CPI because we don't own it.
@@ -18390,6 +18434,245 @@ pub mod processor {
             a_slab.key,
             force_close_unix_timestamp,
             delta
+        );
+        Ok(())
+    }
+
+    // --- ForceCloseKind2 (tag 88) ---
+    //
+    // Permissionless crank that force-closes a `market_kind = 2` slab
+    // before Polymarket's UMA finalisation can hit a live leveraged
+    // position with a discontinuous binary jump. Anyone with SOL can
+    // call this once `clock.unix_timestamp >= force_close_unix_timestamp`.
+    //
+    // Settlement price: `engine.last_oracle_price` (the last trade-
+    // time price the engine consumed). For kind=2 markets, every
+    // trade-time price read routes through `ring_buf_twap` (per the
+    // matcher-CPI gate commit), so `last_oracle_price` is by
+    // construction the ring TWAP at the moment of the most recent
+    // trade. Settling at this value has two clean properties:
+    //
+    //   * It is the price at which the engine has been doing PnL /
+    //     margin accounting up to this point — so there's no
+    //     retroactive shift at settlement (the engine's `Degenerate`
+    //     resolve mode requires this equality and would otherwise
+    //     refuse the call with `Overflow`).
+    //   * It's a price that someone actually traded against, which
+    //     is arguably more fair than settling at a TWAP that
+    //     reflects post-last-trade pushes nobody opened or closed
+    //     positions on.
+    //
+    // For diagnostics, the handler also computes the current ring
+    // TWAP via `ring_buf_twap_unbounded` and logs it alongside
+    // `last_oracle_price` so off-chain observers can confirm the
+    // two are in agreement (and flag any meaningful drift between
+    // them as an indicator of a quiet period before force-close).
+    //
+    // The handler delegates resolution-state mutation to
+    // `engine.resolve_market_not_atomic(Degenerate, last_price,
+    // last_price, slot, 0)` — the same engine path the legacy
+    // `ResolvePermissionless` handler uses for kind=0/1 stale-oracle
+    // recovery. The `Degenerate` mode crystallises
+    // `engine.resolved_price`, forces `funding_rate_e9 = 0` (no
+    // funding accrues past force-close), and sets
+    // `engine.market_mode = Resolved`. The wrapper's `FLAG_RESOLVED`
+    // bit is then set so `state::is_resolved()` readers stay in
+    // sync.
+    //
+    // Failure mode: if `engine.last_oracle_price == 0` (no trade
+    // ever happened on this market), the Degenerate mode cannot
+    // be invoked. The handler rejects with `OracleInvalid` and the
+    // market requires admin / Council escalation. This is the
+    // documented operational cliff for never-traded markets and
+    // is rare in practice (a market that never traded also has
+    // no positions to settle).
+    //
+    // Reject gates (in order; first failure returns and writes
+    // nothing):
+    //
+    //   * Structural: slab_guard, init, caller signer (tx-level
+    //     accountability — anyone with SOL can crank), slab writable.
+    //   * Already-resolved: refuses if `engine.market_mode ==
+    //     Resolved` (engine-side source of truth).
+    //   * Already-force-closed: refuses if `forced_close_price_e6
+    //     != 0` (wrapper-side one-shot sentinel; redundant with the
+    //     engine check given they're co-written, but defence-in-
+    //     depth).
+    //   * Kind: refuses `market_kind != 2`.
+    //   * Configured: refuses if `force_close_unix_timestamp == 0`
+    //     (admin never set it — the market is not eligible).
+    //   * Time gate: refuses if `clock.unix_timestamp <
+    //     force_close_unix_timestamp` (not yet eligible).
+    //   * Linked: refuses if `polymarket_condition_id == [0; 32]`
+    //     (defence-in-depth; LinkPolymarketMarket is required
+    //     before SetForceCloseTimestamp can succeed).
+    //
+    // Side effects (only on success):
+    //
+    //   * Reads ring TWAP via `oracle_ring::ring_buf_twap_unbounded`.
+    //     If the ring is empty (zero entries ever pushed), returns
+    //     `OracleStale` — this is the only legitimate failure mode
+    //     after all gates pass, and means the keeper never ran. In
+    //     this case the deployment runbook fallback applies (admin
+    //     escalation via a future Council path).
+    //   * Captures the TWAP into `forced_close_price_e6` so off-chain
+    //     readers can verify the settlement price after the fact.
+    //   * Calls `engine.resolve_market_not_atomic(Degenerate, twap,
+    //     twap, clock.slot, 0)` to crystallise the engine's
+    //     `resolved_price` and flip `market_mode` to `Resolved`.
+    //   * Sets `state::set_resolved()` so the wrapper's `is_resolved`
+    //     bit aligns with the engine.
+    //   * Stamps `config.hyperp_mark_e6 = twap` for cross-handler
+    //     compatibility, matching the prior `ResolvePermissionless`
+    //     pattern.
+    //
+    // After the crank fires, the market is in the terminal Resolved
+    // state. All subsequent operations route through existing
+    // settlement paths (ForceCloseResolved, withdraw, etc.) using
+    // the captured `forced_close_price_e6` as the resolution price.
+    #[inline(never)]
+    fn handle_force_close_kind2<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_caller = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_caller)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Engine-side already-resolved guard. Same pattern as the
+        // legacy resolve handlers — engine's `market_mode` is the
+        // source of truth.
+        if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
+            msg!("ForceCloseKind2: already resolved");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+
+        if config.market_kind != 2 {
+            msg!(
+                "ForceCloseKind2: refuses market_kind={} (kind=2 only)",
+                config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Linked + configured precondition.
+        if config.polymarket_condition_id == [0u8; 32] {
+            msg!("ForceCloseKind2: market not linked yet");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.force_close_unix_timestamp == 0 {
+            msg!("ForceCloseKind2: force-close timestamp not configured (admin must call SetForceCloseTimestamp first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Wrapper-side one-shot sentinel.
+        if config.forced_close_price_e6 != 0 {
+            msg!("ForceCloseKind2: already force-closed");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Time gate. Use the Clock syscall (not a passed account)
+        // for the same anti-spoofing reason as the timestamp setter.
+        let clock = Clock::get()?;
+        if clock.unix_timestamp < config.force_close_unix_timestamp {
+            msg!(
+                "ForceCloseKind2: not yet eligible (now={} < force_close={})",
+                clock.unix_timestamp,
+                config.force_close_unix_timestamp
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Settlement price: engine.last_oracle_price (the last
+        // trade-time price the engine consumed). For kind=2 this is
+        // by construction the ring TWAP at the most recent trade —
+        // see the doc-comment preamble for why this is the correct
+        // choice rather than the current ring TWAP.
+        let last_price = {
+            let engine = zc::engine_ref(&data)?;
+            engine.last_oracle_price
+        };
+        if last_price == 0 {
+            // No trade has ever happened on this market — the engine's
+            // resolve path cannot be invoked (Degenerate mode requires
+            // a non-zero last_oracle_price for both its `resolved_price`
+            // and `live_oracle_price` arguments). Admin escalation via a
+            // future Council-gated handler is the documented path.
+            msg!(
+                "ForceCloseKind2: engine has no last_oracle_price (no trade ever happened — operator escalation required)"
+            );
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // Compute the current ring TWAP for diagnostic logging. Uses
+        // the unbounded helper so a stale ring (typical end-of-life
+        // condition) still produces a value rather than `None`. If
+        // the ring is fully empty (no push ever fired), `twap_for_log`
+        // is `None` and the log just records that fact. The
+        // settlement itself does not depend on this value.
+        let twap_for_log = oracle_ring::ring_buf_twap_unbounded(&config.oracle_ring_buf);
+
+        // Engine resolve. `Degenerate` mode requires both
+        // `resolved_price` and `live_oracle_price` to equal
+        // `engine.last_oracle_price` — passing identical values
+        // produces a zero price-diff terminal delta and a clean
+        // settlement at the last-traded price.
+        //
+        // Borrow scope: `zc::engine_mut(&mut data)` is confined to
+        // the inner block so the exclusive borrow ends before
+        // `write_config` re-borrows `data` mutably below.
+        {
+            let engine = zc::engine_mut(&mut data)?;
+            engine
+                .resolve_market_not_atomic(
+                    percolator::ResolveMode::Degenerate,
+                    last_price,
+                    last_price,
+                    clock.slot,
+                    0,
+                )
+                .map_err(map_risk_error)?;
+        }
+
+        // Cross-handler compatibility: existing post-resolution
+        // readers (Tag 20/21/30 — kind=0/1 originally) read
+        // `config.hyperp_mark_e6` for the resolved price. Mirror
+        // the `ResolvePermissionless` handler's write so those
+        // readers stay consistent for kind=2 too.
+        //
+        // Cross-kind-aliasing note: this field is named for the
+        // Hyperp use case but is used here as a generic
+        // "post-resolution mark" slot. Downstream Hyperp-specific
+        // readers MUST gate on `market_kind` before consuming this
+        // field — kind=2 markets repurpose it for settlement-price
+        // exposure to legacy readers.
+        config.hyperp_mark_e6 = last_price;
+        // Wrapper-side one-shot sentinel: write last_price (the
+        // engine's settlement price) so off-chain observers can
+        // confirm the wrapper and engine agree.
+        config.forced_close_price_e6 = last_price;
+        state::write_config(&mut data, &config);
+
+        // Wrapper-side resolved flag.
+        state::set_resolved(&mut data);
+
+        msg!(
+            "ForceCloseKind2: slab={} settled at last_oracle_price_e6={} (diagnostic_twap_unbounded={:?}, force_close_unix_ts={}, now={})",
+            a_slab.key,
+            last_price,
+            twap_for_log,
+            config.force_close_unix_timestamp,
+            clock.unix_timestamp
         );
         Ok(())
     }

@@ -260,6 +260,20 @@ pub const TAG_SET_PYTH_PRICE_MAPPING: u8 = 86;
 /// (Clock is read via syscall, not passed as an account.)
 pub const TAG_SET_FORCE_CLOSE_TIMESTAMP: u8 = 87;
 
+/// Polymarket-perp: permissionless crank that force-closes a
+/// `market_kind = 2` slab at the captured ring TWAP, BEFORE
+/// Polymarket's UMA finalisation can hit a live leveraged position.
+/// Eligible once `clock.unix_timestamp >= force_close_unix_timestamp`.
+/// One-shot — refuses if `forced_close_price_e6` is already non-zero.
+/// Reads TWAP via the unbounded helper so a stale ring (typical at
+/// market end-of-life) still settles cleanly rather than wedging
+/// user capital.
+///
+/// Data: tag(1) = 1 byte. No payload.
+/// Accounts: [caller(signer), slab(writable)]
+/// (Clock is read via syscall, not passed as an account.)
+pub const TAG_FORCE_CLOSE_KIND2: u8 = 88;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +367,7 @@ mod tests {
             TAG_PUSH_ORACLE_SNAPSHOT,
             TAG_SET_PYTH_PRICE_MAPPING,
             TAG_SET_FORCE_CLOSE_TIMESTAMP,
+            TAG_FORCE_CLOSE_KIND2,
         ];
 
         for i in 0..tags.len() {
@@ -452,6 +467,7 @@ mod tests {
             TAG_PUSH_ORACLE_SNAPSHOT,
             TAG_SET_PYTH_PRICE_MAPPING,
             TAG_SET_FORCE_CLOSE_TIMESTAMP,
+            TAG_FORCE_CLOSE_KIND2,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)
