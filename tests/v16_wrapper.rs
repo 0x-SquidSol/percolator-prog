@@ -1,9 +1,9 @@
 use percolator::{
     AssetLifecycleV16, AssetStateV16Account, BackingBucketStatusV16, CloseProgressLedgerV16,
     EngineAssetSlotV16Account, MarketGroupV16, MarketGroupV16HeaderAccount, MarketModeV16,
-    PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
-    ResolvedPayoutLedgerV16, ResolvedPayoutReceiptV16, SideModeV16, SideV16, V16Config,
-    BOUND_SCALE, POS_SCALE,
+    PermissionlessRecoveryReasonV16, PortfolioAccountV16, PortfolioAccountV16Account,
+    PortfolioLegV16, ResolvedPayoutLedgerV16, ResolvedPayoutReceiptV16, SideModeV16, SideV16,
+    V16Config, BOUND_SCALE, POS_SCALE,
 };
 use percolator_prog::{
     constants::{
@@ -16,6 +16,9 @@ use percolator_prog::{
     ix::Instruction,
     oracle_v16, policy_v16, processor, state,
 };
+// RESYNC(9abf11b): MarketGroupV16 / PortfolioAccountV16 come from the ENGINE
+// (percolator::, runtime-vec-api retained), already imported above — not the
+// wrapper state:: relocation 9abf11b introduced for toly's deleted runtime path.
 use solana_program::{
     account_info::AccountInfo, program_error::ProgramError, program_option::COption,
     program_pack::Pack, pubkey::Pubkey,
@@ -100,7 +103,7 @@ fn active_bitmap_with(indices: &[usize]) -> percolator::V16ActiveBitmap {
 }
 
 fn active_leg_for_asset(
-    account: &percolator::PortfolioAccountV16,
+    account: &PortfolioAccountV16,
     asset_index: usize,
 ) -> percolator::PortfolioLegV16 {
     account
@@ -111,7 +114,7 @@ fn active_leg_for_asset(
         .unwrap()
 }
 
-fn has_active_leg_for_asset(account: &percolator::PortfolioAccountV16, asset_index: usize) -> bool {
+fn has_active_leg_for_asset(account: &PortfolioAccountV16, asset_index: usize) -> bool {
     account
         .legs
         .iter()
