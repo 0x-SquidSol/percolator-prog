@@ -7767,29 +7767,7 @@ pub mod processor {
         Ok(())
     }
 
-    /// Keeper-crank-specific accrual wrapper. Combines the stuck-target
-    /// guard, the uncovered-progress guard, and the actual accrue. Replaces
-    /// `ensure_market_accrued_to_now_with_policy` at the keeper crank call
-    /// site.
-    #[allow(dead_code)]
-    fn ensure_market_accrued_to_now_for_keeper_crank(
-        engine: &mut RiskEngine,
-        config: &MarketConfig,
-        now_slot: u64,
-        price: u64,
-        funding_rate_e9: i128,
-        combined: &[(u16, Option<percolator::LiquidationPolicy>)],
-    ) -> Result<(), ProgramError> {
-        reject_stuck_target_accrual(config, engine, now_slot, price)?;
-        reject_keeper_crank_uncovered_market_progress(
-            engine,
-            now_slot,
-            price,
-            funding_rate_e9,
-            combined,
-        )?;
-        ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
-    }
+
 
     /// PORT-3-supporting (toly:3858). Sync per-account fee_slot to `now_slot`
     /// after an authoritative engine touch (settle_account_not_atomic, keeper
@@ -8646,13 +8624,6 @@ pub mod processor {
         let multiplier = packed & 0xFFFF_FFFF;
         let skew_factor = (packed >> 32) & 0xFFFF;
         (multiplier, skew_factor)
-    }
-
-    /// PERC-298: Pack OI cap multiplier and skew factor.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn pack_oi_cap(multiplier: u64, skew_factor: u64) -> u64 {
-        (multiplier & 0xFFFF_FFFF) | ((skew_factor & 0xFFFF) << 32)
     }
 
     /// GH#2073: Verify the Token-2022 program account is the canonical spl_token_2022::id().

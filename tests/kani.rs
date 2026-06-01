@@ -695,7 +695,9 @@ fn kani_tradenocpi_universal_characterization() {
 // N. ZERO SIZE WITH PARTIAL_OK (1 proof)
 // =============================================================================
 
-/// Prove: zero exec_size with PARTIAL_OK flag is accepted
+/// Prove: zero exec_size with PARTIAL_OK flag is accepted (when matcher
+/// zero-fill check from Wave 12-C is satisfied — exec_price_e6 must equal
+/// oracle_price_e6 per upstream `d76ea67` invariant).
 #[kani::proof]
 fn kani_matcher_zero_size_with_partial_ok_accepted() {
     let mut ret = any_matcher_return();
@@ -703,6 +705,10 @@ fn kani_matcher_zero_size_with_partial_ok_accepted() {
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
+    // Wave 12-C: matcher rejects exec_price_e6 != oracle_price_e6 (zero-fill
+    // defense ported from upstream d76ea67). Constrain inputs to model the
+    // accept side of the new invariant.
+    ret.oracle_price_e6 = ret.exec_price_e6;
     ret.exec_size = 0;
 
     let lp_account_id: u64 = ret.lp_account_id;
@@ -1093,13 +1099,15 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
 /// Non-vacuity: concrete witness proves at least one Accept path exists.
 #[kani::proof]
 fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
-    // Non-vacuity witness: construct valid ABI inputs that produce Accept
+    // Non-vacuity witness: construct valid ABI inputs that produce Accept.
+    // Wave 12-C: exec_price_e6 must equal oracle_price_e6 for matcher to
+    // accept (zero-fill defense from upstream d76ea67).
     {
         let req_id = nonce_on_success(42).expect("42 + 1 cannot overflow u64");
         let valid_ret = MatcherReturnFields {
             abi_version: MATCHER_ABI_VERSION,
             flags: FLAG_VALID | FLAG_PARTIAL_OK,
-            exec_price_e6: 1_000_000,
+            exec_price_e6: 50_000_000,
             exec_size: 0,
             req_id,
             lp_account_id: 1,
@@ -1135,7 +1143,12 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
     let pda_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let ret = any_matcher_return_fields();
+    let mut ret = any_matcher_return_fields();
+    // Wave 12-C: matcher zero-fill check forces exec_price_e6 == oracle_price_e6
+    // for accept. Symbolic harnesses must constrain to the accept side OR
+    // model both sides; here we constrain to accept so the nonce-transition
+    // proof remains over the full symbolic space of every OTHER input.
+    ret.oracle_price_e6 = ret.exec_price_e6;
     let lp_account_id: u64 = kani::any();
     let oracle_price_e6: u64 = kani::any();
     let req_size: i128 = kani::any();
@@ -1922,6 +1935,10 @@ fn kani_tradecpi_from_ret_req_id_is_nonce_plus_one() {
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK; // PARTIAL_OK allows exec_size=0
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
+    // Wave 12-C: matcher rejects exec_price_e6 != oracle_price_e6 (zero-fill
+    // defense from upstream d76ea67). Pair both fields so the matcher accept
+    // path is reachable.
+    ret.oracle_price_e6 = ret.exec_price_e6;
     ret.req_id = expected_req_id; // Must match nonce_on_success(old_nonce)
     ret.exec_size = 0; // With PARTIAL_OK, zero size is always valid
 
@@ -1995,6 +2012,9 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
+    // Wave 12-C: matcher rejects exec_price_e6 != oracle_price_e6 (zero-fill
+    // defense from upstream d76ea67).
+    ret.oracle_price_e6 = ret.exec_price_e6;
     ret.req_id = expected_req_id;
     ret.exec_size = 0; // PARTIAL_OK allows zero
 
