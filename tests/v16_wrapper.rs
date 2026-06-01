@@ -16436,3 +16436,599 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
         check(&market, &fresh);
     }
 }
+
+// ============================================================================
+// Cross-domain isolation under oracle attack.
+//
+// Property: an attacker who fully controls one domain's oracle (asset 1 here)
+// must NOT be able to extract value from OTHER domains - neither the honest
+// domain's insurance/backing nor the capital of a bystander who only trades
+// the honest domain - even though the wrapper is cross-margin and the victim
+// holds positions. The engine isolates loss absorption per domain
+// (consume_domain_insurance_for_negative_pnl is scoped to the bankrupt asset's
+// own domain) and the wrapper keeps sum_d (budget - spent) <= insurance, so a
+// loss in the attacker's domain can consume at most that domain's insurance +
+// the victim's own capital + social loss among that asset's own participants.
+//
+// This test drives a randomized adversarial sequence on the attacker domain
+// (wild oracle pushes, trades against a victim, liquidation cranks, and
+// withdrawal attempts) and asserts after EVERY step that the honest domain's
+// per-domain insurance budget, its backing bucket, and the bystander's capital
+// are byte-for-byte unchanged from the pre-attack snapshot.
+// ============================================================================
+#[test]
+fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
+    // asset 0 -> domains 0,1 ; asset 1 (ATTACKER) -> 2,3 ; asset 2 (HONEST) -> 4,5
+    let mut admin = signer().writable();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+
+    let mut attacker = signer().writable();
+    let admin_key = admin.key.to_bytes();
+    let attacker_key = attacker.key.to_bytes();
+    // Asset 1 = attacker-controlled domain (including oracle authority). Asset
+    // 2 = honest domain. Both are activated by admin (the asset authority).
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        100,
+        125,
+        attacker_key,
+        attacker_key,
+        attacker_key,
+    )
+    .unwrap();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        2,
+        200,
+        125,
+        admin_key,
+        admin_key,
+        admin_key,
+    )
+    .unwrap();
+
+    let mut token_program = token_program_account();
+
+    // ---- Fund the HONEST domain (asset 2: domains 4,5) ----
+    let mut admin_src = user_token_account(admin.key, mint, 1_000_000_000);
+    let mut vault_tok = vault_token_account(&market, mint, 1_000_000_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut attacker_dest = user_token_account(attacker.key, mint, 0);
+    for dom in [4u8, 5u8] {
+        run_ix(
+            Instruction::TopUpInsuranceDomain {
+                domain: dom,
+                amount: 5_000,
+            },
+            &mut [
+                &mut admin,
+                &mut market,
+                &mut admin_src,
+                &mut vault_tok,
+                &mut token_program,
+            ],
+        )
+        .unwrap();
+    }
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: 4,
+            amount: 3_000,
+            expiry_slot: 1_000_000,
+        },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut admin_src,
+            &mut vault_tok,
+            &mut token_program,
+        ],
+    )
+    .unwrap();
+
+    // ---- Bystander who only ever touches the HONEST asset 2 ----
+    let mut bystander = signer();
+    let mut bystander_acct = portfolio_account();
+    init_portfolio(&mut bystander, &mut market, &mut bystander_acct);
+    deposit(&mut bystander, &mut market, &mut bystander_acct, 200_000);
+
+    // ---- Attacker + victim on asset 1 ----
+    let mut victim = signer();
+    let mut atk_acct = portfolio_account();
+    let mut vic_acct = portfolio_account();
+    init_portfolio(&mut attacker, &mut market, &mut atk_acct);
+    init_portfolio(&mut victim, &mut market, &mut vic_acct);
+    deposit(&mut attacker, &mut market, &mut atk_acct, 1_000_000);
+    deposit(&mut victim, &mut market, &mut vic_acct, 300);
+
+    // Snapshot honest-domain state and bystander capital after setup.
+    let snap = |market: &TestAccount| {
+        let (_, g) = state::read_market(&market.data).unwrap();
+        (
+            g.insurance_domain_budget[4],
+            g.insurance_domain_budget[5],
+            g.insurance_domain_spent[4],
+            g.insurance_domain_spent[5],
+            g.source_backing_buckets[4].fresh_unliened_backing_num,
+            g.source_backing_buckets[4].utilization_fee_earnings,
+        )
+    };
+    let honest_before = snap(&market);
+    let bystander_before = state::read_portfolio(&bystander_acct.data).unwrap().capital;
+
+    let assert_honest_isolated = |market: &TestAccount, bystander_acct: &TestAccount, tag: &str| {
+        assert_eq!(
+            snap(market),
+            honest_before,
+            "honest domain state changed after {tag}"
+        );
+        let (_, group) = state::read_market(&market.data).unwrap();
+        assert!(
+            group.vault >= group.insurance + group.c_tot,
+            "vault {} < insurance {} + user capital {} after {tag}",
+            group.vault,
+            group.insurance,
+            group.c_tot
+        );
+        let cap = state::read_portfolio(&bystander_acct.data).unwrap().capital;
+        assert_eq!(
+            cap, bystander_before,
+            "bystander capital changed after {tag}"
+        );
+    };
+
+    // Configure asset 1 oracle as the attacker-controlled oracle authority.
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            asset_index: 1,
+            now_slot: 300,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+        },
+        &mut [&mut attacker, &mut market],
+    )
+    .unwrap();
+    assert_honest_isolated(&market, &bystander_acct, "configure asset1 oracle");
+
+    // Open opposing positions on asset 1 between attacker (long) and victim
+    // (short) at the honest price.
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 1,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut attacker,
+            &mut victim,
+            &mut market,
+            &mut atk_acct,
+            &mut vic_acct,
+        ],
+    )
+    .unwrap();
+    assert_honest_isolated(&market, &bystander_acct, "open asset1 position");
+
+    // Randomized attack: push the asset-1 mark to wild values and liquidate.
+    let mut rng: u64 = 0xA11C_E5_DEAD_BEEFu64;
+    let next = |rng: &mut u64| {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        *rng
+    };
+    let mut liquidations = 0u32;
+    let mut slot = 300u64;
+    for _ in 0..200 {
+        slot += 1;
+        // Wild attacker-chosen price in [1, 1_000_000].
+        let mark = 1 + (next(&mut rng) % 1_000_000);
+        let _ = run_ix(
+            Instruction::PushEwmaMark {
+                asset_index: 1,
+                now_slot: slot,
+                mark_e6: mark,
+            },
+            &mut [&mut attacker, &mut market],
+        );
+        assert_honest_isolated(&market, &bystander_acct, "push asset1 mark");
+
+        // Liquidation crank against the victim on asset 1.
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                action: 1,
+                asset_index: 1,
+                now_slot: slot,
+                funding_rate_e9: 0,
+                close_q: POS_SCALE,
+                fee_bps: 0,
+                recovery_reason: 0,
+            },
+            &mut [&mut admin, &mut market, &mut vic_acct],
+        );
+        if res.is_ok() {
+            liquidations += 1;
+        }
+        assert_honest_isolated(&market, &bystander_acct, "liquidate victim on asset1");
+
+        // Attacker tries to realize gains by withdrawing - capped by their real
+        // equity; can never pull honest-domain value.
+        let _ = run_ix(
+            Instruction::Withdraw {
+                amount: (next(&mut rng) % 2_000_000) as u128,
+            },
+            &mut [
+                &mut attacker,
+                &mut market,
+                &mut atk_acct,
+                &mut attacker_dest,
+                &mut vault_tok,
+                &mut vault_auth,
+                &mut token_program,
+            ],
+        );
+        assert_honest_isolated(&market, &bystander_acct, "attacker withdraw");
+    }
+
+    // Non-vacuity: the attack must have actually moved the asset-1 mark and
+    // exercised the liquidation path at least once.
+    assert!(
+        liquidations > 0,
+        "attack never triggered a liquidation; test is vacuous"
+    );
+    // Non-vacuity: the attack must have actually hurt the victim (drained their
+    // capital and/or closed their position), proving the loss-absorption path
+    // ran while the honest domain stayed isolated.
+    let victim_after = state::read_portfolio(&vic_acct.data).unwrap();
+    assert!(
+        victim_after.capital < 300
+            || percolator::active_bitmap_is_empty(victim_after.active_bitmap),
+        "victim was never harmed (capital {}); attack vacuous",
+        victim_after.capital
+    );
+    // Final isolation check.
+    assert_honest_isolated(&market, &bystander_acct, "final");
+}
+
+// ----------------------------------------------------------------------------
+// Per-asset crank clamp dt (regression for the multi-asset clamp/envelope
+// mismatch). The wrapper used to clamp the crank price toward the target using
+// the GROUP-level dt (`now - header.slot_last`), while the engine accrual
+// envelope validates the move against the PER-ASSET dt
+// (`now - asset.slot_last`). Because `header.slot_last == min(per-asset
+// slot_last)`, a fresher asset in a multi-asset market would get a clamp dt
+// strictly larger than its own accrual dt, letting the wrapper hand the engine
+// a price the per-asset envelope rejects with RecoveryRequired -- a transient
+// crank brick for that asset (it can only be unstuck by cranking the stalest
+// asset first). The fix clamps with the per-asset slot_last so the wrapper
+// clamp bound exactly matches the engine envelope bound for the cranked asset.
+// ----------------------------------------------------------------------------
+
+// Builds a 2-asset market in the exact "group pinned stale, asset-1 fresh"
+// state and pushes `target_mark_e6` as asset 1's auth-mark target, leaving the
+// market ready for `PermissionlessCrank { asset_index: 1, now_slot: 11 }`.
+//
+// Slot layout after setup:
+//   asset 0: slot_last = 0, has open interest  -> pins header.slot_last to 0
+//   asset 1: slot_last = 10, has open interest, auth-mark target pushed
+//   header.slot_last = min(0, 10) = 0, current_slot = 10
+// So at the crank slot 11:
+//   group dt  = 11 - 0  = 11   (what the buggy clamp used)
+//   asset dt  = 11 - 10 = 1    (what the engine envelope uses)
+// With max_price_move_bps_per_slot = 1000 (10%/slot) and an asset-1 price of
+// 100, the per-asset 1-slot envelope only admits a move to 110.
+fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAccount, TestAccount) {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut a0_long_owner = signer();
+    let mut a0_short_owner = signer();
+    let mut a1_long_owner = signer();
+    let mut a1_short_owner = signer();
+    let mut a0_long = portfolio_account();
+    let mut a0_short = portfolio_account();
+    let mut a1_long = portfolio_account();
+    let mut a1_short = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                max_price_move_bps_per_slot,
+                max_accrual_dt_slots,
+                min_funding_lifetime_slots,
+                ..
+            } = ix
+            {
+                *max_portfolio_assets = 2;
+                *max_price_move_bps_per_slot = 1_000;
+                // Keep max_price_move_bps_per_slot * max_accrual_dt_slots <= 10_000 so
+                // the 100% maintenance-margin solvency envelope admits the config, and
+                // max_accrual_dt_slots <= min_funding_lifetime_slots for the engine.
+                *max_accrual_dt_slots = 10;
+                *min_funding_lifetime_slots = 10;
+            }
+        }),
+    );
+
+    // Asset 0: auth-mark, price 100. Open its interest at slot 0 so it is a
+    // live, accruable asset that pins header.slot_last; then never touch it
+    // again, so it stays at slot 0 while asset 1 moves ahead.
+    configure_base_auth_mark(&mut admin, &mut market, 0, 100);
+    init_portfolio(&mut a0_long_owner, &mut market, &mut a0_long);
+    init_portfolio(&mut a0_short_owner, &mut market, &mut a0_short);
+    deposit(&mut a0_long_owner, &mut market, &mut a0_long, 1_000_000);
+    deposit(&mut a0_short_owner, &mut market, &mut a0_short, 1_000_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut a0_long_owner,
+            &mut a0_short_owner,
+            &mut market,
+            &mut a0_long,
+            &mut a0_short,
+        ],
+    )
+    .unwrap();
+
+    // Asset 1 is already an active slot after init. Configure it as an auth-mark
+    // at slot 5: this sets its own slot_last to 5 (it has no open interest yet)
+    // while leaving header.slot_last pinned to 0, because asset 0 already holds a
+    // position. Then open asset-1 interest with disjoint portfolios so the
+    // asset-1 crank never settles an asset-0 leg; the trade isolates asset 0's
+    // (unrelated) loss-stale bit.
+    run_ix(
+        Instruction::ConfigureAuthMark {
+            asset_index: 1,
+            now_slot: 5,
+            initial_mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    init_portfolio(&mut a1_long_owner, &mut market, &mut a1_long);
+    init_portfolio(&mut a1_short_owner, &mut market, &mut a1_short);
+    deposit(&mut a1_long_owner, &mut market, &mut a1_long, 1_000_000);
+    deposit(&mut a1_short_owner, &mut market, &mut a1_short, 1_000_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 1,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut a1_long_owner,
+            &mut a1_short_owner,
+            &mut market,
+            &mut a1_long,
+            &mut a1_short,
+        ],
+    )
+    .unwrap();
+    {
+        let (_, group) = state::read_market(&market.data).unwrap();
+        assert_eq!(group.assets[0].slot_last, 0, "asset 0 stays stale at slot 0");
+        assert_eq!(group.assets[1].slot_last, 5, "asset 1 is fresh at slot 5");
+        assert_eq!(group.slot_last, 0, "header.slot_last is pinned by the stale asset 0");
+        assert_eq!(group.current_slot, 5);
+        assert_eq!(group.assets[1].effective_price, 100);
+    }
+
+    // Push a far auth-mark target for asset 1 at slot 6, leaving the market ready
+    // for a crank at slot 6 where group dt = 6 but asset-1 accrual dt = 1.
+    run_ix(
+        Instruction::PushAuthMark {
+            asset_index: 1,
+            now_slot: 6,
+            mark_e6: target_mark_e6,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    (admin, market, a1_long)
+}
+
+#[test]
+fn v16_wrapper_crank_clamp_uses_per_asset_dt_not_group_dt() {
+    // Target 130 sits outside asset 1's per-slot envelope (max move to 110) but
+    // inside the wider group-dt window the buggy clamp used. Before the fix the
+    // wrapper clamped toward 130 with group dt = 6 and handed the engine a price
+    // the per-asset envelope (dt = 1) rejected -> the crank reverted with
+    // RecoveryRequired. After the fix the wrapper clamps with the per-asset dt,
+    // so it never proposes a move the engine will reject: the crank advances and
+    // the price walks exactly to the per-asset 1-slot bound, 110.
+    let (mut admin, mut market, mut a1_long) = setup_pinned_group_fresh_asset1(130);
+
+    run_ix(
+        Instruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 1,
+            now_slot: 6,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+        &mut [&mut admin, &mut market, &mut a1_long],
+    )
+    .expect("fresh-asset crank must make progress when the group is pinned by a stale asset");
+
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        group.assets[1].effective_price, 110,
+        "crank price must be clamped to asset 1's own per-slot envelope (100 -> 110), not the wider group window",
+    );
+    assert_eq!(group.assets[1].slot_last, 6, "asset 1 accrued to the crank slot");
+    assert_eq!(group.assets[0].slot_last, 0, "the stale asset is untouched and still recoverable");
+    assert_eq!(group.mode, MarketModeV16::Live);
+}
+
+#[test]
+fn v16_wrapper_crank_per_asset_clamp_still_binds_extreme_target() {
+    // The fix tightens the clamp dt; it must not loosen the clamp. Even an
+    // absurd target is admitted by the crank only after being clamped to the
+    // per-asset 1-slot bound (100 -> 110), so the engine envelope is always
+    // satisfied and the price can never jump by the group dt.
+    let (mut admin, mut market, mut a1_long) = setup_pinned_group_fresh_asset1(100_000);
+
+    run_ix(
+        Instruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 1,
+            now_slot: 6,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+        &mut [&mut admin, &mut market, &mut a1_long],
+    )
+    .expect("crank must make progress and clamp the extreme target rather than reverting");
+
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        group.assets[1].effective_price, 110,
+        "per-asset 1-slot clamp must cap the move at 10% regardless of how far the pushed target is",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Per-asset dt for the dynamic-fee externality floor (same class as the crank
+// clamp fix above). `hybrid_trade_fee_bps_view` sized the EwmaMark / matured-
+// hybrid externality floor with the GROUP dt (`now - header.slot_last`) instead
+// of the per-asset dt (`now - asset.slot_last`). In a multi-asset market pinned
+// stale by one asset, a trade on a FRESH EwmaMark asset got a hugely inflated
+// fee floor that could exceed max_trading_fee_bps and revert the trade -- a
+// liveness footgun on the fresh asset, driven by an unrelated stale co-asset.
+// The fix clamps with the per-asset dt so the floor reflects only the traded
+// asset's own staleness.
+// ----------------------------------------------------------------------------
+#[test]
+fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut a0_long_owner = signer();
+    let mut a0_short_owner = signer();
+    let mut a1_long_owner = signer();
+    let mut a1_short_owner = signer();
+    let mut a0_long = portfolio_account();
+    let mut a0_short = portfolio_account();
+    let mut a1_long = portfolio_account();
+    let mut a1_short = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                max_price_move_bps_per_slot,
+                max_accrual_dt_slots,
+                min_funding_lifetime_slots,
+                max_trading_fee_bps,
+                ..
+            } = ix
+            {
+                *max_portfolio_assets = 2;
+                *max_price_move_bps_per_slot = 1_000;
+                *max_accrual_dt_slots = 10;
+                *min_funding_lifetime_slots = 10;
+                // Group dt = 5 => floor 5000 bps > cap; per-asset dt = 1 => floor
+                // 1000 bps < cap. So the cap distinguishes the two clamp dts.
+                *max_trading_fee_bps = 3_000;
+            }
+        }),
+    );
+
+    // Asset 0: auth-mark with open interest at slot 0 -> pins header.slot_last to 0.
+    configure_base_auth_mark(&mut admin, &mut market, 0, 100);
+    init_portfolio(&mut a0_long_owner, &mut market, &mut a0_long);
+    init_portfolio(&mut a0_short_owner, &mut market, &mut a0_short);
+    deposit(&mut a0_long_owner, &mut market, &mut a0_long, 1_000_000);
+    deposit(&mut a0_short_owner, &mut market, &mut a0_short, 1_000_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut a0_long_owner,
+            &mut a0_short_owner,
+            &mut market,
+            &mut a0_long,
+            &mut a0_short,
+        ],
+    )
+    .unwrap();
+
+    // Asset 1: EwmaMark configured at slot 5 -> asset 1 slot_last = 5, current_slot
+    // = 5, but header.slot_last stays 0 (asset 0 already holds a position). EwmaMark
+    // (not auth-mark) so the trade actually exercises the externality fee floor.
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            asset_index: 1,
+            now_slot: 5,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    init_portfolio(&mut a1_long_owner, &mut market, &mut a1_long);
+    init_portfolio(&mut a1_short_owner, &mut market, &mut a1_short);
+    deposit(&mut a1_long_owner, &mut market, &mut a1_long, 1_000_000);
+    deposit(&mut a1_short_owner, &mut market, &mut a1_short, 1_000_000);
+    {
+        let (_, group) = state::read_market(&market.data).unwrap();
+        assert_eq!(group.assets[0].slot_last, 0, "asset 0 stays stale at slot 0");
+        assert_eq!(group.assets[1].slot_last, 5, "asset 1 is fresh at slot 5");
+        assert_eq!(group.slot_last, 0, "header.slot_last pinned by stale asset 0 -> group dt = 5");
+        assert_eq!(group.current_slot, 5);
+    }
+
+    // Trade on the FRESH EwmaMark asset 1 at mark price. The trade's now_slot ==
+    // current_slot == 5, so group dt = 5 (floor 5000 > 3000 cap, reverts before
+    // the fix) but per-asset dt = 0 -> max(1,..) = 1 (floor 1000 < cap) after it.
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 1,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut a1_long_owner,
+            &mut a1_short_owner,
+            &mut market,
+            &mut a1_long,
+            &mut a1_short,
+        ],
+    )
+    .expect("a trade on a fresh asset must not be blocked by an unrelated stale co-asset's group dt");
+
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        group.assets[1].oi_eff_long_q, POS_SCALE,
+        "the fresh-asset trade went through and opened interest",
+    );
+    assert_eq!(group.assets[0].slot_last, 0, "the stale co-asset is still untouched and recoverable");
+}
