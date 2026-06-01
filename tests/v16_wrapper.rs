@@ -3716,9 +3716,18 @@ fn v16_wrapper_maintenance_fee_sync_charges_recurring_fee_without_forcing_local_
     .unwrap();
 
     {
+        // RESYNC(323c9f2 target-effective-lag): adopt toly 574a7a1's setup —
+        // direct slot/price field-set instead of accrue_asset_to_not_atomic,
+        // with effective_price aligned to raw_oracle_target_price (=50) so the
+        // new adverse-lag penalty is zero. This test exercises ONLY the recurring
+        // maintenance fee; our fork's old accrue-based setup left a price lag
+        // that now (correctly) levies a +50 penalty.
         let (cfg, mut group) = state::read_market(&market.data).unwrap();
-        group.accrue_asset_to_not_atomic(0, 1, 50, 0, true).unwrap();
+        group.current_slot = 1;
+        group.slot_last = 1;
         group.assets[0].raw_oracle_target_price = 50;
+        group.assets[0].effective_price = 50;
+        group.assets[0].slot_last = 1;
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
 
