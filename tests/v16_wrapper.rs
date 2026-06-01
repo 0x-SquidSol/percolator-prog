@@ -6619,6 +6619,28 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
 }
 
 #[test]
+fn v16_wrapper_asset_zero_cannot_be_retired() {
+    let mut admin = signer();
+    let mut market = market_account();
+
+    init_market(&mut admin, &mut market);
+    let before = market.data.clone();
+    let retire_base = update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_RETIRE,
+        0,
+        1,
+        0,
+    );
+    assert_err_and_market_unchanged(retire_base, &market, &before);
+
+    let (cfg, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg.free_market_slot_count, 0);
+    assert_eq!(group.assets[0].lifecycle, AssetLifecycleV16::Active);
+}
+
+#[test]
 fn v16_wrapper_asset_retire_rejects_nonzero_domain_insurance_budget() {
     let mut admin = signer();
     let mut market = market_account();
@@ -10511,6 +10533,38 @@ fn v16_wrapper_base_unit_authority_changes_primary_and_rotates() {
     let account = state::read_portfolio(&portfolio.data).unwrap();
     assert_eq!(group.vault, 1);
     assert_eq!(account.capital, 1);
+}
+
+#[test]
+fn v16_wrapper_base_unit_mint_rotation_rejects_nonempty_market_vault() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut old_primary_mint = mint_account();
+    let mut new_primary_mint = mint_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+
+    run_ix(
+        default_init_market_ix(),
+        &mut [&mut admin, &mut market, &mut old_primary_mint],
+    )
+    .unwrap();
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1);
+
+    let before = market.data.clone();
+    let rotate = configure_base_unit_mints(
+        &mut admin,
+        &mut market,
+        &mut old_primary_mint,
+        &mut new_primary_mint,
+    );
+    assert_err_and_market_unchanged(rotate, &market, &before);
+
+    let (cfg, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg.collateral_mint, old_primary_mint.key.to_bytes());
+    assert_eq!(group.vault, 1);
+    assert_eq!(group.c_tot, 1);
 }
 
 #[test]
@@ -15279,6 +15333,50 @@ fn v16_wrapper_close_resolved_uses_configured_fee_not_permissionless_caller_fee(
 }
 
 #[test]
+fn v16_wrapper_close_resolved_pays_positive_pnl_through_engine_ledger() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+
+    let mint = init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000);
+    top_up_backing_bucket(&mut admin, &mut market, 1, 250, 10);
+    add_source_positive_pnl(&mut market, &mut portfolio, 1, 250);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+
+    let mut dest = user_token_account(owner.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_250);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    )
+    .unwrap();
+
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    assert_eq!(group.vault, 0);
+    assert_eq!(group.c_tot, 0);
+    assert_eq!(account.capital, 0);
+    assert_eq!(account.pnl, 0);
+    assert!(account.resolved_payout_receipt.present);
+    assert!(account.resolved_payout_receipt.finalized);
+}
+
+#[test]
 fn v16_wrapper_close_resolved_does_not_double_pay_after_closed_payout() {
     let mut admin = signer();
     let mut market = market_account();
@@ -15477,11 +15575,11 @@ fn v16_wrapper_close_resolved_rejects_before_resolution_without_mutation() {
 }
 
 #[test]
-fn v16_wrapper_close_resolved_active_position_makes_progress_no_payout() {
-    // post-fix: close_resolved_account_not_atomic returns ProgressOnly (payout=0,
-    // Ok(())) when an active position is present — it makes KF-effects progress
-    // then returns without paying. Previously the fork's inline code returned
-    // Custom(21) at this point; the engine correctly returns ProgressOnly.
+// RESYNC(323c9f2 detach): the FORK-vs-TOLY ProgressOnly divergence is ELIMINATED
+// by this re-sync. Our engine now carries detach_solvent_active_legs_for_resolved_
+// close, so a solvent open-position winner closes+pays in the same call (matching
+// toly 574a7a1's final test, which superseded the stale 0925ed4 ProgressOnly form).
+fn v16_wrapper_close_resolved_active_position_pays_when_engine_clears_exposure() {
     let mut admin = signer();
     let mut market = market_account();
     let mut long_owner = signer();
@@ -15530,39 +15628,24 @@ fn v16_wrapper_close_resolved_active_position_makes_progress_no_payout() {
             &mut token_program,
         ],
     );
-    // Engine returns ProgressOnly -> payout=0 -> Ok(()).
     assert_eq!(result, Ok(()));
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let long = state::read_portfolio(&long_account.data).unwrap();
     assert_eq!(
-        group.vault, 2_000_000,
-        "resolved close must not pay when account still has exposure (ProgressOnly)"
+        group.vault, 1_000_000,
+        "resolved close pays capital once the engine clears account exposure"
     );
-    // Capital is still there (ProgressOnly — not yet closed).
-    assert_eq!(long.capital, 1_000_000);
-    // ProgressOnly did NOT close the leg: the position is still open. (Pins that
-    // the Ok(()) is a no-pay progress step, not an erroneous silent close.)
-    assert!(
-        !percolator::active_bitmap_is_empty(long.active_bitmap),
-        "ProgressOnly must leave the open position intact (leg still active)"
-    );
-    // FORK-vs-TOLY DIVERGENCE (V16_DIVERGENCES.md): toly's newer engine clears the
-    // leg and pays capital in this same call; our locked engine (b3558fa) returns
-    // ProgressOnly and requires the position to be flattened BEFORE resolve. The
-    // security invariant — no payout while exposure is open — holds in both. Since
-    // nothing was paid, no resolved-payout snapshot may have been captured.
-    assert!(
-        !group.payout_snapshot_captured,
-        "no payout snapshot may be captured for a still-exposed resolved close"
-    );
+    assert!(percolator::active_bitmap_is_empty(long.active_bitmap));
+    assert_eq!(long.capital, 0);
 }
 
 #[test]
-fn v16_wrapper_close_resolved_active_position_progress_only_no_token_accounts_needed() {
-    // post-fix: CloseResolved with an active position succeeds with payout=0
-    // (ProgressOnly) — no token accounts are required because nothing is paid.
-    // Previously the fork's inline code returned Custom(21) early.
+// RESYNC(323c9f2 detach): toly 574a7a1's final form — once the engine clears
+// exposure the close becomes a real payout, so omitting the token accounts now
+// fails with NotEnoughAccountKeys and leaves market+portfolio untouched (no
+// silent ProgressOnly). Supersedes the stale 0925ed4 progress-only variant.
+fn v16_wrapper_close_resolved_payout_requires_token_accounts_after_exposure_clears() {
     let mut admin = signer();
     let mut market = market_account();
     let mut long_owner = signer();
@@ -15593,34 +15676,17 @@ fn v16_wrapper_close_resolved_active_position_progress_only_no_token_accounts_ne
     .unwrap();
     run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
 
-    // No token accounts needed when payout=0.
+    let before_market = market.data.clone();
+    let before_portfolio = long_account.data.clone();
     let result = run_ix(
         Instruction::CloseResolved {
             fee_rate_per_slot: 0,
         },
         &mut [&mut long_owner, &mut market, &mut long_account],
     );
-    // Engine ProgressOnly -> payout=0 -> Ok(()) — no token accounts required.
-    assert_eq!(result, Ok(()));
-
-    let (_, group) = state::read_market(&market.data).unwrap();
-    let long = state::read_portfolio(&long_account.data).unwrap();
-    assert_eq!(
-        group.vault, 2_000_000,
-        "active resolved close (ProgressOnly) must not perform any token payout"
-    );
-    assert_eq!(long.capital, 1_000_000);
-    // Leg still open + no snapshot: ProgressOnly is a no-pay progress step, not a
-    // silent close. (FORK-vs-TOLY DIVERGENCE: toly clears+pays here; our locked
-    // engine requires flattening before resolve — see V16_DIVERGENCES.md.)
-    assert!(
-        !percolator::active_bitmap_is_empty(long.active_bitmap),
-        "ProgressOnly must leave the open position intact (leg still active)"
-    );
-    assert!(
-        !group.payout_snapshot_captured,
-        "no payout snapshot may be captured for a still-exposed resolved close"
-    );
+    assert_eq!(result, Err(ProgramError::NotEnoughAccountKeys));
+    assert_eq!(market.data, before_market);
+    assert_eq!(long_account.data, before_portfolio);
 }
 
 #[test]
