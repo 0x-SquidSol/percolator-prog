@@ -2004,13 +2004,17 @@ pub mod ix {
         /// is the next holder (default = burn).
         UpdateAuthority { kind: u8, new_pubkey: Pubkey },
         /// Polymarket-perp: bind a `market_kind = 2` slab to a Polymarket
-        /// condition-id + oracle source (tag 84). One-shot: refuses to
-        /// re-bind a market whose `polymarket_condition_id` is already
-        /// non-zero. Admin-only. `oracle_source`: 0=Pyth, 1=custom-keeper,
-        /// 2=Switchboard.
+        /// condition-id + oracle source + off-chain attestation hash
+        /// (tag 84). One-shot. Requires admin AND council co-signature
+        /// (council pubkey must have been configured by
+        /// `SetCouncilAuthority` tag 89 first). Stamps `linked_at_slot`
+        /// for the activation-timelock gate enforced by user-entry
+        /// handlers. `oracle_source`: 0=Pyth, 1=custom-keeper,
+        /// 2=Switchboard (V1 fail-closed to 0=Pyth).
         LinkPolymarketMarket {
             condition_id: [u8; 32],
             oracle_source: u8,
+            metadata_uri_hash: [u8; 32],
         },
         /// Polymarket-perp: permissionless oracle-ring crank for a linked
         /// `market_kind = 2` slab (tag 85). Caller supplies `p_yes_e6`
@@ -2579,11 +2583,18 @@ pub mod ix {
                 }
                 84 => {
                     // Tag 84: LinkPolymarketMarket — bind a market_kind=2 slab
-                    // to a Polymarket condition-id + oracle source. Data:
-                    // condition_id(32) + oracle_source(1) = 33 bytes payload.
+                    // to a Polymarket condition-id + oracle source +
+                    // off-chain attestation hash. Data:
+                    // condition_id(32) + oracle_source(1) + metadata_uri_hash(32)
+                    // = 65 bytes payload.
                     let condition_id = read_bytes32(&mut rest)?;
                     let oracle_source = read_u8(&mut rest)?;
-                    Ok(Instruction::LinkPolymarketMarket { condition_id, oracle_source })
+                    let metadata_uri_hash = read_bytes32(&mut rest)?;
+                    Ok(Instruction::LinkPolymarketMarket {
+                        condition_id,
+                        oracle_source,
+                        metadata_uri_hash,
+                    })
                 }
                 85 => {
                     // Tag 85: PushOracleSnapshot — permissionless oracle-ring
@@ -8428,7 +8439,18 @@ pub mod processor {
     /// level — InitMarket → LinkPolymarketMarket → SetPythPriceMapping
     /// → (first keeper pushes) → user-entry instructions — instead
     /// of relying on the off-chain runbook to get the order right.
-    fn require_kind2_fully_configured(config: &MarketConfig) -> Result<(), ProgramError> {
+    /// Activation-timelock delay after `LinkPolymarketMarket` succeeds
+    /// before user-entry handlers will accept the first deposit on a
+    /// kind=2 slab. 216_000 slots ≈ 24 hours at 400ms per slot. Gives
+    /// off-chain watchers a window to flag a misbound market (via the
+    /// `metadata_uri_hash` reconciliation against the advertised
+    /// event) BEFORE any user capital can enter.
+    const MIN_ACTIVATION_DELAY_SLOTS: u64 = 216_000;
+
+    fn require_kind2_fully_configured(
+        config: &MarketConfig,
+        clock_slot: u64,
+    ) -> Result<(), ProgramError> {
         if config.market_kind != 2 {
             return Ok(());
         }
@@ -8462,6 +8484,37 @@ pub mod processor {
         }
         if config.force_close_unix_timestamp == 0 {
             msg!("Kind=2 slab has no force-close timestamp (call SetForceCloseTimestamp first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // Defence-in-depth: a successful `LinkPolymarketMarket` already
+        // requires `config.council_authority != [0; 32]` (the link
+        // handler refuses to proceed without it), so a configured
+        // `polymarket_condition_id` should imply a configured council
+        // too. Check explicitly so that any future drift between Link
+        // and this helper surfaces as a clean reject rather than
+        // letting an un-governed kind=2 slab reach user entry.
+        if config.council_authority == [0u8; 32] {
+            msg!("Kind=2 slab has no council authority (governance configuration incomplete)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // Activation timelock. `linked_at_slot` is stamped by
+        // `LinkPolymarketMarket`; the user-entry handlers refuse new
+        // accounts until enough slots have elapsed since link for
+        // off-chain watchers to reconcile `metadata_uri_hash` against
+        // the advertised event and flag a misbound market.
+        // Saturating-add is defensive against an absurd
+        // `linked_at_slot` near `u64::MAX` (impossible in practice
+        // because the link handler stamps with the current slot, but
+        // cheap insurance).
+        let activate_at = config
+            .linked_at_slot
+            .saturating_add(MIN_ACTIVATION_DELAY_SLOTS);
+        if clock_slot < activate_at {
+            msg!(
+                "Kind=2 slab still in activation timelock (clock_slot={} < activate_at={})",
+                clock_slot,
+                activate_at
+            );
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
@@ -8714,6 +8767,28 @@ pub mod processor {
         // Kind-specific invariants at assignment time.
         match kind {
             AUTHORITY_ADMIN => {
+                // V1-mainnet kind=2 two-signer integrity guard. If a
+                // council authority has been configured (kind=2
+                // governance), reject any admin rotation that would
+                // make the new admin equal the council pubkey. Without
+                // this gate, an admin-rotation-after-link could
+                // silently collapse the LinkPolymarketMarket two-signer
+                // requirement to "single key signs twice" — defeating
+                // the purpose of council co-sign. Burns are exempt
+                // because new_bytes == [0; 32] != council (the council
+                // setter refuses zero, so council is non-zero by
+                // invariant).
+                if !is_burn
+                    && config.market_kind == 2
+                    && config.council_authority != [0u8; 32]
+                    && new_bytes == config.council_authority
+                {
+                    msg!(
+                        "UpdateAuthority: refuses admin rotation to council_authority (would collapse kind=2 two-signer guarantee)"
+                    );
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
                 if is_burn {
                     // Burning admin requires permissionless paths so the
                     // market lifecycle can complete without admin. Non-
@@ -9243,10 +9318,22 @@ pub mod processor {
             }
 
             // Polymarket-perp (tag 84): one-shot bind of a `market_kind = 2`
-            // slab to a Polymarket condition-id + oracle source.
-            // Accounts: [admin(signer), slab(writable)]
-            Instruction::LinkPolymarketMarket { condition_id, oracle_source } => {
-                handle_link_polymarket_market(program_id, accounts, condition_id, oracle_source)?;
+            // slab to a Polymarket condition-id + oracle source +
+            // off-chain attestation hash. Requires admin AND council
+            // co-signature.
+            // Accounts: [admin(signer), council(signer), slab(writable)]
+            Instruction::LinkPolymarketMarket {
+                condition_id,
+                oracle_source,
+                metadata_uri_hash,
+            } => {
+                handle_link_polymarket_market(
+                    program_id,
+                    accounts,
+                    condition_id,
+                    oracle_source,
+                    metadata_uri_hash,
+                )?;
             }
 
             // Polymarket-perp (tag 85): permissionless oracle-ring crank.
@@ -9868,8 +9955,12 @@ pub mod processor {
         // Refuse user entry on an un-configured kind=2 slab. See
         // `require_kind2_fully_configured` rationale: without this
         // gate, an early InitUser permanently bricks the admin's
-        // ability to configure the market.
-        require_kind2_fully_configured(&config)?;
+        // ability to configure the market. The clock is read via
+        // syscall here (separate from the `a_clock` account read
+        // later in the handler) so the timelock check uses the
+        // authoritative runtime clock — same anti-spoofing rationale
+        // as the governance setters that consume Clock::get().
+        require_kind2_fully_configured(&config, Clock::get()?.slot)?;
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         let auth = accounts::derive_vault_authority_with_bump(
@@ -10012,8 +10103,10 @@ pub mod processor {
 
         let config = state::read_config(&data);
         // Refuse LP entry on an un-configured kind=2 slab — same
-        // brick-the-admin scenario as InitUser.
-        require_kind2_fully_configured(&config)?;
+        // brick-the-admin scenario as InitUser. Clock via syscall
+        // for the timelock check (same anti-spoofing rationale as
+        // the governance setters).
+        require_kind2_fully_configured(&config, Clock::get()?.slot)?;
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         let auth = accounts::derive_vault_authority_with_bump(
@@ -10137,8 +10230,9 @@ pub mod processor {
         // Defence-in-depth: reject deposits on an un-configured kind=2
         // slab. In practice an un-configured slab can have no users
         // (InitUser already rejects), so this check is reachable only
-        // if state drifts; cheap to add.
-        require_kind2_fully_configured(&config)?;
+        // if state drifts; cheap to add. Clock via syscall for the
+        // timelock check.
+        require_kind2_fully_configured(&config, Clock::get()?.slot)?;
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         let auth = accounts::derive_vault_authority_with_bump(
@@ -17759,12 +17853,23 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         condition_id: [u8; 32],
         oracle_source: u8,
+        metadata_uri_hash: [u8; 32],
     ) -> ProgramResult {
-        accounts::expect_len(accounts, 2)?;
+        // Account list expanded from 2 to 3 by W9b: a council co-signer
+        // now sits between admin and slab. Pre-W9b a single admin
+        // signature was sufficient to bind a kind=2 slab to a
+        // Polymarket condition-id; post-W9b a separate council
+        // multisig must also sign, gated by the on-chain
+        // `config.council_authority` which `SetCouncilAuthority` (tag 89)
+        // configured earlier in the lifecycle. A single admin-key
+        // compromise can no longer unilaterally bind the slab.
+        accounts::expect_len(accounts, 3)?;
         let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
+        let a_council = &accounts[1];
+        let a_slab = &accounts[2];
 
         accounts::expect_signer(a_admin)?;
+        accounts::expect_signer(a_council)?;
         accounts::expect_writable(a_slab)?;
 
         let mut data = state::slab_data_mut(a_slab)?;
@@ -17811,6 +17916,26 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // Gate: council must have been configured BEFORE Link can
+        // proceed. Sentinel `[0; 32]` means `SetCouncilAuthority`
+        // (tag 89) has not been run. Admin must complete the council
+        // configuration step first.
+        if config.council_authority == [0u8; 32] {
+            msg!("LinkPolymarketMarket: council_authority not set (call SetCouncilAuthority first)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Gate: council signer must match the configured pubkey. This
+        // is THE governance check — a compromised admin acting alone
+        // cannot satisfy this signer requirement. The
+        // `SetCouncilAuthority` setter already enforced
+        // `council != admin` at configuration time so this is a real
+        // two-signer requirement, not "admin signs twice".
+        if a_council.key.to_bytes() != config.council_authority {
+            msg!("LinkPolymarketMarket: council signer does not match configured council_authority");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         // Gate: one-shot. Re-link path is Council-gated and not exposed here.
         if config.polymarket_condition_id != [0u8; 32] {
             msg!("LinkPolymarketMarket: condition_id already set; re-link requires Council path");
@@ -17820,6 +17945,16 @@ pub mod processor {
         // Gate: reject the all-zero condition_id (sentinel = "unbound").
         if condition_id == [0u8; 32] {
             msg!("LinkPolymarketMarket: condition_id must be non-zero");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Gate: reject the all-zero metadata_uri_hash (sentinel
+        // "unlinked"). The hash binds the on-chain link to an
+        // off-chain attestation of the market description / advertised
+        // outcome. Indexers reconcile against this value to flag
+        // misbound markets.
+        if metadata_uri_hash == [0u8; 32] {
+            msg!("LinkPolymarketMarket: metadata_uri_hash must be non-zero");
             return Err(ProgramError::InvalidInstructionData);
         }
 
@@ -17844,30 +17979,55 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // Stamp the activation-timelock anchor. User-entry handlers
+        // refuse new accounts until
+        // `clock.slot >= linked_at_slot + MIN_ACTIVATION_DELAY_SLOTS`,
+        // giving off-chain watchers a window to flag a misbound
+        // market (via `metadata_uri_hash` mismatch against the
+        // advertised event) BEFORE any user capital can enter. Clock
+        // via syscall (not a passed account) — same anti-spoofing
+        // rationale as the other governance setters.
+        let clock = Clock::get()?;
+
         config.polymarket_condition_id = condition_id;
         config.oracle_source = oracle_source;
+        config.metadata_uri_hash = metadata_uri_hash;
+        config.linked_at_slot = clock.slot;
         state::write_config(&mut data, &config);
 
         // Structured success log — primary off-chain reconciliation
         // primitive. Indexers MUST parse this and reconcile the full
-        // tuple (slab, condition_id, pyth_feed) against the front-end's
-        // advertised market. A mismatch on ANY leg is the signal of a
-        // misbound / malicious link. The 32-byte condition_id and
-        // index_feed_id are each logged as two u128 halves (no base58
-        // dep needed) so both values are precisely recoverable from
-        // program logs.
+        // tuple (slab, condition_id, pyth_feed, metadata_uri_hash)
+        // against the front-end's advertised market. A mismatch on
+        // ANY leg is the signal of a misbound / malicious link. Logs
+        // split across multiple `msg!` calls to stay under the
+        // 5-arg fast-path budget per call.
         let cid_hi = u128::from_be_bytes(condition_id[..16].try_into().unwrap());
         let cid_lo = u128::from_be_bytes(condition_id[16..].try_into().unwrap());
         let feed_hi = u128::from_be_bytes(config.index_feed_id[..16].try_into().unwrap());
         let feed_lo = u128::from_be_bytes(config.index_feed_id[16..].try_into().unwrap());
+        let meta_hi = u128::from_be_bytes(metadata_uri_hash[..16].try_into().unwrap());
+        let meta_lo = u128::from_be_bytes(metadata_uri_hash[16..].try_into().unwrap());
         msg!(
-            "LinkPolymarketMarket: slab={} condition_id_hi=0x{:032x} condition_id_lo=0x{:032x} pyth_feed_hi=0x{:032x} pyth_feed_lo=0x{:032x} oracle_source={}",
+            "LinkPolymarketMarket: slab={} oracle_source={} linked_at_slot={}",
             a_slab.key,
+            oracle_source,
+            clock.slot
+        );
+        msg!(
+            "LinkPolymarketMarket: condition_id_hi=0x{:032x} condition_id_lo=0x{:032x}",
             cid_hi,
-            cid_lo,
+            cid_lo
+        );
+        msg!(
+            "LinkPolymarketMarket: pyth_feed_hi=0x{:032x} pyth_feed_lo=0x{:032x}",
             feed_hi,
-            feed_lo,
-            oracle_source
+            feed_lo
+        );
+        msg!(
+            "LinkPolymarketMarket: metadata_uri_hash_hi=0x{:032x} metadata_uri_hash_lo=0x{:032x}",
+            meta_hi,
+            meta_lo
         );
         Ok(())
     }
@@ -18390,9 +18550,24 @@ pub mod processor {
         force_close_unix_timestamp: i64,
     ) -> ProgramResult {
         /// Minimum gap between `now` and the force-close timestamp at
-        /// configuration time. Prevents admin from setting a timestamp
-        /// so close that the keeper can't react / users can't position.
-        const MIN_FUTURE_SECS: i64 = 3600;
+        /// configuration time. Sized to absorb both the 24-hour
+        /// activation timelock that gates user entry (governance
+        /// extension's `MIN_ACTIVATION_DELAY_SLOTS` ≈ 24h at 400ms /
+        /// slot) AND a minimum 24-hour trading window once user entry
+        /// opens. Without this combined floor, an admin (legitimate
+        /// or coerced) could set a force-close timestamp that fires
+        /// almost immediately after the activation window passes,
+        /// leaving users a vanishingly small window to enter and
+        /// manage positions before mandatory close — caught by the
+        /// adversarial-oracle audit pass on the governance commit.
+        ///
+        /// 48 hours total: 86_400 secs activation + 86_400 secs
+        /// minimum trading. Strictly stricter than the original 1-hour
+        /// floor (which was sized for the pre-governance lifecycle
+        /// where no activation timelock existed). Markets that need
+        /// a faster turn-around than 48 hours are out of V1 scope
+        /// (per the broader "long-dated markets only" policy).
+        const MIN_FUTURE_SECS: i64 = 172_800;
         /// Maximum horizon for the force-close timestamp. Caps planning
         /// risk; markets resolving more than a year out are out of V1
         /// scope.
