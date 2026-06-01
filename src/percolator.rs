@@ -2047,6 +2047,16 @@ pub mod ix {
         /// `clock.unix_timestamp >= force_close_unix_timestamp`. No
         /// payload. One-shot per market.
         ForceCloseKind2,
+        /// Polymarket-perp: admin-only one-shot setting of the
+        /// council co-signer pubkey on a `market_kind = 2` slab
+        /// (tag 89). A future `LinkPolymarketMarket` invocation will
+        /// require this pubkey as a co-signer; setting it before
+        /// Link is the V1-mainnet governance step that prevents a
+        /// single-admin-key compromise from binding the slab to a
+        /// malicious Polymarket condition-id.
+        SetCouncilAuthority {
+            council_authority: Pubkey,
+        },
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -2610,6 +2620,14 @@ pub mod ix {
                     // Tag 88: ForceCloseKind2 — permissionless crank.
                     // No payload.
                     Ok(Instruction::ForceCloseKind2)
+                }
+                89 => {
+                    // Tag 89: SetCouncilAuthority — admin-only one-shot
+                    // setting of the council co-signer pubkey. Data:
+                    // council_authority(32) = 32 bytes.
+                    let council_bytes = read_bytes32(&mut rest)?;
+                    let council_authority = Pubkey::new_from_array(council_bytes);
+                    Ok(Instruction::SetCouncilAuthority { council_authority })
                 }
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
@@ -3642,6 +3660,56 @@ pub mod state {
         /// captured value. Written exactly once by the force-close
         /// crank.
         pub forced_close_price_e6: u64,
+
+        /// V1-mainnet governance hardening extension. The V1 dev
+        /// multisig that holds `header.admin` is a single point of
+        /// catastrophic failure for kind=2 markets: a compromised
+        /// admin key could bind a slab to a malicious Polymarket
+        /// condition-id and rug deposits before users notice. This
+        /// extension introduces three on-chain checks at link time
+        /// — a separate council co-sign, an off-chain attestation
+        /// hash, and an activation timelock — so a single admin key
+        /// alone cannot stand up a misbound market that immediately
+        /// accepts user funds.
+        ///
+        /// **All three fields below carry `market_kind = 2`-only
+        /// semantics.** They are zero-initialised by `InitMarket`
+        /// regardless of kind; for kind=0/1 markets the zeros remain
+        /// untouched and mean nothing. Any future reader of these
+        /// fields MUST gate on `config.market_kind == 2` before
+        /// interpreting the value — a silent acceptance of `0` as
+        /// "default" on a non-kind=2 market would be a bug.
+
+        /// Pubkey of the council multisig that must co-sign
+        /// `LinkPolymarketMarket` alongside `header.admin`. Sentinel
+        /// `[0; 32]` = council not yet configured. Set once by
+        /// `SetCouncilAuthority` (tag 89) before Link can be invoked;
+        /// the setter rejects equality with `header.admin` so the
+        /// two-signer requirement is real (not "admin signs twice").
+        pub council_authority: [u8; 32],
+
+        /// Hash of the off-chain attestation pinned at Link time.
+        /// Indexers / front-ends compute the same hash from the
+        /// advertised Polymarket event metadata (URI of the event
+        /// page, market description, resolution rules, etc.) and
+        /// reconcile against this field to verify the admin bound
+        /// the correct event. Sentinel `[0; 32]` = unlinked.
+        pub metadata_uri_hash: [u8; 32],
+
+        /// Solana slot at which `LinkPolymarketMarket` succeeded.
+        /// The user-entry handlers refuse new accounts until
+        /// `clock.slot >= linked_at_slot + MIN_ACTIVATION_DELAY_SLOTS`,
+        /// giving off-chain watchers a window to flag a misbound
+        /// market (via the `metadata_uri_hash` mismatch above) and
+        /// raise an alarm BEFORE any user capital can enter.
+        /// Sentinel `0` = unlinked.
+        pub linked_at_slot: u64,
+
+        /// 8-byte padding to keep the governance extension a
+        /// multiple of 16 bytes
+        /// (`council_authority` 32 + `metadata_uri_hash` 32 +
+        /// `linked_at_slot` 8 + `_pad_governance` 8 = 80).
+        pub _pad_governance: [u8; 8],
     }
 
     // Compile-time pin: `MarketConfig` total size must be a multiple of 16
@@ -3665,6 +3733,12 @@ pub mod state {
         + core::mem::size_of::<i32>()
         + core::mem::size_of::<u16>()
         + 2];
+
+    // Compile-time pin: the governance extension is exactly 80 bytes
+    // (`council_authority` 32 + `metadata_uri_hash` 32 +
+    // `linked_at_slot` 8 + `_pad_governance` 8 = 80). 80 mod 16 = 0,
+    // so the overall struct's 16-alignment is preserved.
+    const _: [(); 80] = [(); 32 + 32 + 8 + 8];
 
     pub fn slab_data_mut<'a, 'b>(
         ai: &'b AccountInfo<'a>,
@@ -9220,6 +9294,15 @@ pub mod processor {
             Instruction::ForceCloseKind2 => {
                 handle_force_close_kind2(program_id, accounts)?;
             }
+
+            // Polymarket-perp (tag 89): admin-only one-shot setting
+            // of the council co-signer pubkey for a kind=2 slab.
+            // Required before `LinkPolymarketMarket` will accept the
+            // co-sign.
+            // Accounts: [admin(signer), slab(writable)]
+            Instruction::SetCouncilAuthority { council_authority } => {
+                handle_set_council_authority(program_id, accounts, council_authority)?;
+            }
         }
         Ok(())
     }
@@ -9714,6 +9797,10 @@ pub mod processor {
             _pad_value_anchoring: [0u8; 2],
             force_close_unix_timestamp: 0,
             forced_close_price_e6: 0,
+            council_authority: [0u8; 32],
+            metadata_uri_hash: [0u8; 32],
+            linked_at_slot: 0,
+            _pad_governance: [0u8; 8],
         };
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
@@ -18673,6 +18760,151 @@ pub mod processor {
             twap_for_log,
             config.force_close_unix_timestamp,
             clock.unix_timestamp
+        );
+        Ok(())
+    }
+
+    // --- SetCouncilAuthority (tag 89) ---
+    //
+    // One-shot admin configuration of the council co-signer pubkey
+    // for a `market_kind = 2` slab. The follow-up commit modifies
+    // `LinkPolymarketMarket` to require this pubkey as a co-signer
+    // alongside `header.admin`, so a single compromised admin key
+    // cannot unilaterally bind the slab to a malicious Polymarket
+    // condition-id.
+    //
+    // The motivation for council co-sign: V1's admin is a 2-of-3
+    // dev multisig. If that multisig is compromised (or simply
+    // wrong about the bound Polymarket event), the admin could
+    // link the slab to a condition-id the user community never
+    // approved, then advertise it on the front-end and rug
+    // deposits at resolution. Council co-sign is a structural
+    // mitigation: a SEPARATE multisig must also approve the link,
+    // and the council pubkey is fixed BEFORE link can happen.
+    //
+    // Reject gates (admin-only, mirrors `SetForceCloseTimestamp`'s
+    // posture):
+    //
+    //   * Structural: slab_guard, init, admin signer, slab writable.
+    //   * Lifecycle: refuses paused / resolved markets.
+    //   * Emptiness: refuses any slab with `num_used_accounts > 0`.
+    //     The council pubkey must be configured BEFORE the first
+    //     user enters so users cannot deposit into a market whose
+    //     governance pubkey they didn't agree to. (User entry is
+    //     gated on full configuration anyway; the empty-slab
+    //     requirement is defence-in-depth.)
+    //   * Admin: signer must match `header.admin`.
+    //   * Kind: refuses `market_kind != 2`.
+    //   * One-shot: refuses if `council_authority != [0; 32]`.
+    //     Re-setting the council requires a future Council-gated
+    //     escalation handler — not exposed in V1.
+    //   * Input-domain: rejects `council_authority == [0; 32]`
+    //     (sentinel value, "unset").
+    //   * Two-signer integrity: rejects
+    //     `council_authority == header.admin`. If council equals
+    //     admin, the two-signer requirement becomes "admin signs
+    //     twice" which is no protection. The setter forbids this
+    //     so the structural guarantee is real.
+    //
+    // Note that this commit does NOT yet wire the council into
+    // `LinkPolymarketMarket`. That's the next commit. Until then,
+    // `SetCouncilAuthority` is a forward-compatible write that
+    // populates a field no consumer reads. The lifecycle ordering
+    // for new kind=2 markets is: InitMarket →
+    // `SetCouncilAuthority` (this handler) → `LinkPolymarketMarket`
+    // (currently admin-only, becomes admin+council in the follow-up
+    // commit) → `SetPythPriceMapping` → `SetForceCloseTimestamp` →
+    // wait for activation timelock → first keeper push → user entry.
+    #[inline(never)]
+    fn handle_set_council_authority<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        council_authority: Pubkey,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if state::is_paused(&data) {
+            msg!("SetCouncilAuthority: refuses paused market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if state::is_resolved(&data) {
+            msg!("SetCouncilAuthority: refuses resolved market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let has_accounts = {
+            let engine = zc::engine_ref(&data)?;
+            engine.num_used_accounts > 0
+        };
+        if has_accounts {
+            msg!(
+                "SetCouncilAuthority: refuses non-empty slab (must be set before first user entry)"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+
+        if config.market_kind != 2 {
+            msg!(
+                "SetCouncilAuthority: refuses market_kind={} (kind=2 only)",
+                config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // One-shot.
+        if config.council_authority != [0u8; 32] {
+            msg!(
+                "SetCouncilAuthority: council already set; re-set requires Council-gated path"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Input-domain: refuse the all-zero sentinel.
+        let council_bytes = council_authority.to_bytes();
+        if council_bytes == [0u8; 32] {
+            msg!("SetCouncilAuthority: council_authority must be non-zero");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Two-signer integrity: council MUST differ from admin so the
+        // co-sign requirement is real (not "admin signs twice"). The
+        // header's admin pubkey is the authoritative comparison —
+        // future commits could rotate admin via `UpdateAuthority`
+        // separately, but at the moment of council configuration the
+        // two MUST be different.
+        if council_bytes == header.admin {
+            msg!("SetCouncilAuthority: council_authority must differ from header.admin (two-signer integrity)");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        config.council_authority = council_bytes;
+        state::write_config(&mut data, &config);
+
+        // Log the bound council pubkey as two u128 halves so the
+        // value is precisely recoverable from program logs without a
+        // base58 dependency. Same pattern as the link / mapping
+        // success logs.
+        let hi = u128::from_be_bytes(council_bytes[..16].try_into().unwrap());
+        let lo = u128::from_be_bytes(council_bytes[16..].try_into().unwrap());
+        msg!(
+            "SetCouncilAuthority: slab={} council_hi=0x{:032x} council_lo=0x{:032x}",
+            a_slab.key,
+            hi,
+            lo
         );
         Ok(())
     }

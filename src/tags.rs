@@ -274,6 +274,20 @@ pub const TAG_SET_FORCE_CLOSE_TIMESTAMP: u8 = 87;
 /// (Clock is read via syscall, not passed as an account.)
 pub const TAG_FORCE_CLOSE_KIND2: u8 = 88;
 
+/// Polymarket-perp: admin-only one-shot setting of the council
+/// authority pubkey on a `market_kind = 2` slab. The future
+/// `LinkPolymarketMarket` invocation will require this pubkey as a
+/// co-signer alongside `header.admin`, so a single admin-key
+/// compromise cannot unilaterally bind the market to a malicious
+/// Polymarket condition-id. Council pubkey must differ from
+/// `header.admin` (refused at the handler), so the two-signer
+/// requirement is real. One-shot — refuses to overwrite an
+/// already-configured `council_authority`.
+///
+/// Data: tag(1) + council_authority(32) = 33 bytes.
+/// Accounts: [admin(signer), slab(writable)]
+pub const TAG_SET_COUNCIL_AUTHORITY: u8 = 89;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +382,7 @@ mod tests {
             TAG_SET_PYTH_PRICE_MAPPING,
             TAG_SET_FORCE_CLOSE_TIMESTAMP,
             TAG_FORCE_CLOSE_KIND2,
+            TAG_SET_COUNCIL_AUTHORITY,
         ];
 
         for i in 0..tags.len() {
@@ -468,6 +483,7 @@ mod tests {
             TAG_SET_PYTH_PRICE_MAPPING,
             TAG_SET_FORCE_CLOSE_TIMESTAMP,
             TAG_FORCE_CLOSE_KIND2,
+            TAG_SET_COUNCIL_AUTHORITY,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)
