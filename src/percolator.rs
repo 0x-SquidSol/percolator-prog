@@ -3731,12 +3731,46 @@ pub mod state {
         /// two-signer requirement is real (not "admin signs twice").
         pub council_authority: [u8; 32],
 
-        /// Hash of the off-chain attestation pinned at Link time.
-        /// Indexers / front-ends compute the same hash from the
-        /// advertised Polymarket event metadata (URI of the event
-        /// page, market description, resolution rules, etc.) and
-        /// reconcile against this field to verify the admin bound
-        /// the correct event. Sentinel `[0; 32]` = unlinked.
+        /// Advisory hash of the off-chain attestation pinned at Link
+        /// time.
+        ///
+        /// **This is NOT an on-chain cryptographic integrity guarantee
+        /// today.** The program stores whatever 32 bytes admin+council
+        /// supply at Link and never recomputes anything against config
+        /// state. A council that co-signs against the wrong document
+        /// would pin a hash that does not correspond to the bound
+        /// configuration; on-chain checks cannot detect that mismatch.
+        ///
+        /// What it IS for: indexers and front-ends compute the same
+        /// hash from the advertised Polymarket event metadata (event
+        /// URI, description, resolution rules, etc.) and reconcile
+        /// against this field to flag misbound markets at the source.
+        ///
+        /// The actual binding-integrity story for V1 is:
+        ///   (1) the kind=2 two-signer requirement at Link (admin +
+        ///       council, separate keys);
+        ///   (2) the structural Pyth-account validation at Link
+        ///       (`oracle::validate_pyth_feed_account`), which catches
+        ///       the wrong-feed-bytes case before any user enters;
+        ///   (3) the 24h activation timelock gating user capital entry
+        ///       so off-chain watchers can flag a mismatch;
+        ///   (4) the indexer's reconciliation across the emitted
+        ///       Link log primitives (slab, condition_id_hi/lo,
+        ///       pyth_feed_hi/lo, metadata_uri_hash_hi/lo,
+        ///       linked_at_slot).
+        ///
+        /// A follow-up commit may upgrade this field to a real
+        /// `hashv` attestation. The design choice is either
+        ///   (A) re-pass a canonical pre-image at every governance
+        ///       setter so the hash covers Pyth-mapping / force-close
+        ///       fields written after Link, or
+        ///   (B) collapse Link + SetPythPriceMapping +
+        ///       SetForceCloseTimestamp into one atomic Link so the
+        ///       hash binds every field in a single transaction.
+        /// Both have non-trivial operational costs and are deferred
+        /// until V1 launch-cadence signal informs the trade-off.
+        ///
+        /// Sentinel `[0; 32]` = unlinked.
         pub metadata_uri_hash: [u8; 32],
 
         /// Solana slot at which `LinkPolymarketMarket` succeeded.
@@ -4366,6 +4400,54 @@ pub mod oracle {
     /// - max_staleness_secs: Maximum age in seconds
     /// - conf_bps: Maximum confidence interval in basis points
     ///
+    /// Structural-only Pyth account validation. Confirms:
+    ///   * `price_ai.owner == PYTH_RECEIVER_PROGRAM_ID`
+    ///   * account length is large enough for `PriceUpdateV2`
+    ///   * `verification_level == Full`
+    ///   * the embedded `PriceFeedMessage.feed_id` matches `expected_feed_id`
+    ///   * `price > 0` (sanity — a malformed account could deserialize but
+    ///     carry garbage price; refusing zero/negative at validation time
+    ///     keeps the "this is a valid feed" guarantee honest)
+    ///
+    /// Deliberately omits staleness, confidence interval, expo bounds,
+    /// and the e6 conversion. Those are runtime concerns for the
+    /// `PushOracleSnapshot` hot path; at Link time we only ask "is this
+    /// the right account, well-formed". The Pyth feed may not have
+    /// ticked recently when admin + council co-sign Link — that is
+    /// fine and not a reason to refuse the bind.
+    ///
+    /// Closes the audit finding that `index_feed_id` (set at admin-only
+    /// InitMarket) is never re-validated against an actual Pyth
+    /// `AccountInfo` at Link time, so a wrong-feed-bytes binding only
+    /// surfaces at the first `PushOracleSnapshot` push days later.
+    pub fn validate_pyth_feed_account(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+    ) -> Result<(), ProgramError> {
+        use pythnet_sdk::messages::PriceFeedMessage;
+
+        if *price_ai.owner != PYTH_RECEIVER_PROGRAM_ID {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let data = price_ai.try_borrow_data()?;
+        if data.len() < PRICE_UPDATE_V2_MIN_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data[OFF_VERIFICATION_LEVEL] != PYTH_VERIFICATION_FULL_TAG {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        let msg_slice = &data[OFF_PRICE_FEED_MESSAGE..];
+        let msg = <PriceFeedMessage as borsh::BorshDeserialize>::deserialize(&mut &msg_slice[..])
+            .map_err(|_| PercolatorError::OracleInvalid)?;
+        if &msg.feed_id != expected_feed_id {
+            return Err(PercolatorError::InvalidOracleKey.into());
+        }
+        if msg.price <= 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        Ok(())
+    }
+
     /// Returns `(price_e6, publish_time)` where `publish_time` is the Pyth
     /// off-chain network's timestamp for this observation. The caller is
     /// expected to enforce monotonicity against any previously-accepted
@@ -9349,8 +9431,10 @@ pub mod processor {
             // Polymarket-perp (tag 84): one-shot bind of a `market_kind = 2`
             // slab to a Polymarket condition-id + oracle source +
             // off-chain attestation hash. Requires admin AND council
-            // co-signature.
-            // Accounts: [admin(signer), council(signer), slab(writable)]
+            // co-signature. The Pyth price account is passed
+            // read-only so the handler can structurally validate it
+            // against `config.index_feed_id` at bind time.
+            // Accounts: [admin(signer), council(signer), slab(writable), pyth_price(read-only)]
             Instruction::LinkPolymarketMarket {
                 condition_id,
                 oracle_source,
@@ -17929,18 +18013,24 @@ pub mod processor {
         oracle_source: u8,
         metadata_uri_hash: [u8; 32],
     ) -> ProgramResult {
-        // Account list expanded from 2 to 3 by W9b: a council co-signer
-        // now sits between admin and slab. Pre-W9b a single admin
-        // signature was sufficient to bind a kind=2 slab to a
-        // Polymarket condition-id; post-W9b a separate council
-        // multisig must also sign, gated by the on-chain
-        // `config.council_authority` which `SetCouncilAuthority` (tag 89)
-        // configured earlier in the lifecycle. A single admin-key
-        // compromise can no longer unilaterally bind the slab.
-        accounts::expect_len(accounts, 3)?;
+        // Account list:
+        //   [0] admin (signer)
+        //   [1] council (signer)
+        //   [2] slab (writable)
+        //   [3] pyth_price (read-only) — added by the metadata-binding
+        //       commit. The Pyth account that `config.index_feed_id`
+        //       claims to bind. Validated structurally at Link time so
+        //       a wrong-feed-bytes binding is caught at the moment of
+        //       council co-sign rather than surfacing days later at
+        //       the first `PushOracleSnapshot` push (audit 2026-06-01).
+        //       Pre-this-commit: tag 84 took 3 accounts; the wrong-feed
+        //       case was only detected when `read_pyth_price_e6`'s
+        //       feed-id check fired during a push.
+        accounts::expect_len(accounts, 4)?;
         let a_admin = &accounts[0];
         let a_council = &accounts[1];
         let a_slab = &accounts[2];
+        let a_pyth = &accounts[3];
 
         accounts::expect_signer(a_admin)?;
         accounts::expect_signer(a_council)?;
@@ -18023,10 +18113,15 @@ pub mod processor {
         }
 
         // Gate: reject the all-zero metadata_uri_hash (sentinel
-        // "unlinked"). The hash binds the on-chain link to an
-        // off-chain attestation of the market description / advertised
-        // outcome. Indexers reconcile against this value to flag
-        // misbound markets.
+        // "unlinked"). NOTE: this field is ADVISORY — the program
+        // stores whatever 32 bytes the council supplies and does NOT
+        // recompute or verify the hash on-chain today. The integrity
+        // story for V1 is council diligence at co-sign time, the
+        // structural Pyth validation above, the activation timelock,
+        // and indexer cross-reconciliation against the emitted log.
+        // See the field's doc-comment on MarketConfig for the full
+        // rationale and the upgrade path (re-pass pre-image vs.
+        // atomic Link).
         if metadata_uri_hash == [0u8; 32] {
             msg!("LinkPolymarketMarket: metadata_uri_hash must be non-zero");
             return Err(ProgramError::InvalidInstructionData);
@@ -18052,6 +18147,19 @@ pub mod processor {
             );
             return Err(ProgramError::InvalidAccountData);
         }
+
+        // Gate: the supplied Pyth account at index [3] must be a real
+        // `PriceUpdateV2` owned by the Pyth receiver program, with
+        // verification level = Full, whose embedded `feed_id` matches
+        // the `index_feed_id` admin stamped at InitMarket. This catches
+        // the wrong-feed-bytes case at Link time: pre-this-commit, the
+        // first sanity check on the binding was the first push, days
+        // or weeks later. Reuses the same structural validator surface
+        // that `read_pyth_price_e6` runs on every push, minus the
+        // staleness / confidence / expo / e6-conversion checks (those
+        // are runtime concerns; at Link we only ask whether the bound
+        // feed exists and is well-formed).
+        oracle::validate_pyth_feed_account(a_pyth, &config.index_feed_id)?;
 
         // Stamp the activation-timelock anchor. User-entry handlers
         // refuse new accounts until
