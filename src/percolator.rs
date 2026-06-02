@@ -2061,6 +2061,24 @@ pub mod ix {
         SetCouncilAuthority {
             council_authority: Pubkey,
         },
+
+        /// Polymarket-perp: rotate the council co-signer pubkey on a
+        /// kind=2 slab (tag 90). REQUIRES BOTH the outgoing council
+        /// AND the incoming council to sign. Admin is NOT involved —
+        /// council rotation is independent of admin so that a coerced
+        /// admin cannot replace a council it wants to silence. Allowed
+        /// on populated (live) slabs because rotation must remain
+        /// possible mid-market; the two-signer requirement substitutes
+        /// for the empty-slab guarantee `SetCouncilAuthority` uses at
+        /// bootstrap.
+        ///
+        /// Lost-outgoing-council is irreversible by design: protocol
+        /// has no admin-override path. The operational mitigation is
+        /// that the council key is itself a multisig with off-chain
+        /// key rotation.
+        ///
+        /// Data: new_council(32).
+        RotateCouncilAuthority { new_council: Pubkey },
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -2633,12 +2651,20 @@ pub mod ix {
                     Ok(Instruction::ForceCloseKind2)
                 }
                 89 => {
-                    // Tag 89: SetCouncilAuthority — admin-only one-shot
-                    // setting of the council co-signer pubkey. Data:
-                    // council_authority(32) = 32 bytes.
+                    // Tag 89: SetCouncilAuthority — bootstrap-only setting
+                    // of the council co-signer pubkey. Admin + incoming
+                    // council both sign. Data: council_authority(32).
                     let council_bytes = read_bytes32(&mut rest)?;
                     let council_authority = Pubkey::new_from_array(council_bytes);
                     Ok(Instruction::SetCouncilAuthority { council_authority })
+                }
+                90 => {
+                    // Tag 90: RotateCouncilAuthority — outgoing-council
+                    // + incoming-council co-signed rotation of the council
+                    // pubkey. Admin is NOT a signer. Data: new_council(32).
+                    let new_bytes = read_bytes32(&mut rest)?;
+                    let new_council = Pubkey::new_from_array(new_bytes);
+                    Ok(Instruction::RotateCouncilAuthority { new_council })
                 }
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
@@ -9385,13 +9411,19 @@ pub mod processor {
                 handle_force_close_kind2(program_id, accounts)?;
             }
 
-            // Polymarket-perp (tag 89): admin-only one-shot setting
-            // of the council co-signer pubkey for a kind=2 slab.
-            // Required before `LinkPolymarketMarket` will accept the
-            // co-sign.
-            // Accounts: [admin(signer), slab(writable)]
+            // Polymarket-perp (tag 89): bootstrap-only setting of the
+            // council co-signer pubkey for a kind=2 slab. Admin +
+            // incoming-council both sign.
+            // Accounts: [admin(signer), incoming_council(signer), slab(writable)]
             Instruction::SetCouncilAuthority { council_authority } => {
                 handle_set_council_authority(program_id, accounts, council_authority)?;
+            }
+            // Polymarket-perp (tag 90): outgoing-council + incoming-council
+            // co-signed rotation of the council pubkey. Admin is NOT a
+            // signer.
+            // Accounts: [outgoing_council(signer), incoming_council(signer), slab(writable)]
+            Instruction::RotateCouncilAuthority { new_council } => {
+                handle_rotate_council_authority(program_id, accounts, new_council)?;
             }
         }
         Ok(())
@@ -11951,6 +11983,23 @@ pub mod processor {
         // has full authority until AcceptAdmin (tag 82) is invoked by
         // new_admin. Overwrites any previous pending transfer.
         let mut config = state::read_config(&data);
+
+        // Two-signer integrity for kind=2: refuse a pending_admin that
+        // would, on AcceptAdmin, make `header.admin == config.council_authority`.
+        // `UpdateAuthority` (tag 83) for AUTHORITY_ADMIN already refuses
+        // this for kind=2; closing the legacy two-step path here keeps
+        // the council co-sign requirement honest no matter which
+        // admin-rotation primitive is used.
+        if config.market_kind == 2
+            && config.council_authority != [0u8; 32]
+            && new_admin.to_bytes() == config.council_authority
+        {
+            msg!(
+                "UpdateAdmin: refuses pending_admin == council_authority (would collapse kind=2 two-signer guarantee on AcceptAdmin)"
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
         config.pending_admin = new_admin.to_bytes();
         state::write_config(&mut data, &config);
         msg!("UpdateAdmin: transfer proposed, new admin must call AcceptAdmin");
@@ -11986,6 +12035,28 @@ pub mod processor {
         // Signer must match the pending admin exactly.
         if config.pending_admin != a_new_admin.key.to_bytes() {
             msg!("AcceptAdmin: signer does not match pending_admin");
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Two-signer integrity belt-and-braces. `UpdateAdmin` already
+        // refuses to propose `pending_admin == council_authority` on
+        // kind=2 slabs, but `SetCouncilAuthority` could plausibly run
+        // between proposal and acceptance and write a matching
+        // `council_authority` (the bootstrap path is one-shot on
+        // `council_authority`, but in a future world with rotation
+        // this is the kind of sequencing that exposes the bypass).
+        // Closing here too means neither sequencing wins, and we
+        // clear the poisoned `pending_admin` so a future legitimate
+        // transfer requires a fresh `UpdateAdmin` proposal.
+        if config.market_kind == 2
+            && config.council_authority != [0u8; 32]
+            && config.pending_admin == config.council_authority
+        {
+            msg!(
+                "AcceptAdmin: refuses accept that would collapse kind=2 two-signer guarantee (admin == council)"
+            );
+            config.pending_admin = [0u8; 32];
+            state::write_config(&mut data, &config);
             return Err(ProgramError::InvalidArgument);
         }
 
@@ -18411,11 +18482,20 @@ pub mod processor {
         // legitimate keeper-side smoothing variation.
         const MIN_DEVIATION_BPS: u16 = 50;
 
-        accounts::expect_len(accounts, 2)?;
+        // Council co-sign required. SetPythPriceMapping writes the
+        // formula coefficients the on-chain value-anchoring depends on
+        // (threshold, scale, deviation tolerance). Admin alone must not
+        // be able to re-map the curve after the council has co-signed
+        // Link, because the council-attested document fixes the
+        // mapping pre-image. The 3-account `[admin, council, slab]`
+        // shape mirrors `LinkPolymarketMarket`.
+        accounts::expect_len(accounts, 3)?;
         let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
+        let a_council = &accounts[1];
+        let a_slab = &accounts[2];
 
         accounts::expect_signer(a_admin)?;
+        accounts::expect_signer(a_council)?;
         accounts::expect_writable(a_slab)?;
 
         let mut data = state::slab_data_mut(a_slab)?;
@@ -18452,6 +18532,22 @@ pub mod processor {
                 "SetPythPriceMapping: refuses market_kind={} (only kind=2/PerpOnPolymarket eligible)",
                 config.market_kind
             );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Council co-sign verification. `council_authority` must already
+        // be configured (SetCouncilAuthority preceded Link, which preceded
+        // this setter in the documented lifecycle). The supplied council
+        // signer's pubkey must match exactly — admin alone cannot pick a
+        // second key it controls.
+        if config.council_authority == [0u8; 32] {
+            msg!(
+                "SetPythPriceMapping: council_authority not configured (call SetCouncilAuthority first)"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if a_council.key.to_bytes() != config.council_authority {
+            msg!("SetPythPriceMapping: council signer does not match configured council_authority");
             return Err(ProgramError::InvalidAccountData);
         }
 
@@ -18594,11 +18690,17 @@ pub mod processor {
         /// scope.
         const MAX_FUTURE_SECS: i64 = 31_536_000;
 
-        accounts::expect_len(accounts, 2)?;
+        // Council co-sign required. SetForceCloseTimestamp writes the
+        // settlement clock the entire ForceCloseKind2 mechanism keys
+        // off — a coerced admin acting alone must not be able to shift
+        // it. Same `[admin, council, slab]` shape as Link.
+        accounts::expect_len(accounts, 3)?;
         let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
+        let a_council = &accounts[1];
+        let a_slab = &accounts[2];
 
         accounts::expect_signer(a_admin)?;
+        accounts::expect_signer(a_council)?;
         accounts::expect_writable(a_slab)?;
 
         let mut data = state::slab_data_mut(a_slab)?;
@@ -18634,6 +18736,20 @@ pub mod processor {
             msg!(
                 "SetForceCloseTimestamp: refuses market_kind={} (kind=2 only)",
                 config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Council co-sign verification (post kind=2 gate).
+        if config.council_authority == [0u8; 32] {
+            msg!(
+                "SetForceCloseTimestamp: council_authority not configured (call SetCouncilAuthority first)"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if a_council.key.to_bytes() != config.council_authority {
+            msg!(
+                "SetForceCloseTimestamp: council signer does not match configured council_authority"
             );
             return Err(ProgramError::InvalidAccountData);
         }
@@ -19064,11 +19180,25 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         council_authority: Pubkey,
     ) -> ProgramResult {
-        accounts::expect_len(accounts, 2)?;
+        // Bootstrap path requires BOTH admin and the incoming council
+        // pubkey to sign. Without the incoming-council signature, a
+        // compromised admin could pick a second key it also controls as
+        // the council, collapsing the two-signer requirement at Link
+        // time (audit 2026-06-01). Forcing the incoming key to sign
+        // means the council key holder must consent to assume the role.
+        accounts::expect_len(accounts, 3)?;
         let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
+        let a_incoming = &accounts[1];
+        let a_slab = &accounts[2];
 
         accounts::expect_signer(a_admin)?;
+        accounts::expect_signer(a_incoming)?;
+        if a_incoming.key.to_bytes() != council_authority.to_bytes() {
+            msg!(
+                "SetCouncilAuthority: incoming-council signer pubkey must match the supplied council_authority"
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
         accounts::expect_writable(a_slab)?;
 
         let mut data = state::slab_data_mut(a_slab)?;
@@ -19134,6 +19264,20 @@ pub mod processor {
             return Err(ProgramError::InvalidInstructionData);
         }
 
+        // Pending-admin collision: if a two-step admin transfer is in
+        // flight (UpdateAdmin proposed, AcceptAdmin not yet called) and
+        // we set council to the pending admin, the next AcceptAdmin
+        // would collapse `header.admin == config.council_authority`,
+        // defeating the two-signer guarantee. Closed at both ends —
+        // here (council-side) and inside `handle_update_admin`
+        // (admin-side) — so neither sequencing wins.
+        if config.pending_admin != [0u8; 32] && council_bytes == config.pending_admin {
+            msg!(
+                "SetCouncilAuthority: refuses council == pending_admin (would collapse two-signer guarantee on AcceptAdmin)"
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
         config.council_authority = council_bytes;
         state::write_config(&mut data, &config);
 
@@ -19145,6 +19289,130 @@ pub mod processor {
         let lo = u128::from_be_bytes(council_bytes[16..].try_into().unwrap());
         msg!(
             "SetCouncilAuthority: slab={} council_hi=0x{:032x} council_lo=0x{:032x}",
+            a_slab.key,
+            hi,
+            lo
+        );
+        Ok(())
+    }
+
+    // --- RotateCouncilAuthority (tag 90) ---
+    //
+    // Rotates the council co-signer pubkey on a kind=2 slab. Requires
+    // BOTH the outgoing council (the key currently stored in
+    // `config.council_authority`) AND the incoming council (the key
+    // supplied in instruction data) to sign. Admin is NOT a signer:
+    // council rotation is independent of admin so that a coerced or
+    // compromised admin cannot replace the council to remove a check
+    // on its own authority.
+    //
+    // Reject gates:
+    //   * Structural: slab_guard, init, both signers, slab writable.
+    //   * Outgoing signer pubkey must equal current `config.council_authority`.
+    //   * Incoming signer pubkey must equal `new_council` instruction data.
+    //   * Lifecycle: refuses paused / resolved markets.
+    //   * Kind: refuses `market_kind != 2`.
+    //   * Bootstrap precondition: refuses if council not yet set
+    //     (use `SetCouncilAuthority` first).
+    //   * Input domain: rejects zero, current value (no-op), `header.admin`
+    //     collision (would collapse two-signer), and `pending_admin`
+    //     collision (would collapse on AcceptAdmin).
+    //
+    // Unlike `SetCouncilAuthority`, this handler does NOT require the
+    // slab to be empty — rotation must remain possible on live markets.
+    // The two-signer requirement (outgoing + incoming) substitutes for
+    // the empty-slab guarantee bootstrap uses.
+    //
+    // Lost-outgoing-council is irreversible. The operational
+    // mitigation is that the council key is itself a multisig with
+    // off-chain key rotation; the protocol treats the council pubkey
+    // as an opaque single key and refuses any admin-override.
+    #[inline(never)]
+    fn handle_rotate_council_authority<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        new_council: Pubkey,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_outgoing = &accounts[0];
+        let a_incoming = &accounts[1];
+        let a_slab = &accounts[2];
+
+        accounts::expect_signer(a_outgoing)?;
+        accounts::expect_signer(a_incoming)?;
+        if a_incoming.key.to_bytes() != new_council.to_bytes() {
+            msg!(
+                "RotateCouncilAuthority: incoming-council signer pubkey must match supplied new_council"
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if state::is_paused(&data) {
+            msg!("RotateCouncilAuthority: refuses paused market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if state::is_resolved(&data) {
+            msg!("RotateCouncilAuthority: refuses resolved market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let header = state::read_header(&data);
+        let mut config = state::read_config(&data);
+
+        if config.market_kind != 2 {
+            msg!(
+                "RotateCouncilAuthority: refuses market_kind={} (kind=2 only)",
+                config.market_kind
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if config.council_authority == [0u8; 32] {
+            msg!(
+                "RotateCouncilAuthority: council not yet bootstrapped (use SetCouncilAuthority first)"
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if a_outgoing.key.to_bytes() != config.council_authority {
+            msg!("RotateCouncilAuthority: outgoing signer does not match current council_authority");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let new_bytes = new_council.to_bytes();
+        if new_bytes == [0u8; 32] {
+            msg!("RotateCouncilAuthority: new_council must be non-zero");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if new_bytes == config.council_authority {
+            msg!("RotateCouncilAuthority: new_council must differ from current council");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if new_bytes == header.admin {
+            msg!(
+                "RotateCouncilAuthority: new_council must differ from header.admin (two-signer integrity)"
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if config.pending_admin != [0u8; 32] && new_bytes == config.pending_admin {
+            msg!(
+                "RotateCouncilAuthority: refuses new_council == pending_admin (would collapse two-signer guarantee on AcceptAdmin)"
+            );
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        config.council_authority = new_bytes;
+        state::write_config(&mut data, &config);
+
+        let hi = u128::from_be_bytes(new_bytes[..16].try_into().unwrap());
+        let lo = u128::from_be_bytes(new_bytes[16..].try_into().unwrap());
+        msg!(
+            "RotateCouncilAuthority: slab={} new_council_hi=0x{:032x} new_council_lo=0x{:032x}",
             a_slab.key,
             hi,
             lo
