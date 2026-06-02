@@ -18829,6 +18829,19 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
+        // Pause gate. A paused market must not force-close: pause is
+        // the operator's emergency circuit-breaker — if it doesn't also
+        // block the permissionless force-close crank, an attacker who
+        // manipulates the ring right before pause can still crystallise
+        // the manipulated value into a terminal settlement. Mirrors the
+        // sibling kind=2 handlers (LinkPolymarketMarket, SetPythPriceMapping,
+        // SetForceCloseTimestamp, SetCouncilAuthority) all of which gate
+        // on `is_paused`.
+        if state::is_paused(&data) {
+            msg!("ForceCloseKind2: refuses paused market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         // Engine-side already-resolved guard. Same pattern as the
         // legacy resolve handlers — engine's `market_mode` is the
         // source of truth.
@@ -18876,56 +18889,89 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Settlement price: engine.last_oracle_price (the last
-        // trade-time price the engine consumed). For kind=2 this is
-        // by construction the ring TWAP at the most recent trade —
-        // see the doc-comment preamble for why this is the correct
-        // choice rather than the current ring TWAP.
-        let last_price = {
-            let engine = zc::engine_ref(&data)?;
-            engine.last_oracle_price
-        };
-        if last_price == 0 {
-            // No trade has ever happened on this market — the engine's
-            // resolve path cannot be invoked (Degenerate mode requires
-            // a non-zero last_oracle_price for both its `resolved_price`
-            // and `live_oracle_price` arguments). Admin escalation via a
-            // future Council-gated handler is the documented path.
-            msg!(
-                "ForceCloseKind2: engine has no last_oracle_price (no trade ever happened — operator escalation required)"
-            );
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-
-        // Compute the current ring TWAP for diagnostic logging. Uses
-        // the unbounded helper so a stale ring (typical end-of-life
-        // condition) still produces a value rather than `None`. If
-        // the ring is fully empty (no push ever fired), `twap_for_log`
-        // is `None` and the log just records that fact. The
-        // settlement itself does not depend on this value.
-        let twap_for_log = oracle_ring::ring_buf_twap_unbounded(&config.oracle_ring_buf);
-
-        // Engine resolve. `Degenerate` mode requires both
-        // `resolved_price` and `live_oracle_price` to equal
-        // `engine.last_oracle_price` — passing identical values
-        // produces a zero price-diff terminal delta and a clean
-        // settlement at the last-traded price.
+        // Settlement-source selection — three branches:
         //
-        // Borrow scope: `zc::engine_mut(&mut data)` is confined to
-        // the inner block so the exclusive borrow ends before
-        // `write_config` re-borrows `data` mutably below.
-        {
-            let engine = zc::engine_mut(&mut data)?;
-            engine
-                .resolve_market_not_atomic(
-                    percolator::ResolveMode::Degenerate,
-                    last_price,
-                    last_price,
-                    clock.slot,
-                    0,
-                )
-                .map_err(map_risk_error)?;
-        }
+        //   (A) Ring TWAP available → pre-write
+        //       `engine.last_oracle_price = twap` and call Degenerate
+        //       resolve at `(twap, twap)`. Captured TWAP is the
+        //       protocol's contract — it is more manipulation-
+        //       resistant than the last-trade price, because the
+        //       60-entry rolling average defeats single-tick attacks
+        //       and the soft pre-close window already gates new opens.
+        //       Pre-writing `last_oracle_price` is an established
+        //       engine idiom (see `permissionless_recovery_resolve_p_last_not_atomic`).
+        //
+        //   (B) Ring empty but engine has a last_oracle_price → fall
+        //       back to that price under Degenerate. This is strictly
+        //       worse than the TWAP but better than wedging the
+        //       market, and only fires on markets that never received
+        //       a single oracle push after their first trade.
+        //
+        //   (C) Ring empty AND no trade ever happened → dispatch
+        //       refund-mode (`resolve_market_refund_not_atomic`).
+        //       Detaches every open position at zero unrealized PnL,
+        //       preserves trader collateral, preserves insurance,
+        //       leaves protocol fees with LPs + protocol. The
+        //       previous shipped behaviour returned `OracleInvalid`
+        //       here and left the market wedged — see audit
+        //       walkthrough 2026-06-01.
+        //
+        // Haircut routing (TWAP minus a configured haircut credited
+        // to insurance) is deliberately NOT applied here. The
+        // conservation-preserving haircut requires a per-account
+        // skim at force-close-resolved time and a Kani harness
+        // proving `vault >= c_tot + insurance` across the transition;
+        // both ship in a follow-up commit.
+        let twap_opt = oracle_ring::ring_buf_twap_unbounded(&config.oracle_ring_buf);
+        let last_price_engine = zc::engine_ref(&data)?.last_oracle_price;
+
+        let settlement_price = match (twap_opt, last_price_engine) {
+            (Some(twap), _) if twap > 0 => Some(twap),
+            (None, p) if p != 0 => Some(p),
+            _ => None,
+        };
+
+        let (settled_price_e6, used_refund_mode) = if let Some(p) = settlement_price {
+            // Branches (A) and (B): Degenerate resolve at the selected price.
+            // Borrow scope: `engine_mut` confined to the inner block so
+            // the exclusive borrow ends before `write_config` below.
+            {
+                let engine = zc::engine_mut(&mut data)?;
+                // Pre-write `last_oracle_price` so the Degenerate arm's
+                // `live_oracle_price == self.last_oracle_price` equality
+                // check passes when we call it with `(p, p, ...)`. Same
+                // trusted-wrapper pattern the recovery resolve uses.
+                engine.last_oracle_price = p;
+                engine
+                    .resolve_market_not_atomic(
+                        percolator::ResolveMode::Degenerate,
+                        p,
+                        p,
+                        clock.slot,
+                        0,
+                    )
+                    .map_err(map_risk_error)?;
+            }
+            (p, false)
+        } else {
+            // Branch (C): refund mode. Engine never saw a trade and
+            // the ring was never pushed — there is no settlement price
+            // to lock in. Refund-mode detaches every account at zero
+            // unrealized PnL; trader collateral remains withdrawable
+            // through the existing `force_close_resolved` path.
+            {
+                let engine = zc::engine_mut(&mut data)?;
+                engine
+                    .resolve_market_refund_not_atomic(clock.slot)
+                    .map_err(map_risk_error)?;
+            }
+            // Use `POLY_CLAMP_LO` (= 1) as the post-resolve sentinel so
+            // off-chain observers can distinguish "force-closed in
+            // refund mode" from "not yet force-closed" (= 0) and from
+            // "force-closed at a price" (>= POLY_CLAMP_LO with a real
+            // ring entry).
+            (oracle_ring::POLY_CLAMP_LO, true)
+        };
 
         // Cross-handler compatibility: existing post-resolution
         // readers (Tag 20/21/30 — kind=0/1 originally) read
@@ -18939,21 +18985,22 @@ pub mod processor {
         // readers MUST gate on `market_kind` before consuming this
         // field — kind=2 markets repurpose it for settlement-price
         // exposure to legacy readers.
-        config.hyperp_mark_e6 = last_price;
-        // Wrapper-side one-shot sentinel: write last_price (the
-        // engine's settlement price) so off-chain observers can
-        // confirm the wrapper and engine agree.
-        config.forced_close_price_e6 = last_price;
+        config.hyperp_mark_e6 = settled_price_e6;
+        // Wrapper-side one-shot sentinel. Non-zero in every branch so
+        // the re-entry guard above fires correctly on a second call.
+        config.forced_close_price_e6 = settled_price_e6;
         state::write_config(&mut data, &config);
 
         // Wrapper-side resolved flag.
         state::set_resolved(&mut data);
 
         msg!(
-            "ForceCloseKind2: slab={} settled at last_oracle_price_e6={} (diagnostic_twap_unbounded={:?}, force_close_unix_ts={}, now={})",
+            "ForceCloseKind2: slab={} settled_price_e6={} refund_mode={} (twap_unbounded={:?}, engine_last={}, force_close_unix_ts={}, now={})",
             a_slab.key,
-            last_price,
-            twap_for_log,
+            settled_price_e6,
+            used_refund_mode,
+            twap_opt,
+            last_price_engine,
             config.force_close_unix_timestamp,
             clock.unix_timestamp
         );
