@@ -2977,6 +2977,12 @@ pub mod ix {
             // overrides this with the v2 extended-tail value when the
             // client opts in (KL-FORK-MAX-PRICE-MOVE-CALIBRATION-1 REVOKED).
             max_price_move_bps_per_slot: crate::constants::DEFAULT_MAX_PRICE_MOVE_BPS_PER_SLOT,
+            // InitMarket always creates a legacy perp (`market_kind = 0`);
+            // the wrapper lifts this to `2` inside `LinkPolymarketMarket`
+            // when the slab is bound to a Polymarket condition-id. The
+            // engine's side-aware notional branch is gated on this field.
+            market_kind: 0,
+            _pad_market_kind: [0u8; 7],
         };
         Ok((params, new_account_fee.get()))
     }
@@ -8545,6 +8551,21 @@ pub mod processor {
         const BAND_LO_E6: u64 = 100_000;
         /// Upper edge of the tradeable band (= 0.90 e6). Symmetric.
         const BAND_HI_E6: u64 = 900_000;
+        /// Inner-band boundaries — opens inside `[INNER_LO_E6, INNER_HI_E6]`
+        /// (i.e. `[0.20, 0.80]`) get the full admin-configured leverage
+        /// cap. Opens in the edge bands `[0.10, 0.20) ∪ (0.80, 0.90]`
+        /// are restricted to ≤ 2x leverage per the bounded-domain risk
+        /// model — enforced via the IM-floor gate below.
+        const INNER_LO_E6: u64 = 200_000;
+        const INNER_HI_E6: u64 = 800_000;
+        /// IM bps floor required for opens in the edge band (= 5_000 = 2x).
+        /// The engine reads a single `initial_margin_bps` per market; we
+        /// don't reshape per trade. Instead we refuse edge-band opens on
+        /// markets configured below this floor. Admin policy: deploy any
+        /// kind=2 market that may quote into the edge bands with
+        /// `initial_margin_bps >= 5_000` so middle and edge both trade.
+        /// Looser-IM markets get the middle band only.
+        const EDGE_BAND_REQUIRED_IM_BPS: u64 = 5_000;
         /// Soft pre-close window. In the last
         /// `FORCE_CLOSE_SOFT_WINDOW_SECS` before
         /// `force_close_unix_timestamp` the wrapper refuses NEW
@@ -8556,6 +8577,8 @@ pub mod processor {
         const FORCE_CLOSE_SOFT_WINDOW_SECS: i64 = 3600;
 
         let in_deep_edge = price_e6 < BAND_LO_E6 || price_e6 > BAND_HI_E6;
+        let in_edge_band = !in_deep_edge
+            && (price_e6 < INNER_LO_E6 || price_e6 > INNER_HI_E6);
 
         // Soft pre-close window: only enabled once admin has
         // configured `force_close_unix_timestamp`. Sentinel `0` means
@@ -8567,7 +8590,15 @@ pub mod processor {
             && clock_unix_ts.saturating_add(FORCE_CLOSE_SOFT_WINDOW_SECS)
                 >= config.force_close_unix_timestamp;
 
-        if !in_deep_edge && !in_soft_close {
+        // Edge-band IM gate. Only restrictive when admin's market IM is
+        // below the 2x floor — otherwise the edge band trades freely at
+        // the admin-configured cap, which is already ≤ 2x.
+        let edge_band_im_too_loose = in_edge_band && {
+            let engine = zc::engine_ref(data)?;
+            engine.params.initial_margin_bps < EDGE_BAND_REQUIRED_IM_BPS
+        };
+
+        if !in_deep_edge && !in_soft_close && !edge_band_im_too_loose {
             return Ok(());
         }
 
@@ -8607,9 +8638,10 @@ pub mod processor {
         }
 
         msg!(
-            "Kind=2: non-reducing trade rejected (in_deep_edge={} in_soft_close={} price_e6={} current={} new={})",
+            "Kind=2: non-reducing trade rejected (in_deep_edge={} in_soft_close={} edge_band_im_too_loose={} price_e6={} current={} new={})",
             in_deep_edge,
             in_soft_close,
+            edge_band_im_too_loose,
             price_e6,
             current,
             new
@@ -17965,6 +17997,24 @@ pub mod processor {
         config.metadata_uri_hash = metadata_uri_hash;
         config.linked_at_slot = clock.slot;
         state::write_config(&mut data, &config);
+
+        // Mirror `market_kind = 2` into the engine so its notional helper
+        // takes the side-aware branch (long uses p, short uses 1-p) for
+        // every consumer that flows through `risk_notional_from_eff_q` —
+        // IM, MM, IM-trade-open, IM-trade-open-no-pos, and the in-flow
+        // notional sites inside `execute_trade_not_atomic`. Without this
+        // mirror the engine treats kind=2 positions with symmetric
+        // notional, which under-margins shorts at low p (and longs at
+        // high p) by up to ~9x on the tradeable boundary p=0.10.
+        //
+        // `state::engine_mut` re-borrows `data` mutably after the
+        // `write_config` borrow above is dropped at the statement
+        // boundary. The engine reference is scoped tight so the
+        // surrounding borrow patterns are unaffected.
+        {
+            let engine = zc::engine_mut(&mut data)?;
+            engine.params.market_kind = 2;
+        }
 
         // Structured success log — primary off-chain reconciliation
         // primitive. Indexers MUST parse this and reconcile the full
