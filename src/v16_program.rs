@@ -1820,6 +1820,10 @@ pub mod state {
         let mut source_lien_fee_last_slot = Vec::with_capacity(source_domain_count);
         let mut source_claim_impaired_num = Vec::with_capacity(source_domain_count);
         let mut source_lien_impaired_effective_reserved = Vec::with_capacity(source_domain_count);
+        // E6 (a57a408): genesis capital-at-risk fee-revenue counters (+32B/domain).
+        let mut source_lien_capital_at_risk_fee_revenue = Vec::with_capacity(source_domain_count);
+        let mut source_lien_impaired_capital_at_risk_fee_revenue =
+            Vec::with_capacity(source_domain_count);
         let mut d = 0usize;
         while d < source_domain_count {
             source_claim_market_id.push(0);
@@ -1833,6 +1837,8 @@ pub mod state {
             source_lien_fee_last_slot.push(0);
             source_claim_impaired_num.push(0);
             source_lien_impaired_effective_reserved.push(0);
+            source_lien_capital_at_risk_fee_revenue.push(0);
+            source_lien_impaired_capital_at_risk_fee_revenue.push(0);
             d += 1;
         }
 
@@ -1863,6 +1869,10 @@ pub mod state {
                 .write(source_claim_impaired_num);
             core::ptr::addr_of_mut!((*ptr).source_lien_impaired_effective_reserved)
                 .write(source_lien_impaired_effective_reserved);
+            core::ptr::addr_of_mut!((*ptr).source_lien_capital_at_risk_fee_revenue)
+                .write(source_lien_capital_at_risk_fee_revenue);
+            core::ptr::addr_of_mut!((*ptr).source_lien_impaired_capital_at_risk_fee_revenue)
+                .write(source_lien_impaired_capital_at_risk_fee_revenue);
             core::ptr::addr_of_mut!((*ptr).fee_credits).write(0);
             core::ptr::addr_of_mut!((*ptr).cancel_deposit_escrow).write(0);
             core::ptr::addr_of_mut!((*ptr).last_fee_slot).write(last_fee_slot);
@@ -1955,6 +1965,10 @@ pub mod state {
             account.source_claim_impaired_num[d] = source.source_claim_impaired_num.get();
             account.source_lien_impaired_effective_reserved[d] =
                 source.source_lien_impaired_effective_reserved.get();
+            account.source_lien_capital_at_risk_fee_revenue[d] =
+                source.source_lien_capital_at_risk_fee_revenue.get();
+            account.source_lien_impaired_capital_at_risk_fee_revenue[d] =
+                source.source_lien_impaired_capital_at_risk_fee_revenue.get();
             d += 1;
         }
         Ok(account)
