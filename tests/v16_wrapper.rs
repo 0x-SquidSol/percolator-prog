@@ -9465,7 +9465,9 @@ fn v16_wrapper_auth_mark_trade_cannot_update_authority_mark() {
     let (before_cfg, before_group) = state::read_market(&market.data).unwrap();
     let size_q = 10 * POS_SCALE;
     let exec_price = before_group.assets[0].effective_price * 150 / 100;
-    let base_only_fee = two_sided_fee(size_q, exec_price, 1);
+    // W1 (fee-on-mark): the fee is billed on the MARK (effective_price), not the consented
+    // exec_price — so the base (no-surcharge) fee an AuthMark trade pays is mark-based.
+    let base_only_fee = two_sided_fee(size_q, before_group.assets[0].effective_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
             asset_index: 0,
@@ -11247,8 +11249,8 @@ fn v16_wrapper_tradenocpi_accepts_consented_wide_exec_price_without_moving_index
     assert_eq!(long.legs[0].basis_pos_q, (10 * POS_SCALE) as i128);
     assert_eq!(short.legs[0].basis_pos_q, -((10 * POS_SCALE) as i128));
     assert_eq!(
-        group.insurance, 30,
-        "notional=1500 and 100 bps charges 15 to each side"
+        group.insurance, 20,
+        "W1 (fee-on-mark): billed on the mark (100), not exec_price (150) — notional=1000 @ 100 bps = 10/side"
     );
 }
 
@@ -12230,8 +12232,9 @@ fn v16_wrapper_hybrid_regular_hours_wide_trade_keeps_mark_pinned_to_external_ora
     );
     assert_eq!(
         after_group.insurance,
-        two_sided_fee(size_q, exec_price, 1),
-        "regular-hours hybrid pays only the static 1 bp two-sided fee"
+        // W1 (fee-on-mark): billed on the mark (effective_price), not the wide consented exec_price.
+        two_sided_fee(size_q, before_group.assets[0].effective_price, 1),
+        "regular-hours hybrid pays only the static 1 bp two-sided fee (on the mark)"
     );
 }
 
@@ -12648,8 +12651,9 @@ fn v16_wrapper_tradenocpi_applies_static_base_fee_floor() {
 
     let (_, group) = state::read_market(&market.data).unwrap();
     assert_eq!(
-        group.insurance, 30,
-        "zero caller fee still pays the configured 100 bps base fee on both sides"
+        group.insurance, 20,
+        "W1 (fee-on-mark): zero caller fee still pays the 100 bps base fee, billed on the mark (100) \
+         not exec_price (150) — notional=1000 => 10/side"
     );
 }
 
@@ -12966,43 +12970,12 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
     assert_eq!(account_a.data, before_a);
     assert_eq!(account_b.data, before_b);
 
-    let zero_price = run_ix(
-        Instruction::TradeNoCpi {
-            asset_index: 0,
-            size_q: POS_SCALE as i128,
-            exec_price: 0,
-            fee_bps: 0,
-        },
-        &mut [
-            &mut owner_a,
-            &mut owner_b,
-            &mut market,
-            &mut account_a,
-            &mut account_b,
-        ],
-    );
-    assert_err_and_market_unchanged(zero_price, &market, &before_market);
-    assert_eq!(account_a.data, before_a);
-    assert_eq!(account_b.data, before_b);
-
-    let above_max_price = run_ix(
-        Instruction::TradeNoCpi {
-            asset_index: 0,
-            size_q: POS_SCALE as i128,
-            exec_price: percolator::MAX_ORACLE_PRICE + 1,
-            fee_bps: 0,
-        },
-        &mut [
-            &mut owner_a,
-            &mut owner_b,
-            &mut market,
-            &mut account_a,
-            &mut account_b,
-        ],
-    );
-    assert_err_and_market_unchanged(above_max_price, &market, &before_market);
-    assert_eq!(account_a.data, before_a);
-    assert_eq!(account_b.data, before_b);
+    // NOTE: zero / above-MAX exec_price are NOT rejected here under W1 (fee-on-mark). The engine
+    // settles entry + initial margin + fee on the MARK (effective_price); the caller's exec_price
+    // has no settlement role (it only feeds clamped + MAX_ORACLE_PRICE-guarded hybrid mark
+    // discovery, a no-op for this non-price-managed market). A degenerate exec_price is therefore
+    // accepted and pays the FULL mark-based fee — covered by
+    // v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark.
 }
 
 #[test]
@@ -13207,8 +13180,9 @@ fn v16_wrapper_tradecpi_hybrid_regular_and_after_hours_follow_mark_policy() {
     );
     assert_eq!(
         regular_group_after.insurance,
-        two_sided_fee(size_q, regular_exec_price, 1),
-        "regular-hours hybrid CPI trades pay only the static fee floor"
+        // W1 (fee-on-mark): billed on the mark (effective_price), not the wide consented exec_price.
+        two_sided_fee(size_q, regular_group_before.assets[0].effective_price, 1),
+        "regular-hours hybrid CPI trades pay only the static fee floor (on the mark)"
     );
 
     {
@@ -17031,4 +17005,102 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
         "the fresh-asset trade went through and opened interest",
     );
     assert_eq!(group.assets[0].slot_last, 0, "the stale co-asset is still untouched and recoverable");
+}
+
+#[test]
+fn v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark() {
+    // W1 (fee-on-mark): exec_price has NO settlement role — entry, initial margin, and fee all
+    // settle on the MARK (effective_price). A degenerate consented exec_price (0, or above
+    // MAX_ORACLE_PRICE) is ACCEPTED and pays the FULL mark-based fee: it can neither evade nor
+    // inflate the fee, and for a non-price-managed market mark discovery ignores it entirely.
+    for exec_price in [0u64, percolator::MAX_ORACLE_PRICE + 1] {
+        let mut admin = signer();
+        let mut market = market_account();
+        let mut long_owner = signer();
+        let mut short_owner = signer();
+        let mut long_account = portfolio_account();
+        let mut short_account = portfolio_account();
+        init_market(&mut admin, &mut market);
+        init_portfolio(&mut long_owner, &mut market, &mut long_account);
+        init_portfolio(&mut short_owner, &mut market, &mut short_account);
+        deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+        deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+        let (_, before) = state::read_market(&market.data).unwrap();
+        assert_eq!(before.assets[0].effective_price, 100);
+
+        run_ix(
+            Instruction::TradeNoCpi {
+                asset_index: 0,
+                size_q: (10 * POS_SCALE) as i128,
+                exec_price,
+                fee_bps: 100,
+            },
+            &mut [
+                &mut long_owner,
+                &mut short_owner,
+                &mut market,
+                &mut long_account,
+                &mut short_account,
+            ],
+        )
+        .unwrap_or_else(|e| {
+            panic!("degenerate exec_price {exec_price} must be accepted (settles on the mark): {e:?}")
+        });
+
+        let (_, group) = state::read_market(&market.data).unwrap();
+        assert_eq!(
+            group.assets[0].effective_price, 100,
+            "exec_price {exec_price} must not move the mark"
+        );
+        assert_eq!(
+            group.insurance, 20,
+            "exec_price {exec_price}: full mark-based fee (notional 1000 @ 100 bps = 20) is charged"
+        );
+    }
+}
+
+#[test]
+fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
+    // W1 (fee-on-mark) anti-evasion (toly 832dbdf): two cooperating accounts declare a tiny
+    // exec_price (1) on a full mark-valued trade (mark = 100). Pre-fix the fee notional used
+    // exec_price, so they would pay ~1% of the proper fee; post-fix the fee is pinned to the mark,
+    // so the SAME full fee is charged as an honest exec_price=mark trade — the discount is unreachable.
+    let charge_at = |exec_price: u64| {
+        let mut admin = signer();
+        let mut market = market_account();
+        let mut long_owner = signer();
+        let mut short_owner = signer();
+        let mut long_account = portfolio_account();
+        let mut short_account = portfolio_account();
+        init_market(&mut admin, &mut market);
+        init_portfolio(&mut long_owner, &mut market, &mut long_account);
+        init_portfolio(&mut short_owner, &mut market, &mut short_account);
+        deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+        deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+        run_ix(
+            Instruction::TradeNoCpi {
+                asset_index: 0,
+                size_q: (10 * POS_SCALE) as i128,
+                exec_price,
+                fee_bps: 100,
+            },
+            &mut [
+                &mut long_owner,
+                &mut short_owner,
+                &mut market,
+                &mut long_account,
+                &mut short_account,
+            ],
+        )
+        .unwrap();
+        let (_, group) = state::read_market(&market.data).unwrap();
+        group.insurance
+    };
+    let lowball = charge_at(1);
+    let honest = charge_at(100);
+    assert_eq!(honest, 20, "honest mark trade pays notional 1000 @ 100 bps = 20");
+    assert_eq!(
+        lowball, honest,
+        "lowball exec_price=1 must pay the SAME full mark-based fee — fee evasion is closed"
+    );
 }

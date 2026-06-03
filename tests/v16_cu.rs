@@ -3810,11 +3810,54 @@ fn v16_bpf_tradenocpi_executes_and_is_bounded() {
         "consented execution price must not move the effective oracle price"
     );
     assert_eq!(
-        group.insurance, 30,
-        "notional=1500 and 100 bps charges 15 to each side"
+        group.insurance, 20,
+        "W1 (fee-on-mark): fee billed on the MARK (100), NOT the consented exec_price (150) — \
+         notional=1000 and 100 bps charges 10 to each side"
     );
     assert_eq!(group.vault, 2_000_000);
     assert_eq!(group.c_tot + group.insurance, group.vault);
+}
+
+#[test]
+fn v16_bpf_tradenocpi_fee_is_billed_on_mark_not_exec_price() {
+    // W1 (F-TRADENOCPI-FEE): the trade fee notional is pinned to the asset MARK (effective_price),
+    // never the caller-supplied exec_price. A caller cannot lowball exec_price to evade the fee, nor
+    // does a high exec_price inflate it. Same size + same mark (100) => identical insurance accrual
+    // for every exec_price. Mark-based: notional = 10 * 100 = 1000, 100 bps => 10 per side => 20.
+    let mut prev: Option<u128> = None;
+    for exec_price in [1u64, 50, 100, 100_000] {
+        let mut env = V16CuEnv::new();
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long_account = env.create_portfolio(&long_owner);
+        let short_account = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long_account, 1_000_000);
+        env.deposit(&short_owner, short_account, 1_000_000);
+
+        env.trade_with_cu(
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            (10 * POS_SCALE) as i128,
+            exec_price,
+            100,
+        );
+
+        let market_data = env.svm.get_account(&env.market).unwrap().data;
+        let (_, group) = state::read_market(&market_data).unwrap();
+        assert_eq!(
+            group.insurance, 20,
+            "exec_price={exec_price}: fee must be billed on the mark (notional 1000 @ 100 bps = 20), \
+             independent of exec_price"
+        );
+        // the consented exec_price never moves the index, so the mark stays 100 for every iteration.
+        assert_eq!(group.assets[0].effective_price, 100);
+        if let Some(p) = prev {
+            assert_eq!(group.insurance, p, "fee changed with exec_price — not mark-pinned");
+        }
+        prev = Some(group.insurance);
+    }
 }
 
 #[test]

@@ -7006,19 +7006,26 @@ pub mod processor {
             } else {
                 size_q.unsigned_abs()
             };
+            // F-TRADENOCPI-FEE: bill the trade fee on the MARK, not the caller-supplied exec_price.
+            // The engine uses request.exec_price ONLY as the fee notional basis, so a caller could
+            // lowball exec_price to evade the fee. Pin the fee basis to the asset mark
+            // (effective_price) so the fee notional + dynamic externality floor are mark-based and
+            // unmanipulable. The original exec_price is still used for hybrid mark discovery
+            // (update_hybrid_mark_after_trade_view below), which is correct.
+            let fee_basis_price = group.markets[asset_index as usize].engine.asset.effective_price.get();
             let fee_bps = hybrid_trade_fee_bps_view(
                 &cfg,
                 &oracle_profile,
                 &group,
                 asset_index as usize,
                 size_abs,
-                exec_price,
+                fee_basis_price,
                 fee_bps,
             )?;
             let req = TradeRequestV16 {
                 asset_index: asset_index as usize,
                 size_q: size_abs,
-                exec_price,
+                exec_price: fee_basis_price,
                 fee_bps,
                 // A-1 baseline: pass None so wrapper trade path is byte-identical
                 // to upstream v16 behavior. Fork bundles that need the
