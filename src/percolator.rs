@@ -2051,13 +2051,19 @@ pub mod ix {
         /// `clock.unix_timestamp >= force_close_unix_timestamp`. No
         /// payload. One-shot per market.
         ForceCloseKind2,
-        /// Polymarket-perp: admin-only one-shot setting of the
-        /// council co-signer pubkey on a `market_kind = 2` slab
-        /// (tag 89). A future `LinkPolymarketMarket` invocation will
-        /// require this pubkey as a co-signer; setting it before
-        /// Link is the V1-mainnet governance step that prevents a
-        /// single-admin-key compromise from binding the slab to a
-        /// malicious Polymarket condition-id.
+        /// Polymarket-perp: admin + incoming-council co-signed one-shot
+        /// bootstrap of a kind=2 slab (tag 89). This handler is the
+        /// kind=0→2 init step: it atomically lifts `config.market_kind`
+        /// from 0 (legacy perp, the `InitMarket` default) to 2
+        /// (Polymarket-perp) AND writes the council co-signer pubkey.
+        /// `LinkPolymarketMarket` requires the council pubkey as a
+        /// co-signer, so a single-admin-key compromise cannot bind the
+        /// slab to a malicious Polymarket condition-id. Bundling the
+        /// kind lift here removes one admin-only bootstrap step without
+        /// weakening the authorization envelope — the admin + council
+        /// co-signature already required to set the council also
+        /// authorizes the kind transition. One-shot on
+        /// `council_authority != [0;32]`.
         SetCouncilAuthority {
             council_authority: Pubkey,
         },
@@ -19233,12 +19239,25 @@ pub mod processor {
 
     // --- SetCouncilAuthority (tag 89) ---
     //
-    // One-shot admin configuration of the council co-signer pubkey
-    // for a `market_kind = 2` slab. The follow-up commit modifies
-    // `LinkPolymarketMarket` to require this pubkey as a co-signer
-    // alongside `header.admin`, so a single compromised admin key
-    // cannot unilaterally bind the slab to a malicious Polymarket
-    // condition-id.
+    // KIND=2 BOOTSTRAP STEP. This handler is the ONLY path that lifts
+    // `config.market_kind` from 0 (legacy perp, the `InitMarket` default)
+    // to 2 (Polymarket-perp). It does so atomically with the council
+    // pubkey write, under admin + incoming-council co-signature. The
+    // lift is bundled here rather than exposed as a separate tag because
+    // the authorization we'd want on a standalone `SetMarketKind`
+    // instruction — admin AND the incoming kind=2 governance key — is
+    // exactly what's required to set the council in the first place.
+    // Bundling removes one admin-only step from the kind=2 bootstrap
+    // path without weakening the authorization envelope. The one-shot
+    // guarantee comes from the unchanged `council_authority != [0;32]`
+    // reject below: once the council is bound the kind lift can never
+    // run again on this slab.
+    //
+    // One-shot admin+council configuration of the council co-signer
+    // pubkey for a Polymarket-perp slab. `LinkPolymarketMarket` (tag 84)
+    // requires this pubkey as a co-signer alongside `header.admin`, so
+    // a single compromised admin key cannot unilaterally bind the slab
+    // to a malicious Polymarket condition-id.
     //
     // The motivation for council co-sign: V1's admin is a 2-of-3
     // dev multisig. If that multisig is compromised (or simply
@@ -19249,22 +19268,27 @@ pub mod processor {
     // mitigation: a SEPARATE multisig must also approve the link,
     // and the council pubkey is fixed BEFORE link can happen.
     //
-    // Reject gates (admin-only, mirrors `SetForceCloseTimestamp`'s
-    // posture):
+    // Reject gates:
     //
-    //   * Structural: slab_guard, init, admin signer, slab writable.
+    //   * Structural: slab_guard, init, admin+incoming-council signers,
+    //     slab writable.
     //   * Lifecycle: refuses paused / resolved markets.
     //   * Emptiness: refuses any slab with `num_used_accounts > 0`.
     //     The council pubkey must be configured BEFORE the first
     //     user enters so users cannot deposit into a market whose
-    //     governance pubkey they didn't agree to. (User entry is
-    //     gated on full configuration anyway; the empty-slab
-    //     requirement is defence-in-depth.)
+    //     governance pubkey they didn't agree to. The empty-slab gate
+    //     is also what makes the in-handler kind lift safe: no user
+    //     collateral can possibly be present when kind flips.
     //   * Admin: signer must match `header.admin`.
-    //   * Kind: refuses `market_kind != 2`.
-    //   * One-shot: refuses if `council_authority != [0; 32]`.
-    //     Re-setting the council requires a future Council-gated
-    //     escalation handler — not exposed in V1.
+    //   * Kind: refuses `market_kind != 0`. Strict bootstrap gate —
+    //     this handler ONLY runs on a freshly-initialised legacy slab
+    //     and lifts it to kind=2. kind=1 (legacy on-chain prediction)
+    //     and any future kind have their own paths.
+    //   * One-shot: refuses if `council_authority != [0; 32]`. The
+    //     one-shot guards BOTH the council write and the kind lift —
+    //     once the council is set, kind cannot be re-flipped via this
+    //     path. Rotation goes through `RotateCouncilAuthority` (tag 90)
+    //     which is council-gated and does NOT touch `market_kind`.
     //   * Input-domain: rejects `council_authority == [0; 32]`
     //     (sentinel value, "unset").
     //   * Two-signer integrity: rejects
@@ -19272,16 +19296,23 @@ pub mod processor {
     //     admin, the two-signer requirement becomes "admin signs
     //     twice" which is no protection. The setter forbids this
     //     so the structural guarantee is real.
+    //   * Pending-admin collision: rejects
+    //     `council_authority == config.pending_admin`. A two-step
+    //     `UpdateAdmin → AcceptAdmin` could otherwise collapse
+    //     `header.admin == config.council_authority` after the
+    //     transfer completes.
     //
-    // Note that this commit does NOT yet wire the council into
-    // `LinkPolymarketMarket`. That's the next commit. Until then,
-    // `SetCouncilAuthority` is a forward-compatible write that
-    // populates a field no consumer reads. The lifecycle ordering
-    // for new kind=2 markets is: InitMarket →
-    // `SetCouncilAuthority` (this handler) → `LinkPolymarketMarket`
-    // (currently admin-only, becomes admin+council in the follow-up
-    // commit) → `SetPythPriceMapping` → `SetForceCloseTimestamp` →
-    // wait for activation timelock → first keeper push → user entry.
+    // Side effects (atomic, single `write_config`):
+    //   1. `config.council_authority = council_authority`
+    //   2. `config.market_kind = 0 → 2`
+    //   3. `engine.params.market_kind = 2` (engine-side mirror, so the
+    //      side-aware notional branch is hot from the very next ix)
+    //
+    // Lifecycle ordering for new kind=2 markets: InitMarket →
+    // `SetCouncilAuthority` (this handler — sets council AND lifts kind)
+    // → `LinkPolymarketMarket` → `SetPythPriceMapping` →
+    // `SetForceCloseTimestamp` → wait for activation timelock → first
+    // keeper push → user entry.
     #[inline(never)]
     fn handle_set_council_authority<'a>(
         program_id: &Pubkey,
@@ -19338,15 +19369,25 @@ pub mod processor {
 
         let mut config = state::read_config(&data);
 
-        if config.market_kind != 2 {
+        // Strict bootstrap gate: this handler is the kind=0→2 init step.
+        // Refuse any non-zero current kind so we cannot re-run on a
+        // kind=2 slab, downgrade a kind=2 slab to kind=0 (the lift below
+        // is a one-way write but defence-in-depth catches a buggy future
+        // setter), or touch a kind=1 legacy-prediction slab (which has
+        // its own bootstrap path). The unchanged `council_authority`
+        // one-shot below would already catch the kind=2 re-run case, but
+        // we want the kind error surface to read clearly in logs.
+        if config.market_kind != 0 {
             msg!(
-                "SetCouncilAuthority: refuses market_kind={} (kind=2 only)",
+                "SetCouncilAuthority: refuses market_kind={} (kind=0 bootstrap only; this handler is the kind=0->2 init step)",
                 config.market_kind
             );
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // One-shot.
+        // One-shot — guards BOTH the council pubkey write AND the
+        // accompanying `market_kind` lift to 2. Once council is set, no
+        // further call to this handler can succeed.
         if config.council_authority != [0u8; 32] {
             msg!(
                 "SetCouncilAuthority: council already set; re-set requires Council-gated path"
@@ -19386,17 +19427,41 @@ pub mod processor {
             return Err(ProgramError::InvalidInstructionData);
         }
 
+        // Atomic lift: bind council pubkey AND promote the slab from
+        // kind=0 (legacy perp) to kind=2 (Polymarket-perp) in a single
+        // `write_config`. Both fields are protected by the same two
+        // signatures (admin + incoming council) and the same empty-slab
+        // / one-shot gates above.
         config.council_authority = council_bytes;
+        config.market_kind = 2;
         state::write_config(&mut data, &config);
+
+        // Engine-side mirror. Set `engine.params.market_kind = 2`
+        // immediately so the side-aware notional branch (long uses p,
+        // short uses 1-p) is hot from the very next instruction onward.
+        // Without this mirror the engine would treat kind=2 positions
+        // with symmetric notional until `LinkPolymarketMarket` runs,
+        // leaving a window where any engine-side risk math (IM, MM,
+        // in-flow notional) on a paused/half-bootstrapped slab would
+        // read the wrong kind. Tight scope so the surrounding borrow
+        // patterns are unaffected. The redundant write inside
+        // `LinkPolymarketMarket` (line ~18195) is kept as a defensive
+        // belt — it becomes a no-op (already 2) on a properly
+        // bootstrapped slab.
+        {
+            let engine = zc::engine_mut(&mut data)?;
+            engine.params.market_kind = 2;
+        }
 
         // Log the bound council pubkey as two u128 halves so the
         // value is precisely recoverable from program logs without a
         // base58 dependency. Same pattern as the link / mapping
-        // success logs.
+        // success logs. The "kind=0->2" sub-token is the canonical
+        // indexer signal that a slab has entered the kind=2 lifecycle.
         let hi = u128::from_be_bytes(council_bytes[..16].try_into().unwrap());
         let lo = u128::from_be_bytes(council_bytes[16..].try_into().unwrap());
         msg!(
-            "SetCouncilAuthority: slab={} council_hi=0x{:032x} council_lo=0x{:032x}",
+            "SetCouncilAuthority: slab={} kind=0->2 council_hi=0x{:032x} council_lo=0x{:032x}",
             a_slab.key,
             hi,
             lo

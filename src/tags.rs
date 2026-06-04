@@ -274,18 +274,21 @@ pub const TAG_SET_FORCE_CLOSE_TIMESTAMP: u8 = 87;
 /// (Clock is read via syscall, not passed as an account.)
 pub const TAG_FORCE_CLOSE_KIND2: u8 = 88;
 
-/// Polymarket-perp: admin-only one-shot setting of the council
-/// authority pubkey on a `market_kind = 2` slab. The future
-/// `LinkPolymarketMarket` invocation will require this pubkey as a
-/// co-signer alongside `header.admin`, so a single admin-key
-/// compromise cannot unilaterally bind the market to a malicious
-/// Polymarket condition-id. Council pubkey must differ from
-/// `header.admin` (refused at the handler), so the two-signer
-/// requirement is real. One-shot — refuses to overwrite an
-/// already-configured `council_authority`.
+/// Polymarket-perp: admin + incoming-council co-signed one-shot
+/// bootstrap of a kind=2 slab. KIND=0→2 INIT STEP — this handler
+/// atomically lifts `config.market_kind` from 0 (the `InitMarket`
+/// default) to 2 (Polymarket-perp) AND writes the council co-signer
+/// pubkey AND mirrors the kind into the engine. The follow-up
+/// `LinkPolymarketMarket` requires the council pubkey as a co-signer
+/// alongside `header.admin`, so a single admin-key compromise cannot
+/// unilaterally bind the market to a malicious Polymarket
+/// condition-id. Council pubkey must differ from `header.admin` (and
+/// from `pending_admin`), so the two-signer requirement is real.
+/// One-shot on `council_authority != [0;32]` — guards both the
+/// council write and the kind lift.
 ///
 /// Data: tag(1) + council_authority(32) = 33 bytes.
-/// Accounts: [admin(signer), slab(writable)]
+/// Accounts: [admin(signer), incoming_council(signer), slab(writable)]
 pub const TAG_SET_COUNCIL_AUTHORITY: u8 = 89;
 
 #[cfg(test)]
