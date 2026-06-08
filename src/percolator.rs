@@ -19492,7 +19492,13 @@ pub mod processor {
     //   * Structural: slab_guard, init, both signers, slab writable.
     //   * Outgoing signer pubkey must equal current `config.council_authority`.
     //   * Incoming signer pubkey must equal `new_council` instruction data.
-    //   * Lifecycle: refuses paused / resolved markets.
+    //   * Lifecycle: refuses resolved markets. PAUSE-IMMUNE — pause is
+    //     admin-only and the whole purpose of council rotation is to
+    //     remain available to the council when admin is compromised
+    //     (a compromised admin who could pause-block rotation would
+    //     defeat the safety net). Sibling kind=2 setters retain their
+    //     pause guards because they are admin-cosign actions; this
+    //     handler is the only council-self-defense primitive.
     //   * Kind: refuses `market_kind != 2`.
     //   * Bootstrap precondition: refuses if council not yet set
     //     (use `SetCouncilAuthority` first).
@@ -19534,10 +19540,11 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
-        if state::is_paused(&data) {
-            msg!("RotateCouncilAuthority: refuses paused market");
-            return Err(ProgramError::InvalidAccountData);
-        }
+        // Pause-immune: council rotation is the council's self-defense
+        // against a compromised admin. Pause is admin-only; gating
+        // rotation on pause would let a compromised admin lock out
+        // the council. Resolved is still terminal — no rotation makes
+        // sense on a settled market.
         if state::is_resolved(&data) {
             msg!("RotateCouncilAuthority: refuses resolved market");
             return Err(ProgramError::InvalidAccountData);
