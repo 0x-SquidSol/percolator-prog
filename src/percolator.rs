@@ -19152,7 +19152,16 @@ pub mod processor {
         // skim at force-close-resolved time and a Kani harness
         // proving `vault >= c_tot + insurance` across the transition;
         // both ship in a follow-up commit.
-        let twap_opt = oracle_ring::ring_buf_twap_unbounded(&config.oracle_ring_buf);
+        // Two-gate TWAP (audit H-4): refuses thinly-populated or stale
+        // rings so a single keeper-controlled push on a quiet market
+        // cannot pin settlement. Fallthrough order unchanged:
+        // (A) TWAP if gates pass → (B) engine.last_oracle_price → (C) refund.
+        let twap_opt = oracle_ring::ring_buf_twap_with_min_fills(
+            &config.oracle_ring_buf,
+            clock.slot,
+            oracle_ring::MIN_RING_FILLS,
+            oracle_ring::MAX_RING_STALENESS_SLOTS,
+        );
         let last_price_engine = zc::engine_ref(&data)?.last_oracle_price;
 
         let settlement_price = match (twap_opt, last_price_engine) {

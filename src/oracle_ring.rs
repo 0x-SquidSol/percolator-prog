@@ -51,6 +51,18 @@ pub const POLY_CLAMP_HI: u64 = 990_000;
 /// slots per push).
 pub const MAX_STALENESS_SLOTS: u64 = 720;
 
+/// Minimum non-empty ring fills required for the force-close TWAP gate
+/// to trust the average. Below this, a single keeper-controlled push
+/// could dominate; fall through to engine-last / refund mode instead.
+pub const MIN_RING_FILLS: u64 = 10;
+
+/// Maximum age (in Solana slots) of the newest ring entry that the
+/// force-close TWAP gate will still accept. 9000 slots ≈ 1 hour at
+/// 400 ms / slot. Looser than `MAX_STALENESS_SLOTS` (trade-time gate)
+/// because force-close runs after activity has died down, but tight
+/// enough to refuse rings whose last push is days old.
+pub const MAX_RING_STALENESS_SLOTS: u64 = 9_000;
+
 /// Clamp a raw probability reading to the engine's bounded domain.
 ///
 /// Probabilities outside `[POLY_CLAMP_LO, POLY_CLAMP_HI]` are pulled
@@ -285,6 +297,45 @@ pub fn ring_buf_twap_unbounded(buf: &[OracleSnapshotEntry; 60]) -> Option<u64> {
         }
         sum_p = sum_p.saturating_add(entry.p_yes_e6);
         count += 1;
+    }
+    sum_p.checked_div(count)
+}
+
+/// Two-gate TWAP for terminal settlement. Returns `Some(twap)` only if
+/// (a) the ring has at least `min_fills` non-empty entries AND
+/// (b) the newest entry's `on_chain_slot` is within `max_staleness` of
+/// `now_slot`. Otherwise returns `None` so the caller falls through to
+/// a safer settlement branch (engine.last_oracle_price or refund mode).
+///
+/// Defeats the single-push pin attack on quiet markets: a keeper-
+/// controlled push cannot dominate the average unless the ring is
+/// already well-populated AND was active recently. Saturating
+/// subtraction defangs the clock-skew / replay case where
+/// `newest_slot > now_slot` — collapses to age = 0, which is in-window.
+pub fn ring_buf_twap_with_min_fills(
+    buf: &[OracleSnapshotEntry; 60],
+    now_slot: u64,
+    min_fills: u64,
+    max_staleness: u64,
+) -> Option<u64> {
+    let mut sum_p: u64 = 0;
+    let mut count: u64 = 0;
+    let mut newest_slot: u64 = 0;
+    for entry in buf.iter() {
+        if entry.source_timestamp == 0 {
+            continue;
+        }
+        sum_p = sum_p.saturating_add(entry.p_yes_e6);
+        count += 1;
+        if entry.on_chain_slot > newest_slot {
+            newest_slot = entry.on_chain_slot;
+        }
+    }
+    if count < min_fills {
+        return None;
+    }
+    if now_slot.saturating_sub(newest_slot) > max_staleness {
+        return None;
     }
     sum_p.checked_div(count)
 }
@@ -737,5 +788,75 @@ mod tests {
         ring_buf_push(&mut buf, OracleSnapshotEntry { p_yes_e6: 500_000, source_timestamp: 3, on_chain_slot: 3 });
         // Average of 300_000, 400_000, 500_000 = 400_000.
         assert_eq!(ring_buf_twap_unbounded(&buf), Some(400_000));
+    }
+
+    // ----- ring_buf_twap_with_min_fills (force-close two-gate TWAP) -----
+
+    #[test]
+    fn two_gate_twap_refuses_below_min_fills() {
+        // Single push, fresh → fails the min-fills gate.
+        let mut buf = empty_buf();
+        ring_buf_push(&mut buf, OracleSnapshotEntry {
+            p_yes_e6: 800_000, source_timestamp: 1, on_chain_slot: 100,
+        });
+        let now_slot = 100u64;
+        assert_eq!(
+            ring_buf_twap_with_min_fills(&buf, now_slot, MIN_RING_FILLS, MAX_RING_STALENESS_SLOTS),
+            None,
+            "1 fill < MIN_RING_FILLS must return None"
+        );
+    }
+
+    #[test]
+    fn two_gate_twap_refuses_when_newest_too_stale() {
+        // 10 entries, but newest is older than MAX_RING_STALENESS_SLOTS.
+        let mut buf = empty_buf();
+        for i in 0..10u64 {
+            ring_buf_push(&mut buf, OracleSnapshotEntry {
+                p_yes_e6: 500_000,
+                source_timestamp: (i as i64) + 1,
+                on_chain_slot: i + 1,
+            });
+        }
+        // now_slot - newest_slot = 100_000 - 10 = 99_990 > MAX_RING_STALENESS_SLOTS.
+        assert_eq!(
+            ring_buf_twap_with_min_fills(&buf, 100_000, MIN_RING_FILLS, MAX_RING_STALENESS_SLOTS),
+            None,
+            "newest fill > MAX_RING_STALENESS_SLOTS stale must return None"
+        );
+    }
+
+    #[test]
+    fn two_gate_twap_returns_average_when_both_gates_pass() {
+        let mut buf = empty_buf();
+        for i in 0..10u64 {
+            ring_buf_push(&mut buf, OracleSnapshotEntry {
+                p_yes_e6: 500_000,
+                source_timestamp: (i as i64) + 1,
+                on_chain_slot: i + 1,
+            });
+        }
+        // newest_slot = 10, now_slot = 11 → age = 1 ≤ MAX_RING_STALENESS_SLOTS.
+        assert_eq!(
+            ring_buf_twap_with_min_fills(&buf, 11, MIN_RING_FILLS, MAX_RING_STALENESS_SLOTS),
+            Some(500_000),
+        );
+    }
+
+    #[test]
+    fn two_gate_twap_tolerates_clock_skew() {
+        // newest_slot > now_slot — saturating_sub gives age = 0 (in-window).
+        let mut buf = empty_buf();
+        for i in 0..10u64 {
+            ring_buf_push(&mut buf, OracleSnapshotEntry {
+                p_yes_e6: 500_000,
+                source_timestamp: (i as i64) + 1,
+                on_chain_slot: 1_000_000 + i, // future slot — clock skew
+            });
+        }
+        assert_eq!(
+            ring_buf_twap_with_min_fills(&buf, 100, MIN_RING_FILLS, MAX_RING_STALENESS_SLOTS),
+            Some(500_000),
+        );
     }
 }
