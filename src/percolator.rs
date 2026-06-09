@@ -18833,9 +18833,13 @@ pub mod processor {
     //     path is a future Council-gated commit; in V1 admin must
     //     pick a conservatively-early timestamp at configuration time.
     //   * Future-only: refuses timestamps in the past or within the
-    //     near future. `MIN_FUTURE_SECS = 3600` (1 hour) is the floor
-    //     — the admin cannot set a force-close that fires immediately
-    //     (which would brick the market before users can enter).
+    //     near future. `MIN_FUTURE_SECS = 172_800` (48 hours) is the
+    //     floor — sized to absorb the 24-hour activation timelock
+    //     plus a minimum 24-hour trading window so the admin cannot
+    //     set a force-close that fires immediately after activation
+    //     (which would brick the market before users can manage
+    //     positions). See the const declaration below for the
+    //     long-form rationale.
     //   * Bounded: refuses timestamps more than `MAX_FUTURE_SECS`
     //     from now. `MAX_FUTURE_SECS = 31_536_000` (1 year) caps the
     //     planning horizon. Polymarket markets that resolve more than
