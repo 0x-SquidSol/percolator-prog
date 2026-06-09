@@ -8672,6 +8672,14 @@ pub mod processor {
         /// model — enforced via the IM-floor gate below.
         const INNER_LO_E6: u64 = 200_000;
         const INNER_HI_E6: u64 = 800_000;
+        /// Hysteresis cushion (= 0.005 e6). The band gate's anchor source
+        /// can still be walked one step per slot via a keeper-accrual,
+        /// so the boundary is widened by this amount inward. An attacker
+        /// who lands one accrual at the manipulated TWAP crosses the
+        /// nominal boundary but stays inside the hysteresis cushion,
+        /// requiring at least one more accrual to actually flip the
+        /// classification. Cheap and additive to the anchor-not-TWAP fix.
+        const BAND_HYSTERESIS_E6: u64 = 5_000;
         /// IM bps floor required for opens in the edge band (= 5_000 = 2x).
         /// The engine reads a single `initial_margin_bps` per market; we
         /// don't reshape per trade. Instead we refuse edge-band opens on
@@ -8690,9 +8698,37 @@ pub mod processor {
         /// final-window of "only exits" for crank-side accounting.
         const FORCE_CLOSE_SOFT_WINDOW_SECS: i64 = 3600;
 
-        let in_deep_edge = price_e6 < BAND_LO_E6 || price_e6 > BAND_HI_E6;
+        // Classify the band off `engine.last_oracle_price` (the price
+        // committed by the most recent accrual) rather than the live
+        // ring TWAP. The TWAP is permissionless-push-manipulable —
+        // ~6 max-deviation snapshots within ~6s drag it across the
+        // 0.20/0.80 boundary for ~$0.006 of push fees. `last_oracle_price`
+        // is only written by `accrue_market_to`, which is gated by the
+        // per-slot price-move cap and a touched-account window, so a
+        // pure-push attack cannot move it. Cold-start (`last_oracle_price
+        // == 0`, no anchor yet committed): fall back to the live TWAP
+        // `price_e6` BUT refuse edge-band opens — this prevents a
+        // first-trade classification attack while still allowing
+        // inner-band opens on a brand-new market quoting at midpoint.
+        //
+        // Hysteresis: nominal boundaries widened inward by
+        // `BAND_HYSTERESIS_E6` for the inner-band classification.
+        // Defends against a one-step keeper-accrual nudge across the
+        // boundary by requiring two consecutive steps.
+        let (band_price_e6, cold_start) = {
+            let engine = zc::engine_ref(data)?;
+            let anchor = engine.last_oracle_price;
+            if anchor == 0 { (price_e6, true) } else { (anchor, false) }
+        };
+
+        let in_deep_edge = band_price_e6 < BAND_LO_E6 || band_price_e6 > BAND_HI_E6;
+        // Hysteresis: the inner-band threshold is widened toward zero
+        // and toward POS_SCALE so a single-step crossing doesn't flip
+        // the classification.
+        let inner_lo = INNER_LO_E6.saturating_sub(BAND_HYSTERESIS_E6);
+        let inner_hi = INNER_HI_E6.saturating_add(BAND_HYSTERESIS_E6);
         let in_edge_band = !in_deep_edge
-            && (price_e6 < INNER_LO_E6 || price_e6 > INNER_HI_E6);
+            && (band_price_e6 < inner_lo || band_price_e6 > inner_hi);
 
         // Soft pre-close window: only enabled once admin has
         // configured `force_close_unix_timestamp`. Sentinel `0` means
@@ -8712,7 +8748,17 @@ pub mod processor {
             engine.params.initial_margin_bps < EDGE_BAND_REQUIRED_IM_BPS
         };
 
-        if !in_deep_edge && !in_soft_close && !edge_band_im_too_loose {
+        // Cold-start edge-band lock. With no committed anchor we have
+        // to fall back to the live TWAP for classification (see the
+        // `(price_e6, true)` branch above), which IS push-manipulable.
+        // To prevent a one-shot first-trade attack on a brand-new
+        // market, refuse any edge-band entry while the anchor is zero.
+        // Inner-band opens are still allowed — most kind=2 markets
+        // launch quoting at midpoint, so this only locks the bands
+        // the attacker would target.
+        let cold_start_edge_lock = cold_start && in_edge_band;
+
+        if !in_deep_edge && !in_soft_close && !edge_band_im_too_loose && !cold_start_edge_lock {
             return Ok(());
         }
 
@@ -8752,10 +8798,12 @@ pub mod processor {
         }
 
         msg!(
-            "Kind=2: non-reducing trade rejected (in_deep_edge={} in_soft_close={} edge_band_im_too_loose={} price_e6={} current={} new={})",
+            "Kind=2: non-reducing trade rejected (in_deep_edge={} in_soft_close={} edge_band_im_too_loose={} cold_start_edge_lock={} band_price_e6={} live_price_e6={} current={} new={})",
             in_deep_edge,
             in_soft_close,
             edge_band_im_too_loose,
+            cold_start_edge_lock,
+            band_price_e6,
             price_e6,
             current,
             new
