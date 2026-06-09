@@ -19252,11 +19252,15 @@ pub mod processor {
                     .resolve_market_refund_not_atomic(clock.slot)
                     .map_err(map_risk_error)?;
             }
-            // Use `POLY_CLAMP_LO` (= 1) as the post-resolve sentinel so
-            // off-chain observers can distinguish "force-closed in
-            // refund mode" from "not yet force-closed" (= 0) and from
-            // "force-closed at a price" (>= POLY_CLAMP_LO with a real
-            // ring entry).
+            // Use `POLY_CLAMP_LO` (= 10_000, defined in oracle_ring.rs)
+            // as the post-resolve sentinel so off-chain observers can
+            // distinguish "force-closed in refund mode" from "not yet
+            // force-closed" (= 0) and from "force-closed at a price"
+            // (> POLY_CLAMP_LO with a real ring entry). NB: a market
+            // that genuinely settles at the clamp floor (p = 10_000)
+            // is byte-indistinguishable from refund here; ops should
+            // pair the on-chain reading with the keeper's branch
+            // metric for forensics.
             (oracle_ring::POLY_CLAMP_LO, true)
         };
 
