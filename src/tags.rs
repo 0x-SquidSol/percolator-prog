@@ -202,13 +202,22 @@ pub const TAG_ACCEPT_ADMIN: u8 = 82;
 pub const TAG_UPDATE_AUTHORITY: u8 = 83;
 
 /// Polymarket-perp: bind a `market_kind = 2` (PerpOnPolymarket) slab to a
-/// Polymarket condition-id and oracle source. One-shot — refuses to
-/// re-bind a market that already carries a non-zero `condition_id`.
-/// Admin-only. Requires `market_kind == 2` (rejects legacy perp /
-/// hyperp / prediction slabs).
-/// Data: tag(1) + condition_id(32) + oracle_source(1) = 34 bytes.
+/// Polymarket condition-id, oracle source, and off-chain attestation
+/// hash. One-shot — refuses to re-bind a market that already carries a
+/// non-zero `condition_id`. Admin + council co-signed. Requires
+/// `market_kind == 2` (rejects legacy perp / hyperp / prediction slabs)
+/// and an empty slab (`num_used_accounts == 0`).
 /// `oracle_source`: 0=Pyth, 1=custom-keeper (2-of-3 multisig), 2=Switchboard.
-/// Accounts: [admin(signer), slab(writable)]
+/// V1 fail-closed: only 0=Pyth is accepted at runtime; 1 and 2 are
+/// reserved discriminators rejected until their authority/feed binding
+/// lands.
+/// Data: tag(1) + condition_id(32) + oracle_source(1) + metadata_uri_hash(32) = 66 bytes.
+/// Accounts: [admin(signer), council(signer), slab(writable), pyth_price(read-only)]
+/// Council co-signer and `pyth_price` are both mandatory: the council
+/// signer is the governance gate against a unilateral admin binding,
+/// and `pyth_price` is structurally validated at Link time so a
+/// wrong-feed-bytes binding is caught at co-sign rather than at the
+/// first `PushOracleSnapshot` push (audit 2026-06-01).
 pub const TAG_LINK_POLYMARKET_MARKET: u8 = 84;
 
 /// Polymarket-perp: push a single oracle snapshot into the
