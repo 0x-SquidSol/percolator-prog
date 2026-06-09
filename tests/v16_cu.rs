@@ -2354,6 +2354,48 @@ impl V16CuEnv {
         self.withdraw_insurance_asset_with_authority_cu(&admin_clone, dest, domain / 2, amount)
     }
 
+    /// Try to withdraw insurance for an asset; creates an internal dest token account.
+    /// Returns Ok((dest, cu)) on success, Err(String) on rejection.
+    fn try_withdraw_insurance_asset_with_authority(
+        &mut self,
+        authority: &Keypair,
+        asset_index: u16,
+        amount: u128,
+    ) -> Result<(Pubkey, u64), String> {
+        let dest = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, authority.pubkey(), 0),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let cu = send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::WithdrawInsuranceAsset {
+                asset_index,
+                amount,
+            },
+            vec![
+                AccountMeta::new(authority.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[authority],
+        )?;
+        Ok((dest, cu))
+    }
+
     fn withdraw_insurance_asset_with_authority_cu(
         &mut self,
         authority: &Keypair,
@@ -8430,5 +8472,243 @@ fn v16_audit_withdraw_after_cure_and_cancel_close() {
     assert_eq!(
         account.capital, 0,
         "a flat, solvent user must be able to withdraw their capital after curing a cancelled close",
+    );
+}
+
+// security.md sweep — live insurance withdrawal must reject while insurance is still protecting
+// unresolved loss (SOL-021/SOL-022 terminal/encumbered gating). live_domain_withdraw_health_or_shutdown
+// _view (v16_program) blocks WithdrawInsuranceAsset on a live market whenever bankruptcy_hlock_active
+// / threshold_stress_active / loss_stale_active / recovery_reason is set — exactly the states where the
+// fund is the users' backstop for in-flight loss/bankruptcy work. If an operator could drain insurance
+// then, users lose their protection (LOF). The exposed target/effective lag branch is covered by
+// v16_attack_live_insurance_withdraw_rejects_exposed_target_effective_lag; the DISTINCT stress/h-lock/
+// loss-stale OR-branch was untested. This sets each flag on an otherwise-healthy FLAT market
+// (where the same withdrawal demonstrably succeeds) and asserts the withdrawal rejects with insurance +
+// domain budget byte-unchanged — proving the stress flag is the sole blocker (non-vacuous).
+#[test]
+fn v16_attack_live_insurance_withdraw_rejects_while_stressed_or_hlocked() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(1, 10_000, 10_000, 24);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100_000_000);
+    env.enable_live_insurance_withdrawal();
+    env.top_up_insurance(1_000_000);
+    env.top_up_insurance_domain_with_authority(&env.admin.insecure_clone(), 0, 1_000_000);
+    let admin = env.admin.insecure_clone();
+    // Sanity: on a healthy, flat, lag-free market the live asset withdrawal succeeds — so any rejection
+    // below is caused specifically by the stress/h-lock flag, not by some unrelated precondition.
+    env.svm.expire_blockhash();
+    env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100)
+        .expect("flat healthy live insurance withdrawal must succeed");
+    // Each engine "insurance still protecting loss" flag must independently block the withdrawal.
+    let cases: [(&str, fn(&mut MarketGroupV16, bool)); 3] = [
+        ("bankruptcy_hlock_active", |g, v| g.bankruptcy_hlock_active = v),
+        ("threshold_stress_active", |g, v| g.threshold_stress_active = v),
+        ("loss_stale_active", |g, v| g.loss_stale_active = v),
+    ];
+    for (label, set) in cases {
+        env.mutate_market(|_cfg, group| set(group, true));
+        let before = env.market_state().1;
+        env.svm.expire_blockhash();
+        let r = env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100);
+        assert!(
+            r.is_err(),
+            "live WithdrawInsuranceAsset must reject while {label} is set (insurance protecting loss)"
+        );
+        let after = env.market_state().1;
+        assert_eq!(
+            after.insurance, before.insurance,
+            "rejected withdrawal under {label} must leave insurance untouched"
+        );
+        assert_eq!(
+            after.insurance_domain_budget[0], before.insurance_domain_budget[0],
+            "rejected withdrawal under {label} must leave the domain budget untouched"
+        );
+        // clear the flag so the next iteration tests its flag in isolation.
+        env.mutate_market(|_cfg, group| set(group, false));
+    }
+}
+
+// security.md sweep — resolved-mode backing withdrawal wind-down gate (SOL-021/022): LP backing is the
+// loss-absorption layer behind users. In RESOLVED mode handle_withdraw_backing_bucket (v16_program)
+// permits a withdrawal ONLY once materialized_portfolio_count == 0 AND c_tot == 0 — i.e. every user has
+// been paid out and closed. If the backing_bucket_authority (or marketauth) could pull backing while
+// resolved users still hold capital/claims, the vault would drop below what those users are owed (LOF).
+// This is the backing parallel of v16_attack_withdraw_insurance_requires_full_wind_down (insurance), but a
+// DISTINCT code path with a distinct condition (count+c_tot vs insurance wind-down). It was untested:
+// the liened-winner case covers the LIVE lien path, not resolved-mode open capital. Non-vacuous: the same
+// withdrawal succeeds on the live empty market first.
+#[test]
+fn v16_attack_resolved_backing_withdraw_requires_full_user_wind_down() {
+    let mut env = V16CuEnv::new();
+    env.top_up_backing_bucket(1, 1_000, 100_000); // domain 1 (asset-0 short) backing, admin-authorized
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    // Sanity: on a live, user-free market the backing authority CAN withdraw — proves authority + path
+    // are fine, so the resolved-mode rejection below is caused by the wind-down gate, not a precondition.
+    env.svm.expire_blockhash();
+    env.withdraw_backing_bucket_to_admin_token_with_cu(dest, 1, 100);
+    // Open user capital, then resolve. c_tot + materialized_portfolio_count stay > 0.
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    env.deposit(&owner, portfolio, 600_000);
+    env.resolve();
+    let g = env.market_state().1;
+    assert_eq!(g.mode, percolator::MarketModeV16::Resolved, "resolved");
+    assert!(g.c_tot > 0, "user capital still open after resolve (non-vacuous gate)");
+    assert!(
+        g.materialized_portfolio_count > 0,
+        "user portfolio still materialized after resolve"
+    );
+    let vault_before = g.vault;
+    let dest_before = env.token_amount(dest);
+    env.svm.expire_blockhash();
+    let r = env.send(
+        ProgInstruction::WithdrawBackingBucket {
+            domain: 1,
+            amount: 100,
+        },
+        vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&env.admin.insecure_clone()],
+    );
+    assert!(
+        r.is_err(),
+        "resolved-mode backing withdrawal must reject while users still hold capital/claims"
+    );
+    let g_after = env.market_state().1;
+    assert_eq!(
+        g_after.vault, vault_before,
+        "rejected resolved backing withdrawal must leave the vault untouched"
+    );
+    assert_eq!(
+        env.token_amount(dest),
+        dest_before,
+        "no backing tokens may leave to the authority before users are wound down"
+    );
+    assert!(g_after.vault >= g_after.c_tot + g_after.insurance, "senior conservation intact");
+}
+
+// security.md sweep — CloseResolved caller-supplied fee_rate_per_slot must be IGNORED (Copenhagen
+// SOL-001-class spoofed-param / SOL-023 fee-rounding-away-from-user): CloseResolved is permissionless
+// after the exit window (force_close_delay_slots==0 -> always permissionless), and it carries a
+// caller-supplied `fee_rate_per_slot`. handle_close_resolved names it `_fee_rate_per_slot` and passes
+// cfg.maintenance_fee_per_slot to the engine instead. If the param were honored, a hostile third party
+// finalizing a victim's resolved account could pass a huge rate to over-charge the victim's accrued
+// maintenance fee at terminal close, draining the payout into insurance (victim LOF). Every existing
+// CloseResolved test passes fee_rate_per_slot: 0, so this ignore property is unpinned. With cfg
+// maintenance_fee=0 and slots elapsed, the victim must receive the FULL deposit regardless of a
+// u128::MAX spoofed rate; a regression that wired the param in would drain it to ~0.
+#[test]
+fn v16_attack_close_resolved_ignores_spoofed_fee_rate_param() {
+    let mut env = V16CuEnv::new(); // default maintenance_fee_per_slot = 0, force_close_delay_slots = 0
+    let victim_owner = Keypair::new();
+    let victim = env.create_portfolio(&victim_owner);
+    env.deposit(&victim_owner, victim, 1_000_000);
+    env.resolve();
+    // Advance many slots so elapsed_slots is large: a leaked spoofed rate would charge rate*elapsed.
+    env.svm.warp_to_slot(10_000);
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, victim_owner.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm.expire_blockhash();
+    // Permissionless finalize (no signer) with a maximally-spoofed fee rate.
+    env.send(
+        ProgInstruction::CloseResolved {
+            fee_rate_per_slot: u128::MAX,
+        },
+        vec![
+            AccountMeta::new_readonly(victim_owner.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(victim, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[],
+    )
+    .expect("permissionless close-resolved with spoofed fee rate");
+    assert_eq!(
+        env.token_amount(dest),
+        1_000_000,
+        "victim must receive the FULL deposit; the caller-supplied fee_rate_per_slot must be ignored"
+    );
+    let (_, g) = env.market_state();
+    assert_eq!(env.portfolio_state(victim).capital, 0, "account fully closed");
+    assert_eq!(g.vault, g.c_tot + g.insurance, "conservation after terminal close");
+}
+
+// Regression for #113 — permissionless cross-asset maintenance-fee siphon (FIXED).
+// credit_maintenance_fee_to_active_market_budgets_view previously split every
+// maintenance fee equally across all ACTIVE assets' insurance domains with no positions/activity
+// requirement, so a non-admin could append a do-nothing asset (itself as insurance_operator) and
+// capture 1/N of every honest trader's maintenance fee, then withdraw it via WithdrawInsuranceAsset.
+// The fix credits the account-level maintenance fee solely to asset-0 (the canonical base insurance,
+// not permissionlessly creatable), so a parasitic zero-activity asset earns ZERO. This guards the fix.
+#[test]
+fn v16_attack_bug113_maintenance_fee_siphon_to_parasitic_asset() {
+    // capacity 1 (asset-1 is appended at index == configured_slots, growing to 2), maintenance fee 58/slot.
+    let mut env =
+        V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(1, 10_000, 10_000, 10_000, 58);
+    env.update_market_init_fee_policy_with_cu(1); // permissionless create enabled (nonzero fee)
+    // Honest depositor H on the real market (asset 0).
+    let h_owner = Keypair::new();
+    let h = env.create_portfolio(&h_owner);
+    env.deposit(&h_owner, h, 100_000_000);
+    // Attacker permissionlessly appends a do-nothing asset 1 with ITSELF as insurance_operator.
+    let attacker = Keypair::new();
+    env.ensure_signer_account(attacker.pubkey());
+    env.svm.warp_to_slot(1);
+    env.activate_permissionless_asset_with_fee(
+        &attacker,
+        1,
+        1,
+        100,
+        attacker.pubkey(),
+        attacker.pubkey(),
+        attacker.pubkey(),
+        attacker.pubkey(),
+        1,
+    );
+    let (_, g_pre) = env.market_state();
+    assert_eq!(g_pre.assets[1].lifecycle, AssetLifecycleV16::Active, "parasite asset-1 active");
+    // asset-1 domains (2 = long, 3 = short) start empty: it has no positions and was never funded.
+    assert_eq!(g_pre.insurance_domain_budget[2], 0);
+    assert_eq!(g_pre.insurance_domain_budget[3], 0);
+    // Charge H's maintenance fee (58 * 10 slots = 580... but slot 1 is already used, so 9 slots = 522).
+    env.svm.warp_to_slot(10);
+    let h_cap_before = env.portfolio_state(h).capital;
+    env.svm.expire_blockhash();
+    env.sync_maintenance_fee_with_cu(h, None, 10);
+    let fee_paid = h_cap_before - env.portfolio_state(h).capital;
+    assert!(fee_paid > 0, "H actually paid a maintenance fee (non-vacuous)");
+    // SECURITY PROPERTY: the parasitic zero-activity asset-1 must have captured NOTHING of H's fee.
+    let (_, g) = env.market_state();
+    let parasite_share = g.insurance_domain_budget[2] + g.insurance_domain_budget[3];
+    assert_eq!(
+        parasite_share, 0,
+        "BUG #113 REGRESSION: parasitic asset-1 captured {parasite_share} of H's {fee_paid} maintenance fee"
+    );
+    // And the attacker must not be able to withdraw any of it as that asset's insurance_operator.
+    env.svm.expire_blockhash();
+    let siphon = env.try_withdraw_insurance_asset_with_authority(&attacker, 1, 1);
+    assert!(
+        siphon.is_err(),
+        "BUG #113 REGRESSION: attacker siphoned honest maintenance fees via WithdrawInsuranceAsset(asset 1)"
     );
 }
