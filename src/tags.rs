@@ -300,6 +300,30 @@ pub const TAG_FORCE_CLOSE_KIND2: u8 = 88;
 /// Accounts: [admin(signer), incoming_council(signer), slab(writable)]
 pub const TAG_SET_COUNCIL_AUTHORITY: u8 = 89;
 
+/// Polymarket-perp: rotate the council co-signer pubkey on a linked
+/// `market_kind = 2` slab. Two-signer: BOTH the outgoing council
+/// (current `config.council_authority`) AND the incoming council
+/// (the supplied `new_council`) must sign. Admin is intentionally
+/// NOT a signer — rotation is the council's self-defense primitive
+/// against a coerced or compromised admin, so binding it to admin
+/// would defeat the safety net.
+///
+/// PAUSE-IMMUNE: pause is admin-only, so gating rotation on pause
+/// would let a compromised admin lock out the council. Sibling
+/// kind=2 setters retain their pause guards because they are
+/// admin-cosign actions; this is the only council-self-defense
+/// primitive. Do NOT re-add a pause check in a future refactor.
+///
+/// Input-domain rejects (preserve two-signer integrity):
+/// zero, no-op (== current council), `header.admin` collision, and
+/// `pending_admin` collision (would collapse on `AcceptAdmin`).
+/// Also refuses unbootstrapped council, `market_kind != 2`, and
+/// resolved markets.
+///
+/// Data: tag(1) + new_council(32) = 33 bytes.
+/// Accounts: [outgoing_council(signer), incoming_council(signer), slab(writable)]
+pub const TAG_ROTATE_COUNCIL_AUTHORITY: u8 = 90;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +419,7 @@ mod tests {
             TAG_SET_FORCE_CLOSE_TIMESTAMP,
             TAG_FORCE_CLOSE_KIND2,
             TAG_SET_COUNCIL_AUTHORITY,
+            TAG_ROTATE_COUNCIL_AUTHORITY,
         ];
 
         for i in 0..tags.len() {
@@ -496,6 +521,7 @@ mod tests {
             TAG_SET_FORCE_CLOSE_TIMESTAMP,
             TAG_FORCE_CLOSE_KIND2,
             TAG_SET_COUNCIL_AUTHORITY,
+            TAG_ROTATE_COUNCIL_AUTHORITY,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)
