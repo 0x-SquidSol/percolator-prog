@@ -8700,16 +8700,27 @@ pub mod processor {
 
         // Classify the band off `engine.last_oracle_price` (the price
         // committed by the most recent accrual) rather than the live
-        // ring TWAP. The TWAP is permissionless-push-manipulable —
-        // ~6 max-deviation snapshots within ~6s drag it across the
-        // 0.20/0.80 boundary for ~$0.006 of push fees. `last_oracle_price`
-        // is only written by `accrue_market_to`, which is gated by the
-        // per-slot price-move cap and a touched-account window, so a
-        // pure-push attack cannot move it. Cold-start (`last_oracle_price
-        // == 0`, no anchor yet committed): fall back to the live TWAP
-        // `price_e6` BUT refuse edge-band opens — this prevents a
-        // first-trade classification attack while still allowing
-        // inner-band opens on a brand-new market quoting at midpoint.
+        // ring TWAP. The TWAP is permissionless-push-manipulable;
+        // `last_oracle_price` is only written by `accrue_market_to`,
+        // which is gated by the per-slot price-move cap, so a pure-push
+        // attack cannot move it cheaply.
+        //
+        // Cold-start gate: keyed on `engine.num_used_accounts == 0`
+        // rather than `last_oracle_price == 0`. The latter is flippable
+        // by a permissionless `KeeperCrank` (caller_idx == CRANK_NO_CALLER)
+        // followed by accrual — an attacker could erase the cold-start
+        // flag with one push + one crank for a couple of tx fees, then
+        // open at the manipulated anchor. `num_used_accounts` is only
+        // incremented inside engine `materialize_at`, called exclusively
+        // from `InitUser` / `InitLP`; both require a real signer, a real
+        // SPL-token deposit of at least `MIN_INITIAL_DEPOSIT`, an
+        // anti-spam fee to insurance, and (when configured) the
+        // TVL/insurance cap check. No permissionless instruction can
+        // bump it. While the slab has zero materialized users we fall
+        // back to the live TWAP for classification BUT refuse edge-band
+        // opens, preventing a first-trade classification attack while
+        // still allowing inner-band opens on a brand-new market quoting
+        // near midpoint.
         //
         // Hysteresis: nominal boundaries widened inward by
         // `BAND_HYSTERESIS_E6` for the inner-band classification.
@@ -8718,7 +8729,11 @@ pub mod processor {
         let (band_price_e6, cold_start) = {
             let engine = zc::engine_ref(data)?;
             let anchor = engine.last_oracle_price;
-            if anchor == 0 { (price_e6, true) } else { (anchor, false) }
+            if engine.num_used_accounts == 0 {
+                (price_e6, true)
+            } else {
+                (anchor, false)
+            }
         };
 
         let in_deep_edge = band_price_e6 < BAND_LO_E6 || band_price_e6 > BAND_HI_E6;
