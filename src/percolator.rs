@@ -18518,7 +18518,7 @@ pub mod processor {
         );
         // `value_deviation_bps × 100` converts the configured bps
         // tolerance into e6 units. `as u64` is safe — `value_deviation_bps`
-        // is u16 (≤ 2_000 per the setter's MAX_DEVIATION_BPS cap), so
+        // is u16 (≤ 500 per the setter's MAX_DEVIATION_BPS cap), so
         // `× 100` fits comfortably in u64.
         let tolerance_e6 = (config.value_deviation_bps as u64) * 100;
         let observed_dev = oracle_ring::value_deviation_e6(p_yes_clamped, formula_p);
@@ -18619,14 +18619,14 @@ pub mod processor {
     //         `p_yes_e6` consumes the monotonic-publish_time slot for
     //         every honest keeper. A meaningful tolerance floor keeps
     //         the deviation guard real without enabling DoS-by-precision.
-    //         `MAX_DEVIATION_BPS = 1_000` (= 10%). Tightened from an
-    //         earlier 2_000 ceiling after a full-feature audit found
-    //         that at the loose cap a permissionless attacker could
-    //         shift the TWAP by ~20pp over 60 pushes (~24 seconds of
-    //         Pyth ticks) for trivial tx-fee cost. At 10% the residual
-    //         attack moves at most ~10pp over 60 pushes; typical
-    //         deployments still choose 100-500 bps and the cap is the
-    //         hard outer bound.
+    //         `MAX_DEVIATION_BPS = 500` (= 5%). Tightened twice
+    //         (2_000 → 1_000 → 500) as successive audits modelled the
+    //         residual compound-bias drag of permissionless pushes
+    //         against the formula at each loose cap. The current cap
+    //         matches the upper end of the 100-500 bps range the
+    //         `value_deviation_bps` doc-comment names as the
+    //         typical-deployment band, so no real configuration is
+    //         constrained.
     //
     // After all gates pass, the three fields are written and a
     // structured log emits the configured tuple for off-chain
@@ -18639,16 +18639,19 @@ pub mod processor {
         scale_bps_per_pct: i32,
         deviation_bps: u16,
     ) -> ProgramResult {
-        // Hard upper bound on the deviation tolerance. 1_000 bps = 10%
+        // Hard upper bound on the deviation tolerance. 500 bps = 5%
         // of the e6 probability space (after the guard's `× 100`
-        // bps-to-e6 conversion). Tightened from an earlier 2_000 after
-        // a full-feature audit modelled the manipulation cost: at the
-        // loose cap, 60 pushes (~24s of Pyth ticks) for trivial tx-fee
-        // cost could shift the TWAP by ~20pp — meaningful at 5x
-        // leverage. At 10% the residual attack is half that. Typical
-        // deployments still choose 100-500 bps; 1_000 is the loosest
-        // configuration the contract will accept.
-        const MAX_DEVIATION_BPS: u16 = 1_000;
+        // bps-to-e6 conversion). Tightened twice: 2_000 → 1_000 after
+        // the first feature audit, then 1_000 → 500 after a follow-up
+        // audit showed the same compound-bias drag at the loosened cap
+        // still moved the ring TWAP meaningfully relative to the
+        // formula at 5x leverage. At 5% the steady-state ring vs
+        // formula gap halves again, and 500 matches the upper end of
+        // the 100-500 bps range named as the typical-deployment band
+        // in the `value_deviation_bps` doc-comment — so no real
+        // configuration is constrained, only the loose-cap residual
+        // manipulation surface.
+        const MAX_DEVIATION_BPS: u16 = 500;
         // Hard lower bound on the deviation tolerance. 50 bps = 0.5%
         // tolerance. Below this, the deviation guard becomes a
         // permissionless griefing surface: a sub-bps tolerance lets
