@@ -19194,14 +19194,20 @@ pub mod processor {
         //       Pre-writing `last_oracle_price` is an established
         //       engine idiom (see `permissionless_recovery_resolve_p_last_not_atomic`).
         //
-        //   (B) Ring empty but engine has a last_oracle_price → fall
-        //       back to that price under Degenerate. This is strictly
-        //       worse than the TWAP but better than wedging the
-        //       market, and only fires on markets that never received
-        //       a single oracle push after their first trade.
+        //   (B) Ring empty but engine has a recent last_oracle_price
+        //       (last accrual within MAX_RING_STALENESS_SLOTS of
+        //       clock.slot) → fall back to that price under Degenerate.
+        //       This is strictly worse than the TWAP but better than
+        //       wedging the market, and only fires on markets that
+        //       never received a single oracle push after their first
+        //       trade. The recency gate prevents a market that traded
+        //       historically then went idle for hours/days from
+        //       settling at a stale anchor — such markets fall through
+        //       to (C) refund-mode instead.
         //
-        //   (C) Ring empty AND no trade ever happened → dispatch
-        //       refund-mode (`resolve_market_refund_not_atomic`).
+        //   (C) Ring empty AND (no trade ever happened OR last
+        //       accrual is older than MAX_RING_STALENESS_SLOTS) →
+        //       dispatch refund-mode (`resolve_market_refund_not_atomic`).
         //       Detaches every open position at zero unrealized PnL,
         //       preserves trader collateral, preserves insurance,
         //       leaves protocol fees with LPs + protocol. The
@@ -19215,21 +19221,43 @@ pub mod processor {
         // skim at force-close-resolved time and a Kani harness
         // proving `vault >= c_tot + insurance` across the transition;
         // both ship in a follow-up commit.
-        // Two-gate TWAP (audit H-4): refuses thinly-populated or stale
-        // rings so a single keeper-controlled push on a quiet market
-        // cannot pin settlement. Fallthrough order unchanged:
-        // (A) TWAP if gates pass → (B) engine.last_oracle_price → (C) refund.
+        // Two-gate TWAP: refuses thinly-populated or stale rings so a
+        // single keeper-controlled push on a quiet market cannot pin
+        // settlement. Fallthrough order: (A) TWAP if gates pass →
+        // (B) engine.last_oracle_price gated on accrual recency →
+        // (C) refund.
+        //
+        // Branch B recency gate: reuses `MAX_RING_STALENESS_SLOTS` so
+        // branches A and B share one staleness budget — a market that
+        // traded historically and then went idle past the budget
+        // settles via refund-mode (C) rather than locking in a
+        // potentially-hours-stale anchor. `engine.last_market_slot` is
+        // updated atomically with `last_oracle_price` on every
+        // accrual, so it is the canonical recency signal for the
+        // price we are about to lock in. `saturating_sub` defangs a
+        // (theoretically unreachable) clock rewind by collapsing to 0,
+        // which is in-window — safely permissive for that impossible
+        // state.
         let twap_opt = oracle_ring::ring_buf_twap_with_min_fills(
             &config.oracle_ring_buf,
             clock.slot,
             oracle_ring::MIN_RING_FILLS,
             oracle_ring::MAX_RING_STALENESS_SLOTS,
         );
-        let last_price_engine = zc::engine_ref(&data)?.last_oracle_price;
+        let (last_price_engine, last_market_slot) = {
+            let engine = zc::engine_ref(&data)?;
+            (engine.last_oracle_price, engine.last_market_slot)
+        };
 
         let settlement_price = match (twap_opt, last_price_engine) {
             (Some(twap), _) if twap > 0 => Some(twap),
-            (None, p) if p != 0 => Some(p),
+            (None, p)
+                if p != 0
+                    && clock.slot.saturating_sub(last_market_slot)
+                        <= oracle_ring::MAX_RING_STALENESS_SLOTS =>
+            {
+                Some(p)
+            }
             _ => None,
         };
 
