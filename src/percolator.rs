@@ -19464,10 +19464,24 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        let has_accounts = {
+        // Defense-in-depth: the wrapper's `state::is_resolved` flag and
+        // the engine's `market_mode == Resolved` should always move in
+        // lockstep (every resolve path sets both), but the kind=0→2
+        // lift writes engine-side state, so re-check the engine view
+        // explicitly. If any code path ever resolved the engine without
+        // also setting the wrapper flag, this catches it before we
+        // would otherwise lift the kind on a resolved engine.
+        let (has_accounts, engine_live) = {
             let engine = zc::engine_ref(&data)?;
-            engine.num_used_accounts > 0
+            (
+                engine.num_used_accounts > 0,
+                engine.market_mode == percolator::MarketMode::Live,
+            )
         };
+        if !engine_live {
+            msg!("SetCouncilAuthority: refuses non-Live engine state");
+            return Err(ProgramError::InvalidAccountData);
+        }
         if has_accounts {
             msg!(
                 "SetCouncilAuthority: refuses non-empty slab (must be set before first user entry)"
