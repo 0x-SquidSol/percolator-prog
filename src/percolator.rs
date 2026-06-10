@@ -19082,10 +19082,11 @@ pub mod processor {
     //     positions on.
     //
     // For diagnostics, the handler also computes the current ring
-    // TWAP via `ring_buf_twap_unbounded` and logs it alongside
-    // `last_oracle_price` so off-chain observers can confirm the
-    // two are in agreement (and flag any meaningful drift between
-    // them as an indicator of a quiet period before force-close).
+    // TWAP via the two-gate `ring_buf_twap_with_min_fills` and logs it
+    // (as `twap_gated`) alongside `last_oracle_price` so off-chain
+    // observers can confirm the two are in agreement (and flag any
+    // meaningful drift between them as an indicator of a quiet period
+    // before force-close).
     //
     // The handler delegates resolution-state mutation to
     // `engine.resolve_market_not_atomic(Degenerate, last_price,
@@ -19128,14 +19129,16 @@ pub mod processor {
     //
     // Side effects (only on success):
     //
-    //   * Reads ring TWAP via `oracle_ring::ring_buf_twap_unbounded`.
-    //     If the ring is empty (zero entries ever pushed), returns
-    //     `OracleStale` — this is the only legitimate failure mode
-    //     after all gates pass, and means the keeper never ran. In
-    //     this case the deployment runbook fallback applies (admin
-    //     escalation via a future Council path).
-    //   * Captures the TWAP into `forced_close_price_e6` so off-chain
-    //     readers can verify the settlement price after the fact.
+    //   * Selects a settlement price via the three-branch ladder:
+    //     (A) the two-gate `oracle_ring::ring_buf_twap_with_min_fills`
+    //     (>= MIN_RING_FILLS recent entries); (B) the engine's
+    //     `last_oracle_price` if its last accrual is within
+    //     MAX_RING_STALENESS_SLOTS; (C) refund-mode if neither yields a
+    //     price. The handler does not return `OracleStale` on an empty
+    //     ring — that case lands in branch (C), so settlement always
+    //     terminates without admin escalation.
+    //   * Captures the settlement price into `forced_close_price_e6` so
+    //     off-chain readers can verify it after the fact.
     //   * Calls `engine.resolve_market_not_atomic(Degenerate, twap,
     //     twap, clock.slot, 0)` to crystallise the engine's
     //     `resolved_price` and flip `market_mode` to `Resolved`.
@@ -19394,7 +19397,7 @@ pub mod processor {
         state::set_resolved(&mut data);
 
         msg!(
-            "ForceCloseKind2: slab={} settled_price_e6={} refund_mode={} (twap_unbounded={:?}, engine_last={}, force_close_unix_ts={}, now={})",
+            "ForceCloseKind2: slab={} settled_price_e6={} refund_mode={} (twap_gated={:?}, engine_last={}, force_close_unix_ts={}, now={})",
             a_slab.key,
             settled_price_e6,
             used_refund_mode,
