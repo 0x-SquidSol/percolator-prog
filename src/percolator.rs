@@ -10934,6 +10934,22 @@ pub mod processor {
         // Copy stats before threshold update (avoid borrow conflict)
         let ins_low = engine.insurance_fund.balance.get() as u64;
 
+        // Settlement-wedge guard: the engine's permissionless-progress
+        // dispatcher can transition `market_mode` Live -> Resolved on a
+        // recovery / resolved-close outcome (Recovered / AccountBRecovered /
+        // ResolvedClose) without the wrapper observing a `Cranked(_)`. The
+        // dedicated resolve handlers (handle_resolve_market,
+        // handle_resolve_permissionless, handle_force_close_kind2) mirror
+        // resolution to the slab inline at their own call sites; this
+        // permissionless crank path did not. Capture the authoritative
+        // engine fields here while `engine` is still borrowed, then mirror
+        // below once the borrow has ended. Without the mirror the engine is
+        // Resolved while the slab stays Live with `hyperp_mark_e6 == 0`, so
+        // the resolved-crank settlement branch bails and `ForceCloseKind2`
+        // refuses (engine already Resolved) — settlement wedges permanently.
+        let engine_resolved = engine.market_mode == percolator::MarketMode::Resolved;
+        let engine_resolved_price = engine.resolved_price;
+
         // Spec §2.2.1: I_floor is immutable — no auto-update.
         // Insurance floor is set at InitMarket and never changes.
         // (EWMA auto-update removed per spec compliance.)
@@ -10941,6 +10957,26 @@ pub mod processor {
         // Write remaining dust if sweep occurred
         if let Some(dust) = remaining_dust {
             state::write_dust_base(&mut data, dust);
+        }
+
+        // Mirror an engine-side Live -> Resolved transition to the slab
+        // (see the capture above the dust sweep). Reborrow `data` mutably now
+        // that the `engine` borrow has ended. Re-reads the config fresh rather
+        // than reusing the pre-crank local so no intervening write is
+        // clobbered. Idempotent and defensive: only fires when the engine
+        // actually resolved at a non-zero price AND the wrapper flag is not
+        // already set. `resolve_market_not_atomic` rejects a zero settlement
+        // price, so `market_mode == Resolved` implies `resolved_price > 0`;
+        // the explicit check makes that invariant locally verifiable and
+        // guarantees we never write a bogus zero mark. Writes the same
+        // `config.hyperp_mark_e6` slot + FLAG_RESOLVED the dedicated resolve
+        // handlers use, keeping the post-resolution settlement path consistent
+        // across every resolution route.
+        if engine_resolved && engine_resolved_price > 0 && !state::is_resolved(&data) {
+            let mut resolved_config = state::read_config(&data);
+            resolved_config.hyperp_mark_e6 = engine_resolved_price;
+            state::write_config(&mut data, &resolved_config);
+            state::set_resolved(&mut data);
         }
 
         // Debug: log lifetime counters (sol_log_64: tag=CRANK_STATS, liqs, max_accounts, insurance, 0)
