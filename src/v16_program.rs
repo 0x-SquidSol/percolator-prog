@@ -7360,6 +7360,7 @@ pub mod processor {
         expect_owner(account_a_ai, program_id)?;
         expect_owner(account_b_ai, program_id)?;
         if account_a_ai.key == account_b_ai.key
+            || matcher_prog.key == program_id
             || !matcher_prog.executable
             || matcher_ctx.executable
             || matcher_ctx.owner != matcher_prog.key
@@ -7537,7 +7538,8 @@ pub mod processor {
             let matcher_prog = account(accounts, 3)?;
             let matcher_ctx = account(accounts, 4)?;
             let matcher_delegate = account(accounts, 5)?;
-            if !matcher_prog.executable
+            if matcher_prog.key == program_id
+                || !matcher_prog.executable
                 || matcher_ctx.executable
                 || matcher_ctx.owner != matcher_prog.key
                 || matcher_ctx.data_len() < constants::MATCHER_CONTEXT_MIN_LEN
@@ -7644,6 +7646,7 @@ pub mod processor {
         expect_owner(account_a_ai, program_id)?;
         expect_owner(account_b_ai, program_id)?;
         if account_a_ai.key == account_b_ai.key
+            || matcher_prog.key == program_id
             || !matcher_prog.executable
             || matcher_ctx.executable
             || matcher_ctx.owner != matcher_prog.key
