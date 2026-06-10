@@ -49,6 +49,18 @@ pub const POLY_CLAMP_HI: u64 = 990_000;
 /// in the TWAP. Older snapshots are excluded. 720 slots ≈ 5 minutes at
 /// 400 ms / slot, matching the nominal ring window (60 entries at ~12
 /// slots per push).
+///
+/// Design note: this window is the chosen balance between two
+/// adversarial regimes. Tightening it (e.g. 60-slot cap) rejects
+/// otherwise-fresh pushes during cluster-leader skew or Pyth tick
+/// jitter, wedging the trade-time price path. Loosening it widens the
+/// oracle-latency-arb surface — between the slot a fresh Pyth move
+/// lands and the slot the next push lands, a trader who reads Pyth
+/// can transact against a stale ring. The 5-minute window is short
+/// enough that the per-slot price-move cap and the 60-entry uniform
+/// average dampen the arb's effective EV; tighter values trade
+/// liveness for marginal additional safety. Operational mitigation is
+/// to keep the push cranker submitting on every Pyth tick.
 pub const MAX_STALENESS_SLOTS: u64 = 720;
 
 /// Minimum non-empty ring fills required for the force-close TWAP gate
