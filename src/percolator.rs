@@ -19258,6 +19258,28 @@ pub mod processor {
         //       here and left the market wedged — see audit
         //       walkthrough 2026-06-01.
         //
+        //       Refund-at-entry vs settle-at-stale-mark — why refund is
+        //       the correct exit when open positions exist: branch (C) is
+        //       only reachable when (A) failed the MIN_RING_FILLS gate
+        //       (fewer than 10 non-stale ring entries ever) AND (B) failed
+        //       the recency gate. A market that traded enough to put any
+        //       position meaningfully underwater on a *reliable* mark has
+        //       almost certainly accumulated >= MIN_RING_FILLS pushes (the
+        //       ring holds 60), so it settles via (A). Reaching (C) with
+        //       open positions therefore implies the market never had
+        //       enough oracle data to establish a trustworthy mark — in
+        //       which case detaching every account at its own entry (zero
+        //       unrealized PnL) is the neutral, fair exit, NOT a loss-wipe
+        //       exploit. Settling such a market at its stale last mark
+        //       would be strictly worse: that mark is exactly the
+        //       single-push-manipulable value the two-gate exists to
+        //       reject. Do NOT "harden" (C) into a stale-mark settle for
+        //       the positions-exist case — that re-opens the manipulation
+        //       surface the gates close. The operational defense for a
+        //       genuinely-active market that risks drifting toward (C) is
+        //       keeper liveness (push on every Pyth tick): a single fresh
+        //       push within the staleness window flips settlement to (A).
+        //
         // Haircut routing (TWAP minus a configured haircut credited
         // to insurance) is deliberately NOT applied here. The
         // conservation-preserving haircut requires a per-account
