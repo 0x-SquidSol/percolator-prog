@@ -3647,9 +3647,11 @@ pub mod state {
 
         /// Maximum allowed `|caller_p_yes_e6 - on_chain_p|` for the
         /// deviation guard, in bps of the e6 probability space.
-        /// E.g., `value_deviation_bps = 1500` = ±15% deviation
-        /// allowed. Must be non-zero for a configured mapping;
-        /// sentinel `0` = unmapped (PushOracleSnapshot will refuse).
+        /// E.g., `value_deviation_bps = 300` = ±3% deviation allowed.
+        /// Must be non-zero for a configured mapping; sentinel `0` =
+        /// unmapped (PushOracleSnapshot will refuse). The setter caps
+        /// this at `MAX_DEVIATION_BPS = 500` (±5%) — examples above the
+        /// cap would be rejected at `SetPythPriceMapping`.
         ///
         /// Operator note on choosing the value: this is a per-market
         /// hard ceiling on how far the caller-supplied `p_yes_e6` may

@@ -217,13 +217,17 @@ pub fn ring_buf_twap(buf: &[OracleSnapshotEntry; 60], now_slot: u64) -> Option<u
 ///
 /// All intermediate arithmetic uses `i128` (`scale * delta * 10_000`
 /// followed by `/ threshold`). Bounds:
-///   * `scale_bps_per_pct: i32` → at most `≈ 2^31` in absolute value.
-///   * `delta_e6: i128` → bounded above by `pyth_price_e6: u64` (≈ 2^64)
-///     when threshold = 0, but `threshold > 0` is required; in any
-///     legitimate use `|delta| ≤ pyth_price + threshold < 2^65`.
-///   * `10_000 ≈ 2^14`.
-///   * Worst-case product: `2^31 × 2^65 × 2^14 = 2^110`.
-///   * `i128::MAX ≈ 2^127`, leaving `2^17` headroom — comfortable.
+///   * `scale_bps_per_pct: i32` → at most `2^31` in absolute value.
+///   * `delta_e6: i128` → `pyth_price_e6` is hard-bounded to `u64::MAX`
+///     (`read_pyth_price_e6` rejects larger), and `threshold > 0`, so
+///     `|delta| ≤ pyth_price < 2^64`.
+///   * `10_000 < 2^14` (precisely `2^13.29`).
+///   * Worst-case product (conservative upper bounds): strictly below
+///     `2^31 × 2^64 × 2^14 = 2^109`; the exact maximum is ≈ `2^108.3`.
+///   * `i128::MAX ≈ 2^127`, leaving ≳ `2^18` headroom — comfortable.
+///     The bounds above are deliberately rounded UP, so the real
+///     margin is larger than stated; the safety conclusion holds with
+///     room to spare.
 ///
 /// In `release` profile, `overflow-checks = true`, so any unexpected
 /// overflow would panic rather than silently wrap. On the bounded
