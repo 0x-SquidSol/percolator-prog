@@ -12861,6 +12861,21 @@ pub mod processor {
             .fresh_reserved_backing_num
             .checked_add(amount_num)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // STEP-6 (v17): keep header aggregate in sync with per-domain delta.
+        // add_fresh_counterparty_backing_view is the wrapper's inline substitute for
+        // the engine's set_source_credit_for_domain which calls
+        // update_source_credit_aggregate_totals. Without this maintenance,
+        // validate_header_aggregate_totals (senior + fresh_backing/BOUND_SCALE <= vault)
+        // rejects every ExecuteRedemption because the aggregate stays at 0 while the
+        // Step-6 decrement in handle_execute_redemption tries to subtract backing_num.
+        group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(
+            group
+                .header
+                .source_fresh_backing_total_num
+                .get()
+                .checked_add(amount_num)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
         source.credit_rate_num =
             expected_source_credit_rate_num(source).map_err(map_v16_error)?;
         source.credit_epoch = source
