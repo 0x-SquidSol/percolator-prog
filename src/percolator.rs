@@ -12608,6 +12608,15 @@ pub mod processor {
         require_admin(header.admin, a_admin.key)?;
 
         let mut config = state::read_config(&data);
+        // Kind=2 (Polymarket-perp) prices come from the Pyth value-anchoring
+        // mapping + deviation guard (SetPythPriceMapping), not from this
+        // per-slot move clamp. The clamp is a kind=0/1 lever; mutating it on
+        // a configured kind=2 market is at best dead and at worst a
+        // manipulation surface a lone admin should not control. Refuse.
+        if config.market_kind == 2 {
+            msg!("SetOraclePriceCap: refuses market_kind=2 (kind=2 prices governed by SetPythPriceMapping)");
+            return Err(ProgramError::InvalidAccountData);
+        }
         let is_hyperp = oracle::is_hyperp_mode(&config);
         // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
         let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
@@ -17205,6 +17214,13 @@ pub mod processor {
         require_admin(header.admin, a_admin.key)?;
 
         let mut config = state::read_config(&data);
+        // Kind=2 risk params are frozen post-lift (set at InitMarket while
+        // kind=0). A compromised admin acting alone must not retune the
+        // wallet cap on a configured kind=2 market. Mirrors SetDisputeParams.
+        if config.market_kind == 2 {
+            msg!("SetWalletCap: refuses market_kind=2 (risk params frozen post-lift)");
+            return Err(ProgramError::InvalidAccountData);
+        }
         state::set_max_wallet_pos_e6(&mut config, cap_e6);
         state::write_config(&mut data, &config);
 
@@ -17243,6 +17259,13 @@ pub mod processor {
         }
 
         let mut config = state::read_config(&data);
+        // Kind=2 risk params are frozen post-lift (set at InitMarket while
+        // kind=0). A compromised admin acting alone must not retune the OI
+        // imbalance block on a configured kind=2 market. Mirrors SetDisputeParams.
+        if config.market_kind == 2 {
+            msg!("SetOiImbalanceHardBlock: refuses market_kind=2 (risk params frozen post-lift)");
+            return Err(ProgramError::InvalidAccountData);
+        }
         state::set_oi_imbalance_hard_block_bps(&mut config, threshold_bps);
         state::write_config(&mut data, &config);
 
@@ -17824,6 +17847,19 @@ pub mod processor {
         require_admin(header.admin, a_admin.key)?;
 
         let mut config = state::read_config(&data);
+        // Kind=2 (Polymarket-perp) freezes its risk parameters after the
+        // kind=0->2 lift: they are configured at InitMarket while the slab
+        // is still kind=0 and must not be mutated on a live kind=2 market.
+        // max_pnl_cap is the most dangerous lever — it gates ADL, so a
+        // compromised admin acting alone (no council co-sign) could shrink
+        // it to force ADL to confiscate user winnings. Refuse outright;
+        // the SetCouncilAuthority lift additionally requires max_pnl_cap==0
+        // for kind=2, so the cap stays disabled for the market's life.
+        // Mirrors the SetDisputeParams kind=2 refusal.
+        if config.market_kind == 2 {
+            msg!("SetMaxPnlCap: refuses market_kind=2 (risk params frozen post-lift)");
+            return Err(ProgramError::InvalidAccountData);
+        }
         state::set_max_pnl_cap(&mut config, cap);
         state::write_config(&mut data, &config);
 
@@ -17856,6 +17892,13 @@ pub mod processor {
         // Validate: both fields must fit in u32 (that's the packing invariant).
         // No semantic range check here — the unpacking in lp_vault clamps values.
         let mut config = state::read_config(&data);
+        // Kind=2 risk params are frozen post-lift (set at InitMarket while
+        // kind=0). A compromised admin acting alone must not retune OI caps
+        // on a configured kind=2 market. Mirrors SetDisputeParams.
+        if config.market_kind == 2 {
+            msg!("SetOiCapMultiplier: refuses market_kind=2 (risk params frozen post-lift)");
+            return Err(ProgramError::InvalidAccountData);
+        }
         state::set_oi_cap_multiplier_bps(&mut config, packed);
         state::write_config(&mut data, &config);
 
@@ -19613,6 +19656,27 @@ pub mod processor {
                 "SetCouncilAuthority: refuses council == pending_admin (would collapse two-signer guarantee on AcceptAdmin)"
             );
             return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Confiscation backstop: kind=2 markets must run with the ADL PnL
+        // cap DISABLED (max_pnl_cap == 0). The cap gates the ADL pre-check;
+        // a non-zero value lets ADL force-deleverage winners once their
+        // aggregate positive PnL exceeds the cap. The bounded probability
+        // domain already bounds per-position max gain (a long's upside is
+        // 1-p), so a pre-emptive PnL cap is redundant for kind=2 and is
+        // purely a confiscation lever. SetMaxPnlCap refuses kind=2, so the
+        // value cannot be re-enabled after the lift — but it could have been
+        // set to a confiscatory level while the slab was still kind=0 and
+        // carried in here. Refusing the lift unless the cap is 0 closes that
+        // carry-in: a confiscatory cap baked in pre-lift cannot survive the
+        // kind=2 boundary, backstopping a council that co-signs the lift
+        // without auditing every legacy risk field.
+        if config.max_pnl_cap != 0 {
+            msg!(
+                "SetCouncilAuthority: refuses kind=2 lift with non-zero max_pnl_cap={} (kind=2 runs with the ADL PnL cap disabled; set it to 0 before lifting)",
+                config.max_pnl_cap
+            );
+            return Err(ProgramError::InvalidAccountData);
         }
 
         // Atomic lift: bind council pubkey AND promote the slab from
