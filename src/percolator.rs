@@ -11055,6 +11055,20 @@ pub mod processor {
 
         let mut config = state::read_config(&data);
 
+        // Kind=2 (Polymarket-perp) reject: kind=2 always has
+        // `index_feed_id != 0`, so `is_hyperp_mode` below is always false —
+        // without this gate kind=2 trades route through TradeNoCpi
+        // (NoOpMatcher) and skip the matcher CPI cross-check that the kind=2
+        // design relies on as its second line of defense. Force kind=2 onto
+        // TradeCpi (the pinned-matcher path). Placed before the oracle read /
+        // band gate so kind=2 short-circuits before any NoOpMatcher work.
+        // Uses the descriptive-msg! + InvalidAccountData idiom shared by every
+        // other kind=2 reject in this handler set.
+        if config.market_kind == 2 {
+            msg!("TradeNoCpi: refuses market_kind=2 (Polymarket-perp must trade via TradeCpi with a pinned matcher)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         let clock = Clock::from_account_info(&accounts[3])?;
         let a_oracle = &accounts[4];
 
