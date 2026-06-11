@@ -18622,6 +18622,31 @@ pub mod processor {
             }
         }
 
+        // One-push-per-slot gate (single-block manipulation resistance).
+        // The new entry's `on_chain_slot` (= clock.slot) must be strictly
+        // greater than the ring's current slot frontier. Without this, a
+        // caller holding 60 distinct, individually-valid Pyth observations
+        // (increasing publish_times, each within the deviation cap) could
+        // push all 60 in ONE slot — every push passing the monotonic and
+        // deviation gates — and fill the entire ring from a single block.
+        // The TWAP would then reflect one block instead of >= 60 distinct
+        // slots, defeating the ring's reason for existing. Capping to one
+        // entry per slot forces the 60-entry ring to span >= 60 slots, so an
+        // attacker can no longer fill it in a single block and must instead
+        // win the push race against honest keepers slot-by-slot. `clock` is
+        // the runtime Clock already used for the entry's `on_chain_slot`
+        // below; on a fresh ring `ring_buf_max_slot` returns 0 so the first
+        // push always lands.
+        let ring_max_slot = oracle_ring::ring_buf_max_slot(&config.oracle_ring_buf);
+        if ring_max_slot != 0 && clock.slot <= ring_max_slot {
+            msg!(
+                "PushOracleSnapshot: clock.slot={} not greater than ring max_slot={} (one-push-per-slot)",
+                clock.slot,
+                ring_max_slot
+            );
+            return Err(PercolatorError::OracleStale.into());
+        }
+
         // Clamp caller's p_yes_e6 into [POLY_CLAMP_LO, POLY_CLAMP_HI].
         // Out-of-domain values silently pulled to the boundary; the
         // emitted log records both the input and the clamped value so

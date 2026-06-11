@@ -109,6 +109,27 @@ pub fn ring_buf_last(buf: &[OracleSnapshotEntry; 60]) -> Option<&OracleSnapshotE
     best
 }
 
+/// Largest `on_chain_slot` across all written ring entries, or `0` if the
+/// ring is empty (every entry at the `source_timestamp == 0` zero-default).
+///
+/// Used by `PushOracleSnapshot` to enforce a one-entry-per-slot invariant:
+/// a new push must carry a `clock.slot` strictly greater than this value.
+/// That keeps the 60-entry ring spanning at least 60 distinct slots, so the
+/// TWAP cannot be filled from — and collapsed onto — a single block (the
+/// ring's whole purpose is single-block-manipulation resistance). This
+/// computes the max independently of `ring_buf_last` (which keys on
+/// `source_timestamp`) so the slot frontier is locally verifiable and robust
+/// even on a ring whose newest-timestamp entry is not its newest-slot entry.
+pub fn ring_buf_max_slot(buf: &[OracleSnapshotEntry; 60]) -> u64 {
+    let mut max_slot: u64 = 0;
+    for entry in buf.iter() {
+        if entry.source_timestamp != 0 && entry.on_chain_slot > max_slot {
+            max_slot = entry.on_chain_slot;
+        }
+    }
+    max_slot
+}
+
 /// Insert a new entry into the ring, overwriting the slot with the
 /// oldest `source_timestamp`. Returns the index that was overwritten.
 ///
@@ -420,6 +441,42 @@ mod tests {
         let last = ring_buf_last(&buf).unwrap();
         assert_eq!(last.source_timestamp, 200);
         assert_eq!(last.p_yes_e6, 510_000);
+    }
+
+    // ----- ring_buf_max_slot -----
+
+    #[test]
+    fn empty_ring_max_slot_is_zero() {
+        assert_eq!(ring_buf_max_slot(&empty_buf()), 0);
+    }
+
+    #[test]
+    fn max_slot_tracks_largest_on_chain_slot() {
+        let mut buf = empty_buf();
+        ring_buf_push(
+            &mut buf,
+            OracleSnapshotEntry { p_yes_e6: 420_000, source_timestamp: 100, on_chain_slot: 50 },
+        );
+        ring_buf_push(
+            &mut buf,
+            OracleSnapshotEntry { p_yes_e6: 510_000, source_timestamp: 200, on_chain_slot: 150 },
+        );
+        assert_eq!(ring_buf_max_slot(&buf), 150);
+    }
+
+    #[test]
+    fn max_slot_independent_of_timestamp_ordering() {
+        // A (defensive) ring whose newest-timestamp entry is NOT its
+        // newest-slot entry: max_slot must report the true slot frontier,
+        // not the slot of ring_buf_last. This is the one-push-per-slot
+        // gate's safety property — a same-slot burst cannot slip past by
+        // hiding behind a lower-slot/higher-timestamp entry.
+        let mut buf = empty_buf();
+        buf[0] = OracleSnapshotEntry { p_yes_e6: 400_000, source_timestamp: 200, on_chain_slot: 5 };
+        buf[1] = OracleSnapshotEntry { p_yes_e6: 600_000, source_timestamp: 100, on_chain_slot: 10 };
+        // ring_buf_last keys on timestamp -> entry at slot 5; max_slot must still be 10.
+        assert_eq!(ring_buf_last(&buf).unwrap().on_chain_slot, 5);
+        assert_eq!(ring_buf_max_slot(&buf), 10);
     }
 
     // ----- ring_buf_push -----
