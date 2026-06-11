@@ -10703,17 +10703,32 @@ pub mod processor {
             let dust_before = state::read_dust_base(&data);
             let unit_scale = config.unit_scale;
 
-            let engine = zc::engine_mut(&mut data)?;
-
             // Resolved crank: no per-account settlement loop.
             // Accounts are settled by ForceCloseResolved / CloseAccount.
 
-            // Sweep dust to insurance fund.
-            // On resolved markets, also forgive sub-scale remainder
-            // (worth < 1 engine unit, no engine accounting entry).
+            // Dust handling at resolved time.
+            //
+            // kind=0/1: route accumulated whole-unit dust to the insurance
+            // fund (legacy behaviour), then forgive the sub-scale remainder.
+            //
+            // kind=2 (Polymarket-perp): forgive ALL dust without the insurance
+            // top-up. `top_up_insurance_fund` is a Live-only engine operation
+            // (it runs the accrual-envelope checks and rejects
+            // `market_mode != Live`), so on a resolved market it returns
+            // Unauthorized and reverts the whole crank. Routing whole-unit dust
+            // through it here would make every resolved kind=2 crank that
+            // carries >= 1 unit of dust revert, leaving dust_base non-zero
+            // forever and permanently blocking CloseSlab (which requires
+            // dust_base == 0) — the slab and its rent would be stranded. The
+            // base tokens backing the dust stay in the vault and are swept to
+            // the close destination by CloseSlab, so forgiving the accounting
+            // here loses no value; it just lets a resolved kind=2 market be
+            // closed. The engine borrow is taken only on the kind=0/1 path so
+            // the kind=2 path touches no engine state.
             let forgive_dust = if unit_scale > 0 {
                 let scale = unit_scale as u64;
-                if dust_before >= scale {
+                if dust_before >= scale && config.market_kind != 2 {
+                    let engine = zc::engine_mut(&mut data)?;
                     let units_to_sweep = dust_before / scale;
                     engine.top_up_insurance_fund(
                         units_to_sweep as u128, frozen_slot,
