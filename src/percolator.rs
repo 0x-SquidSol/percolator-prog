@@ -7742,11 +7742,24 @@ pub mod processor {
                     return false;
                 }
                 let account = &engine.accounts[idx];
-                let notional_closed = percolator::wide_math::mul_div_floor_u128(
-                    q_close_q,
-                    price as u128,
-                    percolator::POS_SCALE,
-                );
+                // Side-aware liquidation-fee notional. Call the engine's own
+                // `liq_notional_from_close` (the single funnel the actual
+                // liquidation execution uses) rather than the symmetric
+                // `q*price/POS_SCALE`. For kind=2 (Polymarket-perp) a short
+                // close pays (POS_SCALE-p)*q and a long close pays p*q; the
+                // symmetric form diverged from execution by up to ~19x at the
+                // edge, making this pre-flight reject (or wrongly admit) kind=2
+                // partial liquidations the engine would handle differently.
+                // kind=0/1 reduce to the identical symmetric expression, so
+                // legacy behaviour is byte-unchanged. `eff != 0` is guaranteed
+                // by the `q_close_q >= abs_eff` bounds check above.
+                let close_side = if eff < 0 {
+                    percolator::Side::Short
+                } else {
+                    percolator::Side::Long
+                };
+                let notional_closed =
+                    engine.liq_notional_from_close(q_close_q, close_side, price);
                 let liq_fee_raw = percolator::wide_math::mul_div_ceil_u128(
                     notional_closed,
                     engine.params.liquidation_fee_bps as u128,
@@ -7779,11 +7792,18 @@ pub mod processor {
                 };
 
                 let rem_eff = abs_eff - q_close_q;
-                let rem_notional = percolator::wide_math::mul_div_ceil_u128(
-                    rem_eff,
-                    price as u128,
-                    percolator::POS_SCALE,
-                );
+                // Post-partial maintenance-margin notional, side-aware via the
+                // engine's `risk_notional_from_eff_q` (the funnel the actual
+                // MM check uses). The remaining position keeps `eff`'s sign
+                // (a partial close reduces magnitude, preserves side), so
+                // reconstruct the signed remainder for the side-aware ceil.
+                // kind=0/1 reduce to the prior symmetric expression.
+                let rem_eff_signed: i128 = if eff < 0 {
+                    -(rem_eff as i128)
+                } else {
+                    rem_eff as i128
+                };
+                let rem_notional = engine.risk_notional_from_eff_q(rem_eff_signed, price);
                 let proportional = percolator::wide_math::mul_div_floor_u128(
                     rem_notional,
                     engine.params.maintenance_margin_bps as u128,
