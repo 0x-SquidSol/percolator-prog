@@ -64,8 +64,13 @@ pub const SLAB_LEN: usize = 96_760;
 #[cfg(all(feature = "small", not(feature = "medium")))]
 pub const MAX_ACCOUNTS: usize = 256;
 
+// V13 catch-up: the prediction/Polymarket MarketConfig extension grew the
+// large-tier slab by +1712 (program now logs 0x1ad020 = 1_757_216 as its
+// SLAB_LEN vs the prior hardcoded 1_755_504). The strict-equality
+// `data.len() == SLAB_LEN` check in `slab_shape_ok` rejected every
+// `init_market` with Custom(4) = InvalidSlabLen until this mirror was bumped.
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-pub const SLAB_LEN: usize = 1_755_504;
+pub const SLAB_LEN: usize = 1_757_216;
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
