@@ -4213,6 +4213,22 @@ pub mod state {
         c
     }
 
+    /// Heap-allocated variant of [`read_config`]. Returns the 2176-byte
+    /// `MarketConfig` in a `Box` so it never lands on the caller's stack.
+    /// Instruction handlers that run near the SBF 4 KB stack-frame limit MUST
+    /// use this instead of `read_config`; a stack-resident config there pushes
+    /// the frame past the limit, and the SBF linker's resulting
+    /// frame-overwrite UB silently corrupts other locals. The returned bytes
+    /// are identical to `read_config` — only the storage location differs, so
+    /// `*boxed` / field access / `&boxed` (deref-coerced to `&MarketConfig`)
+    /// all behave exactly as before.
+    pub fn read_config_boxed(data: &[u8]) -> alloc::boxed::Box<MarketConfig> {
+        let mut c = bytemuck::zeroed_box::<MarketConfig>();
+        let src = &data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
+        bytemuck::bytes_of_mut(&mut *c).copy_from_slice(src);
+        c
+    }
+
     pub fn write_config(data: &mut [u8], c: &MarketConfig) {
         let src = bytemuck::bytes_of(c);
         let dst = &mut data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
@@ -4279,6 +4295,44 @@ pub mod state {
             return;
         }
         data[off..off + 8].copy_from_slice(&gen.to_le_bytes());
+    }
+
+    #[cfg(test)]
+    mod config_roundtrip {
+        use super::*;
+        use core::mem::offset_of;
+
+        // Regression guard for the SBF stack-overflow bug that corrupted
+        // `vault_authority_bump`. InitMarket built the 2176-byte MarketConfig
+        // as a stack temporary, overflowing the SBF 4 KB frame; the resulting
+        // frame-overwrite UB clobbered the stored bump with an adjacent stack
+        // slot (max_staleness's low byte, 300 & 0xFF = 44), so every market's
+        // vault PDA was unrecoverable. The fix builds the config on the heap.
+        // These asserts pin the layout and the read/write/boxed round-trips
+        // the fix depends on; the absence of the SBF "stack offset exceeded"
+        // linker warning is the build-time half of the guard.
+        #[test]
+        fn vault_bump_roundtrips_losslessly() {
+            // Layout pins shared by the wrapper and every external reader.
+            assert_eq!(offset_of!(MarketConfig, vault_authority_bump), 106);
+            assert_eq!(HEADER_LEN, 136);
+            assert_eq!(core::mem::size_of::<MarketConfig>(), CONFIG_LEN);
+
+            let mut cfg = MarketConfig::zeroed();
+            cfg.max_staleness_secs = 300; // low byte 0x2C = 44 (the historic clobber value)
+            cfg.conf_filter_bps = 500;
+            cfg.vault_authority_bump = 254;
+
+            let mut buf = [0u8; HEADER_LEN + CONFIG_LEN];
+            write_config(&mut buf, &cfg);
+
+            // Stack read and heap (boxed) read must agree and preserve the bump.
+            assert_eq!(read_config(&buf).vault_authority_bump, 254);
+            assert_eq!(read_config_boxed(&buf).vault_authority_bump, 254);
+            // The raw byte at the bump offset is the bump — never max_staleness's low byte.
+            assert_eq!(buf[HEADER_LEN + 106], 254);
+            assert_ne!(buf[HEADER_LEN + 106], 44);
+        }
     }
 }
 
@@ -9962,143 +10016,79 @@ pub mod processor {
                 .unwrap_or(0)
         };
 
-        let config = MarketConfig {
-            collateral_mint: a_mint.key.to_bytes(),
-            vault_pubkey: a_vault.key.to_bytes(),
-            index_feed_id,
-            max_staleness_secs,
-            conf_filter_bps,
-            vault_authority_bump: bump,
-            invert,
-            unit_scale,
-            // Funding parameters (custom overrides or defaults)
-            funding_horizon_slots: custom_funding_horizon.unwrap_or(DEFAULT_FUNDING_HORIZON_SLOTS),
-            funding_k_bps: custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS),
-            funding_max_premium_bps: custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS),
-            funding_max_e9_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_E9_PER_SLOT),
-            // ML8: oracle_authority/authority_price/authority_timestamp REMOVED
-            // by upstream's 4-way authority split. Hyperp mark is now stored in
-            // hyperp_mark_e6 (set by PushHyperpMark on tag 16/17 retired path).
-            hyperp_authority: [0u8; 32],
-            hyperp_mark_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-            // PORT-23 Hunk 9: seed publish_time from the InitMarket oracle
-            // read so subsequent reads can't rewind below genesis.
-            last_oracle_publish_time: init_publish_time,
-            // Oracle price circuit breaker
-            // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
-            // Default: disabled for non-Hyperp, 1% per slot for Hyperp
-            oracle_price_cap_e2bps: if is_hyperp {
-                DEFAULT_HYPERP_PRICE_CAP_E2BPS.max(min_oracle_price_cap_e2bps)
-            } else {
-                // Non-Hyperp: start at the immutable floor so the circuit
-                // breaker is active from genesis. 0 floor = no breaker.
-                min_oracle_price_cap_e2bps
-            },
-            last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-            // Per-market admin limits (immutable after init)
-            // ML8: max_insurance_floor field removed.
-            min_oracle_price_cap_e2bps,
-            // Insurance withdrawal limits (immutable after init)
-            insurance_withdraw_max_bps,
-            // ML8: tvl_insurance_cap_mult claimed 2 bytes of the former 6-byte
-            // padding. Default 0 = check disabled.
-            tvl_insurance_cap_mult: 0,
-            // Wave 12-F: deposit-only mode flag decoded from high bit of
-            // wire-format insurance_withdraw_max_bps.
-            insurance_withdraw_deposits_only: insurance_withdraw_deposits_only as u8,
-            _iw_padding: [0u8; 3],
-            insurance_withdraw_cooldown_slots,
-            last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
-            // Hyperp: stamp init slot so stale check works from genesis.
-            // Non-Hyperp: 0 (no mark push concept).
-            last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
-            last_insurance_withdraw_slot: 0,
-            // Wave 12-F: top-up budget starts at 0 (no deposits yet).
-            // Incremented by TopUpInsurance handler (tag 9); decremented by
-            // WithdrawInsuranceLimited (tag 23) when deposits-only mode is on.
-            insurance_withdraw_deposit_remaining: 0,
-            // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
-            mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-            mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
-            mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
-            // ML8: _ewma_padding repurposed to init_restart_slot (SIMD-0047
-            // cluster-restart detection). Capture the current cluster
-            // LastRestartSlot so newly created markets do not see historical
-            // restarts as post-init oracle death.
-            init_restart_slot,
-            permissionless_resolve_stale_slots,
-            // Init to clock.slot so permissionless resolution timer starts
-            // from market creation, not slot 0 (prevents immediate resolution
-            // if the oracle happens to be down during market creation).
-            last_good_oracle_slot: clock.slot,
-            maintenance_fee_per_slot,
-            fee_sweep_cursor_word: 0,
-            fee_sweep_cursor_bit: 0,
-            mark_min_fee,
-            force_close_delay_slots,
-            // DEX pool pinning: initialized to all-zeros (not set).
-            // Admin must call SetDexPool (tag 74) for HYPERP markets.
-            dex_pool: [0u8; 32],
-
-            // New config fields (pre-audit hygiene Phase A, 2026-04-17).
-            // All default to 0 (disabled) at init. Admin activates each via
-            // dedicated setter instructions (Phase B): SetMaxPnlCap,
-            // SetDisputeParams, SetLpCollateralParams, SetOiCapMultiplier.
-            max_pnl_cap: 0,
-            last_audit_pause_slot: 0,
-            oi_cap_multiplier_bps: 0,
-            dispute_window_slots: 0,
-            dispute_bond_amount: 0,
-            lp_collateral_enabled: 0,
-            _lp_collateral_pad0: 0,
-            lp_collateral_ltv_bps: 0,
-            _new_fields_pad: [0u8; 4],
-            // Two-step admin transfer (Phase E, 2026-04-17).
-            // No transfer pending at market creation.
-            pending_admin: [0u8; 32],
-            // Prediction-market extension (V13 layout). InitMarket creates
-            // legacy perp markets: every field below defaults to zero so
-            // `market_kind == 0` reads as Perp and the prediction-specific
-            // handlers do nothing on this slab. New prediction-market
-            // launches go through InitPredictionMarket (separate handler).
-            market_kind: 0,
-            _pad_kind: [0u8; 7],
-            resolution_oracle: [0u8; 32],
-            resolution_open_unix: 0,
-            resolution_deadline_unix: 0,
-            creator_bond_lamports: 0,
-            resolution_outcome: 0,
-            _pad_outcome: [0u8; 7],
-            resolution_outcome_pending: 0,
-            _pad_outcome_pending: [0u8; 7],
-            ratification_deadline_unix: 0,
-            _pad_v13_tail: [0u8; 8],
-            // Polymarket-perp extension. InitMarket creates legacy perp
-            // markets: every field below defaults to zero so the oracle
-            // adapter sees an unbound slab and the matcher continues to
-            // read the legacy oracle source. Polymarket-bound prediction
-            // markets are initialised via `LinkPolymarketMarket` (tag 40)
-            // which populates these fields after the perp slab exists.
-            polymarket_condition_id: [0u8; 32],
-            oracle_source: 0,
-            _pad_oracle_source: [0u8; 7],
-            oracle_ring_buf: [state::OracleSnapshotEntry {
-                p_yes_e6: 0,
-                source_timestamp: 0,
-                on_chain_slot: 0,
-            }; 60],
-            _pad_polymarket_tail: [0u8; 8],
-            pyth_threshold_e6: 0,
-            pyth_scale_bps_per_pct: 0,
-            value_deviation_bps: 0,
-            _pad_value_anchoring: [0u8; 2],
-            force_close_unix_timestamp: 0,
-            forced_close_price_e6: 0,
-            council_authority: [0u8; 32],
-            metadata_uri_hash: [0u8; 32],
-            linked_at_slot: 0,
-            _pad_governance: [0u8; 8],
+        // Build MarketConfig on the HEAP, not as a stack struct literal. The
+        // literal is 2176 bytes; materializing it in this handler's frame
+        // pushed handle_init_market past the SBF 4 KB stack limit, and the
+        // resulting frame-overwrite UB silently clobbered locals — notably
+        // `bump`, which on-chain became max_staleness's low byte instead of
+        // the canonical vault-authority bump, bricking every market's vault
+        // PDA. `zeroed_box` allocates pre-zeroed heap, so only the non-zero
+        // fields are assigned below; every field omitted here (all padding,
+        // the all-zero V13 prediction/Polymarket extension, the disabled
+        // governance defaults) is already zero. This is a pure stack->heap
+        // move: the bytes written to the slab are identical to the prior
+        // struct literal. See the engine's `engine_mut` for the same
+        // stack-overflow-avoidance rationale (RiskEngine was given the same
+        // treatment).
+        let mut config = bytemuck::zeroed_box::<MarketConfig>();
+        config.collateral_mint = a_mint.key.to_bytes();
+        config.vault_pubkey = a_vault.key.to_bytes();
+        config.index_feed_id = index_feed_id;
+        config.max_staleness_secs = max_staleness_secs;
+        config.conf_filter_bps = conf_filter_bps;
+        config.vault_authority_bump = bump;
+        config.invert = invert;
+        config.unit_scale = unit_scale;
+        // Funding parameters (custom overrides or defaults)
+        config.funding_horizon_slots = custom_funding_horizon.unwrap_or(DEFAULT_FUNDING_HORIZON_SLOTS);
+        config.funding_k_bps = custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS);
+        config.funding_max_premium_bps = custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS);
+        config.funding_max_e9_per_slot = custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_E9_PER_SLOT);
+        // hyperp_authority stays all-zero (4-way authority split; mark lives in hyperp_mark_e6).
+        config.hyperp_mark_e6 = if is_hyperp { initial_mark_price_e6 } else { 0 };
+        // PORT-23 Hunk 9: seed publish_time from the InitMarket oracle read so
+        // subsequent reads can't rewind below genesis.
+        config.last_oracle_publish_time = init_publish_time;
+        // Oracle price circuit breaker. Hyperp: rate-limited index smoothing +
+        // mark clamp. Non-Hyperp: start at the immutable floor (0 = no breaker).
+        config.oracle_price_cap_e2bps = if is_hyperp {
+            DEFAULT_HYPERP_PRICE_CAP_E2BPS.max(min_oracle_price_cap_e2bps)
+        } else {
+            min_oracle_price_cap_e2bps
         };
+        config.last_effective_price_e6 = if is_hyperp { initial_mark_price_e6 } else { 0 };
+        config.min_oracle_price_cap_e2bps = min_oracle_price_cap_e2bps;
+        config.insurance_withdraw_max_bps = insurance_withdraw_max_bps;
+        // tvl_insurance_cap_mult stays 0 (check disabled).
+        // Wave 12-F: deposit-only mode flag decoded from high bit of
+        // wire-format insurance_withdraw_max_bps.
+        config.insurance_withdraw_deposits_only = insurance_withdraw_deposits_only as u8;
+        config.insurance_withdraw_cooldown_slots = insurance_withdraw_cooldown_slots;
+        config.last_hyperp_index_slot = if is_hyperp { clock.slot } else { 0 };
+        // Hyperp: stamp init slot so stale check works from genesis. Non-Hyperp: 0.
+        config.last_mark_push_slot = if is_hyperp { clock.slot as u128 } else { 0 };
+        // last_insurance_withdraw_slot / insurance_withdraw_deposit_remaining stay 0.
+        // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade.
+        config.mark_ewma_e6 = if is_hyperp { initial_mark_price_e6 } else { 0 };
+        config.mark_ewma_last_slot = if is_hyperp { clock.slot } else { 0 };
+        config.mark_ewma_halflife_slots = DEFAULT_MARK_EWMA_HALFLIFE_SLOTS;
+        // ML8: _ewma_padding repurposed to init_restart_slot (SIMD-0047
+        // cluster-restart detection).
+        config.init_restart_slot = init_restart_slot;
+        config.permissionless_resolve_stale_slots = permissionless_resolve_stale_slots;
+        // Init to clock.slot so the permissionless resolution timer starts from
+        // market creation, not slot 0.
+        config.last_good_oracle_slot = clock.slot;
+        config.maintenance_fee_per_slot = maintenance_fee_per_slot;
+        // fee_sweep_cursor_word / fee_sweep_cursor_bit stay 0.
+        config.mark_min_fee = mark_min_fee;
+        config.force_close_delay_slots = force_close_delay_slots;
+        // dex_pool, the Phase A/E hygiene fields, pending_admin, the V13
+        // prediction extension, and the Polymarket-perp extension all stay
+        // all-zero (covered by zeroed_box) — InitMarket creates a legacy
+        // market_kind==0 perp; LinkPolymarketMarket (tag 40) /
+        // InitPredictionMarket populate the extension fields later.
+
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
             return Err(ProgramError::InvalidInstructionData);
@@ -10689,7 +10679,7 @@ pub mod processor {
         // All resolved operations use engine.current_slot (frozen at
         // last pre-resolution crank) instead of clock.slot.
         if state::is_resolved(&data) {
-            let config = state::read_config(&data);
+            let config = state::read_config_boxed(&data);
             let settlement_price = config.hyperp_mark_e6;
             if settlement_price == 0 {
                 return Err(ProgramError::InvalidAccountData);
@@ -10762,7 +10752,7 @@ pub mod processor {
             return Ok(());
         }
 
-        let mut config = state::read_config(&data);
+        let mut config = state::read_config_boxed(&data);
 
         // Read dust before borrowing engine (for dust sweep later)
         let dust_before = state::read_dust_base(&data);
@@ -11010,7 +11000,7 @@ pub mod processor {
         // handlers use, keeping the post-resolution settlement path consistent
         // across every resolution route.
         if engine_resolved && engine_resolved_price > 0 && !state::is_resolved(&data) {
-            let mut resolved_config = state::read_config(&data);
+            let mut resolved_config = state::read_config_boxed(&data);
             resolved_config.hyperp_mark_e6 = engine_resolved_price;
             state::write_config(&mut data, &resolved_config);
             state::set_resolved(&mut data);
@@ -11349,7 +11339,7 @@ pub mod processor {
                 return Err(ProgramError::InvalidAccountData);
             }
 
-            let config = state::read_config(&*data);
+            let config = state::read_config_boxed(&*data);
 
             // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
             // Nonce advancement via verify helper (Kani-provable)
@@ -11600,7 +11590,7 @@ pub mod processor {
                     engine, &config, clock.slot, price, funding_rate_e9_pre,
                 )?;
             }
-            let pristine = state::read_config(&data);
+            let pristine = state::read_config_boxed(&data);
             // Start from pristine, then re-apply only the legitimately-advanced fields.
             let mut restored = pristine;
             restored.last_good_oracle_slot = config.last_good_oracle_slot;
@@ -12110,7 +12100,7 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        let config = state::read_config(&data);
+        let config = state::read_config_boxed(&data);
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         let auth = accounts::derive_vault_authority_with_bump(
@@ -12149,7 +12139,7 @@ pub mod processor {
         // insurance growth from fees/liquidations never increments it.
         // Saturating add: an overflow here would be ~u64::MAX units of
         // top-ups, which is operationally implausible (~1.8e19 base tokens).
-        let mut config_w = state::read_config(&data);
+        let mut config_w = state::read_config_boxed(&data);
         config_w.insurance_withdraw_deposit_remaining = config_w
             .insurance_withdraw_deposit_remaining
             .saturating_add(units);
@@ -12656,7 +12646,7 @@ pub mod processor {
         let header = state::read_header(&data);
         require_admin(header.admin, a_admin.key)?;
 
-        let mut config = state::read_config(&data);
+        let mut config = state::read_config_boxed(&data);
         // Kind=2 (Polymarket-perp) prices come from the Pyth value-anchoring
         // mapping + deviation guard (SetPythPriceMapping), not from this
         // per-slot move clamp. The clamp is a kind=0/1 lever; mutating it on
@@ -12685,7 +12675,7 @@ pub mod processor {
                 config.last_hyperp_index_slot = clock.slot;
             }
             state::write_config(&mut data, &config);
-            config = state::read_config(&data);
+            config = state::read_config_boxed(&data);
             // Accrue to boundary using engine's already-stored rate.
             let engine = zc::engine_mut(&mut data)?;
             engine.accrue_market_to(
@@ -14341,7 +14331,7 @@ pub mod processor {
         }
         require_not_paused(&slab_data)?;
 
-        let config = state::read_config(&slab_data);
+        let config = state::read_config_boxed(&slab_data);
         let mint = Pubkey::new_from_array(config.collateral_mint);
 
         // Use stored vault_authority_bump (~1500 CU cheaper than find_program_address)
@@ -14380,7 +14370,7 @@ pub mod processor {
         collateral::deposit(a_token, a_depositor_ata, a_vault, a_depositor, amount)?;
 
         let slab_data = a_slab.try_borrow_data()?;
-        let config = state::read_config(&slab_data);
+        let config = state::read_config_boxed(&slab_data);
         let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
         drop(slab_data);
 
@@ -15323,7 +15313,7 @@ pub mod processor {
         let mut slab_data = state::slab_data_mut(a_slab)?;
         slab_guard(program_id, a_slab, &slab_data)?;
         require_initialized(&slab_data)?;
-        let config = state::read_config(&slab_data);
+        let config = state::read_config_boxed(&slab_data);
 
         let engine = zc::engine_mut(&mut slab_data)?;
         check_idx(engine, user_idx)?;
@@ -15368,7 +15358,7 @@ pub mod processor {
         let mut slab_data = state::slab_data_mut(a_slab)?;
         // FIX-3 (CRITICAL-3): re-read config from slab to allow
         // read_price_and_stamp to mutate the borrowed copy.
-        let mut config_w = state::read_config(&slab_data);
+        let mut config_w = state::read_config_boxed(&slab_data);
         let clock = Clock::get()?;
         // FIX-3: read the oracle price for non-Hyperp markets so
         // engine.withdraw_not_atomic's `oracle_price > 0` precondition
@@ -15643,7 +15633,7 @@ pub mod processor {
         let slab_data = a_slab.try_borrow_data()?;
         slab_guard(program_id, a_slab, &slab_data)?;
         require_initialized(&slab_data)?;
-        let config = state::read_config(&slab_data);
+        let config = state::read_config_boxed(&slab_data);
         let mint = Pubkey::new_from_array(config.collateral_mint);
         // Save bump before dropping slab_data (~1500 CU cheaper than find_program_address later)
         let vault_bump = config.vault_authority_bump;
@@ -15693,7 +15683,7 @@ pub mod processor {
         }
 
         let slab_data = a_slab.try_borrow_data()?;
-        let config = state::read_config(&slab_data);
+        let config = state::read_config_boxed(&slab_data);
         // SECURITY(M-8): use units_to_base_checked (matches LpVaultWithdraw).
         // The saturating variant silently clamps to u64::MAX on overflow.
         let base_amount = crate::units::units_to_base_checked(
