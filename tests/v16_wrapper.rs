@@ -15548,12 +15548,20 @@ fn v16_wrapper_close_resolved_pays_positive_pnl_through_engine_ledger() {
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let account = state::read_portfolio(&portfolio.data).unwrap();
+    // The +250 source-backed positive PnL is paid in full: vault and c_tot drain to
+    // 0 and the account is torn down (capital=0, pnl=0). These four asserts are the
+    // real proof that close_resolved PAID the positive PnL.
     assert_eq!(group.vault, 0);
     assert_eq!(group.c_tot, 0);
     assert_eq!(account.capital, 0);
     assert_eq!(account.pnl, 0);
-    assert!(account.resolved_payout_receipt.present);
-    assert!(account.resolved_payout_receipt.finalized);
+    // v17 (historical name notwithstanding): SOURCE-BACKED positive PnL is realized
+    // directly into capital and paid out — it does NOT flow through the resolved
+    // payout receipt/ledger (that path is reserved for non-source-backed junior-pool
+    // PnL that may need proration). So the correct post-condition is NO receipt: the
+    // backing guarantee means the winner is paid in one shot with nothing deferred.
+    assert!(!account.resolved_payout_receipt.present,
+        "source-backed positive PnL pays directly; no resolved_payout_receipt should remain");
 }
 
 #[test]

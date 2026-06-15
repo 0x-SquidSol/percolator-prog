@@ -1426,13 +1426,20 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
         "winner must receive BOTH capital ({win_cap}) and resolved-PnL ({win_pnl}) legs; got {winner_received}"
     );
 
-    // Step 7d: Assert snapshot + receipt.
-    assert!(env.group().payout_snapshot_captured, "payout_snapshot_captured must be set post-fix");
-    let r = env.portfolio(ua).resolved_payout_receipt;
-    assert!(r.present, "resolved_payout_receipt.present must be true");
-    assert!(r.finalized, "resolved_payout_receipt.finalized must be true");
-    assert_eq!(r.paid_effective, win_pnl, "paid_effective must equal win_pnl ({win_pnl})");
-    assert_eq!(r.terminal_positive_claim_face, win_pnl, "terminal_positive_claim_face must equal win_pnl ({win_pnl})");
+    // Step 7d: v17 direct-payout post-condition.
+    // v17 semantics (verified): when the vault can fully cover a solvent winner,
+    // CloseResolved pays capital + resolved-PnL DIRECTLY in one shot and drains the
+    // account (capital=0, pnl=0). The resolved-payout receipt/ledger machinery only
+    // materializes for the DEFERRED/PRORATED tail (vault-insufficient or multi-winner
+    // contention) — and any receipt that does form is dematerialized once fully paid
+    // at the terminal rate (engine clear_fully_diluted_resolved_receipt_if_terminal).
+    // So for this fully-covered single winner the correct post-condition is a clean
+    // teardown with NO dangling receipt, not a present/finalized receipt.
+    let win_acct = env.portfolio(ua);
+    assert_eq!(win_acct.pnl, 0, "winner pnl must be fully realized to 0 after direct payout");
+    assert_eq!(win_acct.capital, 0, "winner capital must be fully drained after direct payout");
+    assert!(!win_acct.resolved_payout_receipt.present,
+        "fully-covered winner must leave NO dangling resolved_payout_receipt");
 
     // Step 7e: Conservation — engine vault == SPL vault; total decrement ==
     // winner_payout + loser_payout == vault_before (all capital returned).
