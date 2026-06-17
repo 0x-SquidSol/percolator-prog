@@ -5917,7 +5917,18 @@ pub mod position_nft {
         pub pending_settlement: u8,
         pub bump: u8,
         pub mint_bump: u8,
-        pub _reserved: [u8; 19],
+        /// Per-account materialization generation (the `mat_counter` value read
+        /// from the slab gen-table at mint time). Binds this NFT to the SPECIFIC
+        /// occupant of `user_idx` it was minted against, so a stale NFT left
+        /// behind after CloseAccount cannot authorize a transfer on the slot once
+        /// it is reused by a different account (which carries a higher
+        /// generation). Stored as raw LE bytes (alignment 1) so the struct stays
+        /// padding-free for `bytemuck::Pod` and the on-disk layout/size is
+        /// unchanged (these 8 bytes were previously the head of `_reserved`,
+        /// always written as zero). `0` == legacy NFT minted before this field
+        /// existed; such NFTs fail the strict transfer check and must be re-minted.
+        pub generation: [u8; 8],
+        pub _reserved: [u8; 11],
     }
 
     const _SIZE_CHECK: [(); 128] = [(); core::mem::size_of::<PositionNftState>()];
@@ -5925,6 +5936,18 @@ pub mod position_nft {
     impl PositionNftState {
         #[inline]
         pub fn is_initialized(&self) -> bool { self.magic == POSITION_NFT_MAGIC }
+
+        /// Materialization generation this NFT was minted against (LE bytes).
+        #[inline]
+        pub fn generation_u64(&self) -> u64 {
+            u64::from_le_bytes(self.generation)
+        }
+
+        /// Stamp the materialization generation at mint time.
+        #[inline]
+        pub fn set_generation(&mut self, gen: u64) {
+            self.generation = gen.to_le_bytes();
+        }
     }
 
     pub fn derive_position_nft(
@@ -15453,6 +15476,15 @@ pub mod processor {
         let entry_price_raw: u64 = 0;
         let pos_size = acct.position_basis_q;
         let direction = if pos_size >= 0 { "LONG" } else { "SHORT" };
+        // SECURITY (stale-NFT slot-reuse takeover): capture the slot's live
+        // materialization generation and bind the NFT to it below. A slot owned
+        // and funded enough to mint was materialized via InitUser/InitLP, which
+        // stamps a nonzero generation; defensively reject a zero (never
+        // materialized) generation rather than mint an unbindable NFT.
+        let mat_generation = state::read_account_generation(&data, user_idx);
+        if mat_generation == 0 {
+            return Err(PercolatorError::EngineAccountNotFound.into());
+        }
         drop(data);
 
         let (expected_nft_pda, nft_bump) =
@@ -15593,7 +15625,8 @@ pub mod processor {
                 pending_settlement: 0,
                 bump: nft_bump,
                 mint_bump,
-                _reserved: [0u8; 19],
+                generation: mat_generation.to_le_bytes(),
+                _reserved: [0u8; 11],
             };
             crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
         }
@@ -15637,10 +15670,11 @@ pub mod processor {
         slab_guard(program_id, a_slab, &slab_data)?;
         require_initialized(&slab_data)?;
 
-        {
+        let live_generation = {
             let engine = zc::engine_ref(&slab_data)?;
             check_idx(engine, user_idx)?;
-        }
+            state::read_account_generation(&slab_data, user_idx)
+        };
 
         let (expected_nft_pda, _) =
             crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
@@ -15656,6 +15690,24 @@ pub mod processor {
         };
 
         if nft_state.owner != a_current_owner.key.to_bytes() {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        // SECURITY (stale-NFT slot-reuse takeover): the NFT must have been minted
+        // against the CURRENT occupant of this slot. A stale NFT from a prior
+        // occupant (slot freed by CloseAccount, then reused by InitUser) carries
+        // that occupant's materialization generation, which differs from the live
+        // generation — reject it before touching engine ownership. Legacy NFTs
+        // (generation 0, minted before this binding existed) also fail this strict
+        // check and must be re-minted. This is the gate that closes the takeover:
+        // the `nft_state.owner` check above is satisfiable by an attacker who
+        // self-minted on their own prior occupancy of the reused slot.
+        if nft_state.generation_u64() != live_generation {
+            msg!(
+                "PERC-608: stale position-NFT generation {} != live {} — refusing transfer",
+                nft_state.generation_u64(),
+                live_generation,
+            );
             return Err(PercolatorError::EngineUnauthorized.into());
         }
 
