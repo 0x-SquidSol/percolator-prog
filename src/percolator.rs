@@ -8761,6 +8761,27 @@ pub mod processor {
         if (mark_min_fee as u128) > percolator::MAX_PROTOCOL_FEE_ABS {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
+        // F2 (SF HIGH): Hyperp liveness floor. For a Hyperp market with the
+        // permissionless exit enabled, `last_mark_push_slot` is the ONLY
+        // hard-timeout liveness signal (oracle::permissionless_stale_matured).
+        // It is advanced by the full-weight trade gate, and when mark_min_fee == 0
+        // that gate (`mark_min_fee == 0 || fee_paid >= mark_min_fee`) is
+        // unconditionally satisfied — so a permissionless attacker running their
+        // own LP + matcher can refresh the slot with cheap self-trades every block
+        // and permanently block ResolvePermissionless, the terminal user exit after
+        // the mark authority is burned. Require a nonzero fee floor so sub-threshold
+        // self-trades can no longer keep the market alive.
+        //
+        // Scope is exactly Hyperp AND perm-resolve-enabled: non-Hyperp markets key
+        // liveness on `last_good_oracle_slot` (oracle-driven, not trade-driven), and
+        // admin-resolve-only Hyperp markets (permissionless_resolve_stale_slots == 0)
+        // have no permissionless gate to spoof — both may keep mark_min_fee == 0.
+        // `mark_min_fee` and `permissionless_resolve_stale_slots` are set-once at
+        // InitMarket (neither is mutable via UpdateConfig or any Set* handler), so
+        // this is the only gate required — there is no post-init re-open path.
+        if is_hyperp && permissionless_resolve_stale_slots > 0 && mark_min_fee == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
 
         #[cfg(debug_assertions)]
         {
