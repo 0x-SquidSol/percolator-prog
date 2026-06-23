@@ -6619,7 +6619,11 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR the signer holds the bound NFT (escrowed position).
+            // Optional trailing accounts [6]=nft_registry [7]=PositionNft PDA [8]=signer NFT ATA.
+            // Lets an NFT holder margin-defend a wrapped position (#146).
+            let nft = optional_nft_holder_accounts(accounts, 6);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             group
                 .deposit_not_atomic(&mut portfolio, amount)
                 .map_err(map_v16_error)?;
@@ -6679,7 +6683,12 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT. Optional trailing
+            // accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
+            // FUND-SAFETY: the dest-token check uses `owner.key` (the SIGNER), so an
+            // NFT-holder withdrawal pays the HOLDER, never the escrow PDA.
+            let nft = optional_nft_holder_accounts(accounts, 7);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             group
                 .withdraw_not_atomic(&mut portfolio, amount)
                 .map_err(map_v16_error)?;
@@ -7495,9 +7504,18 @@ pub mod processor {
         {
             return Err(PercolatorError::EngineProvenanceMismatch.into());
         }
-        if account_a_owner != signer_a.key.to_bytes() {
-            return Err(PercolatorError::Unauthorized.into());
-        }
+        // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
+        // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
+        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
+        let nft = optional_nft_holder_accounts(accounts, 7);
+        authorize_owner_or_nft_holder_raw(
+            &account_a_owner,
+            account_a_ai.key,
+            &account_a_header.market_group_id,
+            signer_a.key,
+            nft,
+            program_id,
+        )?;
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -7771,9 +7789,18 @@ pub mod processor {
         {
             return Err(PercolatorError::EngineProvenanceMismatch.into());
         }
-        if account_a_owner != signer_a.key.to_bytes() {
-            return Err(PercolatorError::Unauthorized.into());
-        }
+        // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
+        // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
+        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
+        let nft = optional_nft_holder_accounts(accounts, 7);
+        authorize_owner_or_nft_holder_raw(
+            &account_a_owner,
+            account_a_ai.key,
+            &account_a_header.market_group_id,
+            signer_a.key,
+            nft,
+            program_id,
+        )?;
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -9239,7 +9266,9 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 6.
+            let nft = optional_nft_holder_accounts(accounts, 6);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             group
                 .cure_and_cancel_close_not_atomic(&mut portfolio, optional_deposit)
                 .map_err(map_v16_error)?;
@@ -11016,7 +11045,9 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
+            let nft = optional_nft_holder_accounts(accounts, 7);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             if group.header.mode != 1 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -11104,7 +11135,9 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
+            let nft = optional_nft_holder_accounts(accounts, 7);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             let payout = group
                 .claim_resolved_payout_topup_not_atomic(&mut portfolio)
                 .map_err(map_v16_error)?;
@@ -13337,6 +13370,237 @@ pub mod processor {
         Ok(())
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // E2 — native NFT-holder authorization
+    //
+    // Under #105 escrow-at-mint a wrapped position's `portfolio.owner` is the NFT
+    // program's mint-authority PDA, so the plain `owner == signer` check freezes
+    // it (issue #146: undefendable). E2 adds an alternative auth path: the CURRENT
+    // HOLDER of the bound NFT may operate the position directly. Control then
+    // follows the token automatically on transfer (no per-transfer CPI — dissolves
+    // #141/#145), and the holder can margin-defend while wrapped (dissolves #146).
+    //
+    // Binding storage = Option (b): the wrapper cross-reads the NFT program's
+    // PositionNftV16 PDA (no portfolio-struct growth) to learn the bound mint, then
+    // checks the signer holds it. The PositionNftV16 byte offsets below are PINNED
+    // to ~/v17/percolator-nft/src/state_v16.rs (repr(C), align 1, total 199 bytes,
+    // enforced by that crate's `POSITION_NFT_V16_LEN == 199` assert). Any layout
+    // change there MUST update these.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// PositionNftV16 field offsets (repr(C), align 1) — pinned to percolator-nft.
+    const NFT_PDA_OFF_PORTFOLIO_ACCOUNT: usize = 10; // [10..42]
+    const NFT_PDA_OFF_NFT_MINT: usize = 42; // [42..74]
+    const NFT_PDA_OFF_MARKET_ID_AT_MINT: usize = 111; // [111..119]
+    const NFT_PDA_MIN_LEN: usize = 199;
+    /// PositionNft PDA seed (percolator-nft `POSITION_NFT_SEED`).
+    const NFT_POSITION_SEED: &[u8] = b"position_nft";
+
+    /// Token-2022 program id. Position NFT mints are Token-2022, so a holder's NFT
+    /// token account is owned by THIS program (not classic `spl_token::ID`).
+    const TOKEN_2022_PROGRAM_ID: Pubkey =
+        solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+    /// Read (mint, owner, amount, initialized) from an SPL OR Token-2022 token
+    /// account's base layout (identical first 165 bytes; Token-2022 extensions
+    /// follow). The classic-only `unpack_token_account` (requires owner ==
+    /// spl_token::ID) cannot read a Token-2022 NFT ATA, so E2 uses this for the
+    /// NFT-holder token account.
+    fn read_nft_holder_token_account(
+        ai: &AccountInfo,
+    ) -> Result<([u8; 32], [u8; 32], u64, bool), ProgramError> {
+        if ai.owner != &spl_token::ID && ai.owner != &TOKEN_2022_PROGRAM_ID {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
+        let data = ai.try_borrow_data()?;
+        if data.len() < spl_token::state::Account::LEN {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
+        let mut mint = [0u8; 32];
+        mint.copy_from_slice(&data[0..32]);
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&data[32..64]);
+        let amount = u64::from_le_bytes(data[64..72].try_into().unwrap());
+        // SPL/Token-2022 base layout: AccountState byte at offset 108; 1 == Initialized.
+        let initialized = data[108] == 1;
+        Ok((mint, owner, amount, initialized))
+    }
+
+    /// The three trailing accounts a caller supplies to take the NFT-holder auth
+    /// path. Omitted (None) for the normal `owner == signer` path.
+    struct NftHolderAccounts<'a, 'info> {
+        /// Per-market NftRegistry PDA `["nft_registry", market_group]` (this program).
+        registry: &'a AccountInfo<'info>,
+        /// The PositionNft PDA `["position_nft", portfolio, market_id_le]` (NFT program).
+        nft_account: &'a AccountInfo<'info>,
+        /// The signer's SPL token account holding the bound NFT (amount == 1).
+        signer_ata: &'a AccountInfo<'info>,
+    }
+
+    /// Authorize an owner-gated portfolio mutation by EITHER `owner == signer`
+    /// (normal, zero-overhead) OR — for an NFT-escrowed portfolio — proof that the
+    /// signer holds the bound NFT. Fund-safety: callers route funds to `signer`
+    /// (the holder), never to `portfolio.owner` (the escrow PDA); see handle_withdraw.
+    /// View-based wrapper around the scalar core (used by all chokepoint handlers).
+    fn authorize_owner_or_nft_holder(
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        portfolio_key: &Pubkey,
+        signer: &Pubkey,
+        nft: Option<NftHolderAccounts<'_, '_>>,
+        program_id: &Pubkey,
+    ) -> Result<(), ProgramError> {
+        authorize_owner_or_nft_holder_raw(
+            &portfolio.header.owner,
+            portfolio_key,
+            &portfolio.header.provenance_header.market_group_id,
+            signer,
+            nft,
+            program_id,
+        )
+    }
+
+    /// Scalar core — works before a full engine view exists (e.g. the TradeCpi
+    /// preflight, which reads `(owner, market_group)` via read_portfolio_owner_preflight).
+    fn authorize_owner_or_nft_holder_raw(
+        portfolio_owner: &[u8; 32],
+        portfolio_key: &Pubkey,
+        market_group: &[u8; 32],
+        signer: &Pubkey,
+        nft: Option<NftHolderAccounts<'_, '_>>,
+        program_id: &Pubkey,
+    ) -> Result<(), ProgramError> {
+        // ── Normal path: signer IS the portfolio owner. ──
+        if *portfolio_owner == signer.to_bytes() {
+            return Ok(());
+        }
+
+        // ── NFT-holder path: requires the trailing accounts. ──
+        let nft = nft.ok_or(PercolatorError::Unauthorized)?;
+
+        // (1) Validate the per-market registry account and read the trusted NFT program.
+        let market_group = Pubkey::new_from_array(*market_group);
+        let (expected_registry, _) = state::derive_nft_registry(program_id, &market_group);
+        expect_key(nft.registry, &expected_registry)?;
+        expect_owner(nft.registry, program_id)?;
+        let registry = state::read_nft_registry(&nft.registry.try_borrow_data()?)
+            .map_err(|_| PercolatorError::NftRegistryNotFound)?;
+        let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
+
+        // After the registry trust-root is validated above, `nft_program_id` is
+        // trusted. The remaining checks are gathered as explicit gate values and
+        // fed to the PURE decision `nft_holder_auth_decision` (Kani-proven: every
+        // gate load-bearing + accept reachable — see tests/v16_kani.rs). I/O here;
+        // the AUTHORIZATION VERDICT lives entirely in that pure function.
+        let (expected_mint_auth, _) = state::derive_nft_mint_authority(&nft_program_id);
+
+        // (2) PositionNft PDA — must be NFT-program-owned (so its bytes are
+        //     trustworthy). Read its bound portfolio + mint + market_id.
+        let pda_owner_is_nft_program = nft.nft_account.owner == &nft_program_id;
+        let (pda_portfolio_account, bound_mint, market_id) = {
+            let data = nft.nft_account.try_borrow_data()?;
+            if data.len() < NFT_PDA_MIN_LEN {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            let mut pa = [0u8; 32];
+            pa.copy_from_slice(&data[NFT_PDA_OFF_PORTFOLIO_ACCOUNT..NFT_PDA_OFF_PORTFOLIO_ACCOUNT + 32]);
+            let mut mint = [0u8; 32];
+            mint.copy_from_slice(&data[NFT_PDA_OFF_NFT_MINT..NFT_PDA_OFF_NFT_MINT + 32]);
+            let mut mid = [0u8; 8];
+            mid.copy_from_slice(&data[NFT_PDA_OFF_MARKET_ID_AT_MINT..NFT_PDA_OFF_MARKET_ID_AT_MINT + 8]);
+            (pa, mint, u64::from_le_bytes(mid))
+        };
+        // (3) Canonical PDA for that market_id under the trusted NFT program.
+        let (expected_nft_pda, _) = Pubkey::find_program_address(
+            &[NFT_POSITION_SEED, portfolio_key.as_ref(), &market_id.to_le_bytes()],
+            &nft_program_id,
+        );
+        let pda_is_canonical = nft.nft_account.key == &expected_nft_pda;
+
+        // (4) The signer's token account for the bound NFT. The Position NFT mint
+        //     is a Token-2022 mint, so its ATA is owned by the TOKEN-2022 program —
+        //     the classic-only `unpack_token_account` (requires owner == spl_token::ID)
+        //     would reject EVERY real holder. Read the base (mint, owner, amount,
+        //     init) accepting either SPL or Token-2022 (both share the 165-byte base
+        //     layout; Token-2022 extensions follow).
+        let (ata_mint, ata_owner, ata_amount, ata_initialized) =
+            read_nft_holder_token_account(nft.signer_ata)?;
+
+        // ── Verdict (pure, Kani-proven) ──
+        let authorized = nft_holder_auth_decision(
+            *portfolio_owner,
+            expected_mint_auth.to_bytes(),
+            pda_owner_is_nft_program,
+            pda_portfolio_account,
+            portfolio_key.to_bytes(),
+            pda_is_canonical,
+            bound_mint,
+            ata_mint,
+            signer.to_bytes(),
+            ata_owner,
+            ata_amount,
+            ata_initialized,
+        );
+        if authorized {
+            Ok(())
+        } else {
+            Err(PercolatorError::Unauthorized.into())
+        }
+    }
+
+    /// PURE NFT-holder authorization verdict (no I/O) — the load-bearing fund-safety
+    /// gate, isolated so Kani can prove it exhaustively. Returns true iff the signer
+    /// genuinely holds the bound NFT of a portfolio escrowed under this NFT program:
+    /// the portfolio is owned by the program's mint-authority PDA; the PositionNft
+    /// PDA is NFT-program-owned, binds THIS portfolio, and is its canonical address;
+    /// and the signer's token account holds exactly one unit of the bound mint.
+    /// EVERY conjunct is proven load-bearing (flipping any one → false) and the
+    /// accept path is proven reachable in tests/v16_kani.rs (anti-vacuity).
+    pub fn nft_holder_auth_decision(
+        portfolio_owner: [u8; 32],
+        expected_mint_auth: [u8; 32],
+        pda_owner_is_nft_program: bool,
+        pda_portfolio_account: [u8; 32],
+        portfolio_key: [u8; 32],
+        pda_is_canonical: bool,
+        bound_mint: [u8; 32],
+        ata_mint: [u8; 32],
+        signer: [u8; 32],
+        ata_owner: [u8; 32],
+        ata_amount: u64,
+        ata_initialized: bool,
+    ) -> bool {
+        portfolio_owner == expected_mint_auth      // escrowed under THIS NFT program
+            && pda_owner_is_nft_program            // PositionNft PDA is genuine
+            && pda_portfolio_account == portfolio_key // it binds THIS portfolio
+            && pda_is_canonical                    // and is the canonical PDA
+            && ata_mint == bound_mint              // token is the BOUND mint
+            && ata_owner == signer                 // signer owns the token account
+            && ata_amount == 1                     // holds exactly one
+            && ata_initialized
+    }
+
+    /// Build the optional NFT-holder auth accounts from a handler's account slice,
+    /// expecting the trio `[base]=registry, [base+1]=PositionNft PDA, [base+2]=signer
+    /// NFT ATA`. Returns None (normal owner==signer path) when fewer than 3 trailing
+    /// accounts are present, so non-escrowed callers pass exactly their usual accounts.
+    fn optional_nft_holder_accounts<'a, 'info>(
+        accounts: &'a [AccountInfo<'info>],
+        base: usize,
+    ) -> Option<NftHolderAccounts<'a, 'info>> {
+        match (
+            accounts.get(base),
+            accounts.get(base + 1),
+            accounts.get(base + 2),
+        ) {
+            (Some(registry), Some(nft_account), Some(signer_ata)) => Some(NftHolderAccounts {
+                registry,
+                nft_account,
+                signer_ata,
+            }),
+            _ => None,
+        }
+    }
+
     fn expect_portfolio_view_account_key(
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
         key: &Pubkey,
@@ -13521,7 +13785,9 @@ pub mod processor {
             state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
         expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
         if owner_must_sign {
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 3.
+            let nft = optional_nft_holder_accounts(accounts, 3);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
         }
         f(&mut group, &mut portfolio, &cfg).map_err(map_v16_error)?;
         group.validate_shape().map_err(map_v16_error)?;
