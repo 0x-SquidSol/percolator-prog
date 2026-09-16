@@ -5051,7 +5051,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 2,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut short_owner, &mut market, &mut short_account],
     )
@@ -5566,7 +5566,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 1,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut short_owner, &mut market, &mut short_account],
     )
@@ -5887,7 +5887,7 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     let forfeit_stale = run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: last_asset,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut long_owner, &mut market, &mut long_account],
     );
@@ -15823,7 +15823,7 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
     let unauthorized = run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 0,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut attacker, &mut market, &mut long_account],
     );
@@ -15833,7 +15833,7 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
     run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 0,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut long_owner, &mut market, &mut long_account],
     )
@@ -22369,5 +22369,3216 @@ fn b4_batch_guard_site_enumeration() {
         src.matches("if reconstructed_total != engine_total {").count(),
         1,
         "the reconstructed-total cross-check is untouched"
+    );
+}
+
+// ===========================================================================
+// VERIFY-LOOP PoC BLOCK -- C-W-04
+// "tag 43 ForfeitRecoveryLeg with a budget that principal + insurance cannot
+//  cover reaches ForfeitResidualStepV16::CommitRecovery, flips the MARKET mode
+//  to Recovery and returns Ok."
+//
+// Appended to tests/v16_wrapper.rs in a throwaway percolator-prog worktree at
+// origin/main (480e23a0) whose `percolator` path dep points at an engine
+// worktree at 2c38570a (candidate) / at e8acd708 x 9483ee90 (deployed).
+// The file's own fixture helpers are reused verbatim.
+//
+// THE STATE UNDER TEST (2c38570a:src/v16.rs:8489-8503, source-verified):
+//   "a Recovery asset whose OPPOSITE side has already completed terminal
+//    wind-down holds a real position on one side and nothing on the other,
+//    with both obligation counts at 0 -- the very state
+//    forfeit_recovery_leg_not_atomic's CommitRecovery arm exists for."
+// The MARKET stays Live throughout; only the ASSET lifecycle is Recovery, which
+// is what `leg_is_dead_for_forfeit` (:21134-21145) accepts.
+// ===========================================================================
+
+/// 10e21 B-index units of LONG-domain social loss already booked against the
+/// asset while this leg's own `b_snap` is still 0.
+const CW04_DEBT_B: u128 = 10 * percolator::SOCIAL_LOSS_DEN;
+/// The same debt expressed in COLLATERAL ATOMS at `loss_weight == POS_SCALE`:
+/// 10e21 * 1e6 / 1e21 = 10_000_000.
+const CW04_DEBT_ATOMS: u128 = 10_000_000;
+/// Principal behind the dead leg. Strictly less than CW04_DEBT_ATOMS, so a
+/// terminal forfeit leaves a residual that principal cannot cover.
+const CW04_PRINCIPAL: u128 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cw04Snap {
+    mode: MarketModeV16,
+    recovery_reason: Option<PermissionlessRecoveryReasonV16>,
+    capital: u128,
+    pnl: i128,
+    b_snap: u128,
+    leg_active: bool,
+    residual_remaining: u128,
+    insurance: u128,
+}
+
+fn cw04_snap(market: &TestAccount, portfolio: &TestAccount) -> Cw04Snap {
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    let leg = account
+        .legs
+        .iter()
+        .copied()
+        .find(|l| l.active && l.asset_index as usize == 0);
+    Cw04Snap {
+        mode: group.mode,
+        recovery_reason: group.recovery_reason,
+        capital: account.capital,
+        pnl: account.pnl,
+        b_snap: leg.map(|l| l.b_snap).unwrap_or(0),
+        leg_active: leg.is_some(),
+        residual_remaining: account.close_progress.residual_remaining,
+        insurance: group.insurance,
+    }
+}
+
+struct Cw04Fixture {
+    admin: TestAccount,
+    market: TestAccount,
+    victim_owner: TestAccount,
+    victim: TestAccount,
+    cp_owner: TestAccount,
+    cp: TestAccount,
+    ba_owner: TestAccount,
+    ba: TestAccount,
+    bb_owner: TestAccount,
+    bb: TestAccount,
+}
+
+/// TWO assets in ONE market group:
+///   asset 0 -- the dead Recovery-lifecycle asset the victim's LONG leg sits on
+///   asset 1 -- a completely healthy matched pair between two BYSTANDERS who
+///              have nothing to do with asset 0.
+/// `absorbing_side_empty = false` builds the deployed-representable variant
+/// (short side still populated, so validate_shape's Live symmetry rule holds at
+/// 9483ee90 too).
+fn cw04_fixture(absorbing_side_empty: bool) -> Cw04Fixture {
+    cw04_fixture_with(absorbing_side_empty, CW04_PRINCIPAL, CW04_DEBT_B)
+}
+
+fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) -> Cw04Fixture {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                ..
+            } = ix
+            {
+                // pre-configures asset slots 0 and 1 as Active
+                *max_portfolio_assets = 2;
+            }
+        }),
+    );
+
+    let mut victim_owner = signer();
+    let mut cp_owner = signer();
+    let mut ba_owner = signer();
+    let mut bb_owner = signer();
+    let mut victim = portfolio_account();
+    let mut cp = portfolio_account();
+    let mut ba = portfolio_account();
+    let mut bb = portfolio_account();
+    init_portfolio(&mut victim_owner, &mut market, &mut victim);
+    init_portfolio(&mut cp_owner, &mut market, &mut cp);
+    init_portfolio(&mut ba_owner, &mut market, &mut ba);
+    init_portfolio(&mut bb_owner, &mut market, &mut bb);
+    deposit(&mut victim_owner, &mut market, &mut victim, principal);
+    deposit(&mut cp_owner, &mut market, &mut cp, 10_000_000);
+    deposit(&mut ba_owner, &mut market, &mut ba, 10_000_000);
+    deposit(&mut bb_owner, &mut market, &mut bb, 10_000_000);
+
+    // asset 0: victim LONG 1 unit @100 against the counterparty
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut victim_owner,
+            &mut cp_owner,
+            &mut market,
+            &mut victim,
+            &mut cp,
+        ],
+    )
+    .unwrap();
+    // asset 1: two UNRELATED bystanders hold a matched, healthy pair
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 1,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut ba_owner,
+            &mut bb_owner,
+            &mut market,
+            &mut ba,
+            &mut bb,
+        ],
+    )
+    .unwrap();
+
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        // Asset 0 enters Recovery LIFECYCLE. The MARKET mode stays Live.
+        group.assets[0].lifecycle = AssetLifecycleV16::Recovery;
+        // A real outstanding LONG-domain B debt: b_target_for_leg reports
+        // b_remaining = CW04_DEBT_B for a Long leg whose own b_snap is 0.
+        group.assets[0].b_long_num = debt_b;
+        if absorbing_side_empty {
+            // The ABSORBING (short) side has completed terminal wind-down.
+            group.assets[0].oi_eff_short_q = 0;
+            group.assets[0].loss_weight_sum_short = 0;
+            group.assets[0].stored_pos_count_short = 0;
+        }
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+    if absorbing_side_empty {
+        // Retire the counterparty's short leg with its side, so no account
+        // still claims a position the asset no longer counts.
+        let mut account = state::read_portfolio(&cp.data).unwrap();
+        for leg in account.legs.iter_mut() {
+            if leg.asset_index as usize == 0 {
+                leg.active = false;
+            }
+        }
+        account.active_bitmap = active_bitmap_with(&[]);
+        state::write_portfolio(&mut cp.data, &account).unwrap();
+    }
+
+    Cw04Fixture {
+        admin,
+        market,
+        victim_owner,
+        victim,
+        cp_owner,
+        cp,
+        ba_owner,
+        ba,
+        bb_owner,
+        bb,
+    }
+}
+
+fn cw04_forfeit(f: &mut Cw04Fixture, budget: u128) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::ForfeitRecoveryLeg {
+            asset_index: 0,
+            b_loss_atom_budget: budget,
+        },
+        &mut [&mut f.victim_owner, &mut f.market, &mut f.victim],
+    )
+}
+
+
+// ===========================================================================
+// F-05 REGRESSION BLOCK -- register row C-W-04
+//
+// Defect (verifier verdict, verify/items/C-W-04.md §6): our wrapper exposed the
+// engine's only Recovery -> Resolved route NOWHERE, so once any declarer flipped
+// `MarketGroup.mode` to Recovery the market was ABSORBING: admin `ResolveMarket`
+// (tag 19), `ResolveStalePermissionless` (tag 44) and every permissionless crank
+// arm all returned Custom(21), and no bystander could ever withdraw again.
+//
+// Fix: `handle_permissionless_crank_zero_copy` now routes `group.header.mode == 2`
+// into `permissionless_auto_crank_not_atomic` (engine 2c38570a:src/v16.rs:15171,
+// Recovery arm :15181-15210), the shape upstream's wrapper uses at
+// `aeyakovenko/percolator-prog:src/v16_program.rs:13668-13684`.
+//
+// These tests EXTEND `verify/poc/C-W-04/`: the fixture helpers above are the PoC's,
+// verbatim; the assertions below are the FIXED behaviour. The old lock assertions
+// are kept verbatim in `f05_old_c_w_04_lock_assertions_must_now_fail`, wrapped in
+// `#[should_panic]` so that reverting the wiring turns that test red again.
+// ===========================================================================
+
+/// `PercolatorError::EngineLockActive` -- ordinal 21 in `error::PercolatorError`.
+const F05_LOCK_ACTIVE: u32 = 21;
+
+/// One permissionless crank (tag 5) by an unrelated STRANGER (no signature, no
+/// portfolio of their own) against `portfolio`. `action`/`asset_index` are the
+/// wire fields the Recovery branch deliberately ignores.
+fn f05_stranger_crank(
+    market: &mut TestAccount,
+    portfolio: &mut TestAccount,
+    now_slot: u64,
+) -> Result<(), ProgramError> {
+    let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+    run_ix(
+        Instruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+        &mut [&mut stranger, market, portfolio],
+    )
+}
+
+fn f05_mode(market: &TestAccount) -> MarketModeV16 {
+    state::read_market(&market.data).unwrap().1.mode
+}
+
+// ---------------------------------------------------------------------------
+// (1) THE FLIP: after the tag-43 CommitRecovery flip, the newly wired
+//     permissionless route advances the market to Resolved, and the bystanders
+//     get their capital out -- with NO admin instruction anywhere in the test.
+// ---------------------------------------------------------------------------
+#[test]
+fn f05_permissionless_crank_advances_recovery_to_resolved_and_unlocks_bystanders() {
+    let mut f = cw04_fixture(true);
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Live);
+
+    // The C-W-04 flip, unchanged: owner-signed tag 43 on the dead Recovery-lifecycle
+    // leg with a budget principal + insurance cannot cover -> CommitRecovery.
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("the flipping call returns Ok");
+    assert_eq!(
+        f05_mode(&f.market),
+        MarketModeV16::Recovery,
+        "precondition: the market is in the absorbing state C-W-04 measured"
+    );
+    let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+
+    // THE FIX: a stranger's tag-5 crank, cranked over the BYSTANDER's portfolio.
+    // No signer, no admin, no owner. One instruction per bounded step; loop a
+    // small bounded number of times and record every step.
+    let mut steps: Vec<Result<(), ProgramError>> = Vec::new();
+    for i in 0..4u64 {
+        if f05_mode(&f.market) == MarketModeV16::Resolved {
+            break;
+        }
+        let r = f05_stranger_crank(&mut f.market, &mut f.ba, slot + 1 + i);
+        println!(
+            "F-05 step {i}: stranger tag5 crank -> {r:?} mode={:?}",
+            f05_mode(&f.market)
+        );
+        steps.push(r);
+    }
+    assert!(
+        steps.iter().any(|r| r.is_ok()),
+        "at least one permissionless step must succeed"
+    );
+    assert_eq!(
+        f05_mode(&f.market),
+        MarketModeV16::Resolved,
+        "F-05: Recovery must no longer be absorbing -- a permissionless crank reaches Resolved"
+    );
+
+    // And the bystanders can now actually get out. `CloseResolved` is the terminal
+    // exit that returned Custom(21) for everyone in the C-W-04 measurement.
+    let mint = Pubkey::new_from_array(state::read_market(&f.market.data).unwrap().0.collateral_mint);
+    let payout = state::read_portfolio(&f.ba.data).unwrap().capital;
+    let payout_u64 = u64::try_from(payout).unwrap_or(0);
+    let mut dest_token = user_token_account(f.ba_owner.key, mint, 0);
+    let mut vault_token = vault_token_account(&f.market, mint, payout_u64.max(1));
+    let mut vault_auth = vault_authority_account(&f.market);
+    let mut token_program = token_program_account();
+    let close_resolved = run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut f.ba_owner,
+            &mut f.market,
+            &mut f.ba,
+            &mut dest_token,
+            &mut vault_token,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    println!(
+        "F-05 bystander CloseResolved after the permissionless finalisation = {close_resolved:?} \
+         (capital was {payout})"
+    );
+    assert!(
+        close_resolved.is_ok(),
+        "F-05: a bystander must be able to take the resolved exit without any admin action"
+    );
+    assert_ne!(
+        close_resolved,
+        Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+        "F-05: the C-W-04 lock must be gone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (1b) The old lock assertions, VERBATIM from
+//      verify/poc/C-W-04/verify_C-W-04_exit_routes_appended_to_v16_wrapper.rs
+//      (`verify_c_w_04_who_can_advance_the_market_out_of_recovery`). They asserted
+//      that NOTHING moves the market out of Recovery. With the fix wired they must
+//      FAIL -- the permissionless crank now moves it -- so the test is wrapped in
+//      `#[should_panic]`. Revert the wiring and this test goes red with
+//      "test did not panic as expected": that is the F-05 negative control.
+// ---------------------------------------------------------------------------
+#[test]
+#[should_panic(expected = "nothing above moved the market out of Recovery")]
+fn f05_old_c_w_04_lock_assertions_must_now_fail() {
+    let mut f = cw04_fixture(true);
+    assert_eq!(cw04_snap(&f.market, &f.victim).mode, MarketModeV16::Live);
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("the flipping call returns Ok");
+    assert_eq!(
+        cw04_snap(&f.market, &f.victim).mode,
+        MarketModeV16::Recovery
+    );
+
+    // (a) the MARKET AUTHORITY's own ResolveMarket (tag 19).
+    let admin_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut f.admin, &mut f.market]);
+    let m1 = cw04_snap(&f.market, &f.victim).mode;
+    println!("F-05/old exit(a) admin ResolveMarket (tag 19)   = {admin_resolve:?} mode={m1:?}");
+
+    // (b) the PERMISSIONLESS stale resolve (tag 44), far past any maturity.
+    let perm_resolve = run_ix(
+        Instruction::ResolveStalePermissionless {
+            now_slot: 900_000_000,
+        },
+        &mut [&mut f.market],
+    );
+    let m2 = cw04_snap(&f.market, &f.victim).mode;
+    println!("F-05/old exit(b) ResolveStalePermissionless     = {perm_resolve:?} mode={m2:?}");
+
+    // (c) every permissionless-crank arm, on the HEALTHY asset 1, by a stranger.
+    for (label, action) in [
+        ("Refresh", 0u8),
+        ("Liquidate", 1u8),
+        ("SettleB", 2u8),
+        ("Recover", 3u8),
+    ] {
+        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                action,
+                asset_index: 1,
+                now_slot: 2,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            &mut [&mut stranger, &mut f.market, &mut f.ba],
+        );
+        let m = cw04_snap(&f.market, &f.victim).mode;
+        println!(
+            "F-05/old exit(c) tag5 action={action} ({label:>9}) on HEALTHY asset 1 = {res:?} mode={m:?}"
+        );
+    }
+
+    assert_eq!(
+        cw04_snap(&f.market, &f.victim).mode,
+        MarketModeV16::Recovery,
+        "nothing above moved the market out of Recovery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (2) F-02 NON-REGRESSION. The wired Recovery arm reaches
+//     `forfeit_recovery_leg_not_atomic` (engine :15189), which opens a close
+//     ledger at `:21493`. The F-02 route-3 lock -- `begin_close_progress_ledger`
+//     `:16955` `if !current.close_slot_available() { LockActive }` -- must STILL
+//     bite through the new public route, i.e. wiring the crank must not hand a
+//     public caller a way past an already-open close ledger on someone else's
+//     account. Shape mirrors verify/poc/F-02/poc_F02.rs
+//     `route3_recovery_forfeit_meeting_a_pending_ledger_is_refused_at_
+//      begin_close_progress_ledger`, driven through the WRAPPER instead of the
+//     engine API.
+// ---------------------------------------------------------------------------
+/// Case A -- the ledger the C-W-04 flip itself leaves behind: OPEN with a
+/// PENDING RESIDUAL. The engine's own step selector refuses to pick the forfeit
+/// for such an account at all (`release_allowed = !has_pending_residual()`,
+/// engine 2c38570a:src/v16.rs:15051-15055), so the wired crank can never carry a
+/// booking into it. Measured: the ledger is byte-unchanged across the crank.
+#[test]
+fn f05_f02_pending_residual_ledger_is_never_booked_through_the_wired_crank() {
+    let mut f = cw04_fixture(true);
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("flip");
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Recovery);
+
+    let before = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    println!(
+        "F-05/F-02 (A) victim ledger before: active={} finalized={} residual_remaining={} \
+         b_loss_booked={} explicit_loss_assigned={}",
+        before.active,
+        before.finalized,
+        before.residual_remaining,
+        before.b_loss_booked,
+        before.explicit_loss_assigned
+    );
+    assert!(
+        before.active && !before.finalized && before.residual_remaining != 0,
+        "precondition: an open, non-finalized close ledger with a pending residual"
+    );
+
+    let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+    let res = f05_stranger_crank(&mut f.market, &mut f.victim, slot + 1);
+    let after = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    println!(
+        "F-05/F-02 (A) stranger tag5 crank over the OPEN-LEDGER account -> {res:?} \
+         after: residual_remaining={} b_loss_booked={} explicit_loss_assigned={} \
+         support_consumed={} insurance_spent={}",
+        after.residual_remaining,
+        after.b_loss_booked,
+        after.explicit_loss_assigned,
+        after.support_consumed,
+        after.insurance_spent
+    );
+    assert_eq!(after.residual_remaining, before.residual_remaining);
+    assert_eq!(after.b_loss_booked, before.b_loss_booked);
+    assert_eq!(after.explicit_loss_assigned, before.explicit_loss_assigned);
+    assert_eq!(after.support_consumed, before.support_consumed);
+    assert_eq!(after.insurance_spent, before.insurance_spent);
+}
+
+/// Case B -- the decisive one: the shape that gets PAST the selector and must be
+/// stopped by the F-02 lock itself. An OPEN, non-finalized ledger whose residual
+/// is already 0 satisfies `!has_pending_residual()` (engine :5589-5591) so the
+/// crank DOES select the forfeit, but it fails `close_slot_available()`
+/// (`:5623-5625`, `active && !is_finalized_inert()`), so
+/// `begin_close_progress_ledger` must refuse at `:16955` -> `LockActive`.
+/// Same structural refusal as verify/poc/F-02/poc_F02.rs
+/// `route3_recovery_forfeit_meeting_a_pending_ledger_is_refused_at_
+///  begin_close_progress_ledger`, driven through the WIRED WRAPPER CRANK
+/// instead of the engine API.
+#[test]
+fn f05_f02_route3_open_ledger_still_hits_lock_active_through_the_wired_crank() {
+    let mut f = cw04_fixture(true);
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("flip");
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Recovery);
+
+    // Make the victim's leg a ZERO-BASIS leg that still carries a loss
+    // obligation -- the exact shape the auto-crank's Recovery arm routes through
+    // `forfeit_recovery_leg_not_atomic` (engine :15186-15193, :15099-15108) --
+    // and empty its ledger's residual while leaving the ledger OPEN.
+    {
+        let (cfg, mut group) = state::read_market(&f.market.data).unwrap();
+        group.assets[0].oi_eff_long_q = 0;
+        state::write_market(&mut f.market.data, &cfg, &group).unwrap();
+
+        let mut account = state::read_portfolio(&f.victim.data).unwrap();
+        for leg in account.legs.iter_mut() {
+            if leg.active && leg.asset_index as usize == 0 {
+                leg.basis_pos_q = 0;
+            }
+        }
+        // Zero BOTH, or `validate_close_progress_ledger_with_market` (engine
+        // :5367) rejects the craft with InvalidLeg before anything under test runs.
+        account.close_progress.gross_loss_at_close_start = 0;
+        account.close_progress.residual_remaining = 0;
+        assert!(account.close_progress.active && !account.close_progress.finalized);
+        state::write_portfolio(&mut f.victim.data, &account).unwrap();
+    }
+    let before = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    println!(
+        "F-05/F-02 (B) crafted ledger: active={} finalized={} canceled={} residual_remaining={} \
+         -> has_pending_residual=false, close_slot_available=false",
+        before.active, before.finalized, before.canceled, before.residual_remaining
+    );
+
+    let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+    let res = f05_stranger_crank(&mut f.market, &mut f.victim, slot + 1);
+    println!("F-05/F-02 (B) stranger tag5 crank over the OPEN zero-residual ledger -> {res:?}");
+    assert_eq!(
+        res,
+        Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+        "F-02 :16955 LockActive must still refuse a forfeit reached through the wired crank"
+    );
+
+    let after = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    assert_eq!(after.b_loss_booked, before.b_loss_booked);
+    assert_eq!(after.explicit_loss_assigned, before.explicit_loss_assigned);
+    assert_eq!(after.residual_remaining, before.residual_remaining);
+    assert_eq!(
+        f05_mode(&f.market),
+        MarketModeV16::Recovery,
+        "the refused crank finalized nothing either"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (3) LIVE-MODE BYTE-IDENTITY. Every tag-5 behaviour in a Live market must be
+//     unchanged: the new branch is gated on `mode == 2` only. This pins the
+//     argument validation and the Live dispatch outcomes the C-W-04 PoC recorded.
+// ---------------------------------------------------------------------------
+#[test]
+fn f05_live_mode_permissionless_crank_behaviour_is_unchanged() {
+    let mut f = cw04_fixture(true);
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Live);
+
+    // Argument validation ahead of the branch is untouched.
+    for (label, action, recovery_reason) in [
+        ("action=3", 3u8, 0u8),
+        ("action=8", 8u8, 0u8),
+        ("recovery_reason=1", 0u8, 1u8),
+    ] {
+        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                action,
+                asset_index: 1,
+                now_slot: 2,
+                funding_rate_e9: 0,
+                recovery_reason,
+            },
+            &mut [&mut stranger, &mut f.market, &mut f.ba],
+        );
+        println!("F-05 live-mode reject {label} -> {res:?}");
+        assert_eq!(
+            res,
+            Err(ProgramError::Custom(9)),
+            "InvalidInstruction (Custom(9)) is unchanged for {label}"
+        );
+    }
+
+    // And the Live dispatch still runs the ordinary arms over a healthy asset.
+    for action in [0u8, 1u8, 2u8] {
+        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                action,
+                asset_index: 1,
+                now_slot: 2,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            &mut [&mut stranger, &mut f.market, &mut f.ba],
+        );
+        println!("F-05 live-mode action={action} on healthy asset 1 -> {res:?} mode={:?}", f05_mode(&f.market));
+        assert_eq!(
+            f05_mode(&f.market),
+            MarketModeV16::Live,
+            "a Live crank never changes the mode"
+        );
+    }
+}
+
+/// Case C -- the `:16955` refusal ISOLATED. Case (B) proves the crank is refused,
+/// but its fixture also carries the pending domain-loss barrier the flip itself
+/// installed, and `begin_close_progress_ledger`'s SECOND gate (`:16959`, barrier
+/// count != 0) raises the same `LockActive` (measured: with the ledger removed,
+/// that fixture still returns Custom(21)). This case never flips, so no barrier
+/// exists and only `:16955` can fire: the market is put in Recovery directly and
+/// the account is given the OPEN, zero-loss, non-finalized ledger. The `ledger
+/// removed` control in the same test must then get PAST the gate.
+#[test]
+fn f05_f02_lock_is_the_close_slot_available_gate_16955() {
+    for (label, open_ledger) in [("open-ledger", true), ("no-ledger(control)", false)] {
+        let mut f = cw04_fixture(true);
+        let (cfg, mut group) = state::read_market(&f.market.data).unwrap();
+        let market_id = group.assets[0].market_id;
+        // Recovery WITHOUT the tag-43 flip: no close ledger was ever opened on
+        // this market, so `pending_domain_loss_barrier_short(asset 0) == 0` and
+        // `:16959` cannot be the refusal.
+        group.mode = MarketModeV16::Recovery;
+        group.recovery_reason =
+            Some(PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress);
+        group.assets[0].oi_eff_long_q = 0;
+        state::write_market(&mut f.market.data, &cfg, &group).unwrap();
+
+        let mut account = state::read_portfolio(&f.victim.data).unwrap();
+        for leg in account.legs.iter_mut() {
+            if leg.active && leg.asset_index as usize == 0 {
+                leg.basis_pos_q = 0; // zero-basis leg carrying a loss obligation
+                leg.b_snap = CW04_DEBT_B; // B already settled: no chunk work left
+            }
+        }
+        account.capital = 0;
+        account.pnl = -(CW04_DEBT_ATOMS as i128); // -> gross_close_loss != 0 at :21489
+        account.close_progress = if open_ledger {
+            CloseProgressLedgerV16 {
+                active: true,
+                finalized: false,
+                canceled: false,
+                close_id: 1,
+                asset_index: 0,
+                market_id,
+                domain_side: SideV16::Short, // opposite_side(Long), per :5381
+                gross_loss_at_close_start: 0,
+                drift_reference_slot: 0,
+                max_close_slot: 100,
+                residual_remaining: 0,
+                ..CloseProgressLedgerV16::EMPTY
+            }
+        } else {
+            CloseProgressLedgerV16::EMPTY
+        };
+        state::write_portfolio(&mut f.victim.data, &account).unwrap();
+
+        let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+        let res = f05_stranger_crank(&mut f.market, &mut f.victim, slot + 1);
+        println!("F-05/F-02 (C) {label:<19} stranger tag5 crank -> {res:?}");
+        if open_ledger {
+            assert_eq!(
+                res,
+                Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+                "an OPEN non-inert ledger must refuse at :16955 close_slot_available()"
+            );
+        } else {
+            assert_ne!(
+                res,
+                Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+                "control: with no ledger open the SAME call gets past :16955, so the \
+                 refusal above is the close-ledger lock and not the barrier at :16959"
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C-W-02 / B-3 — tag 64 `ForceCloseAbandonedAsset` sized its close from the RAW
+// basis while the engine routes on the EFFECTIVE quantity.
+//
+// Fixture and measurements are the C-W-02 PoC (`verify/poc/C-W-02/poc_C-W-02.rs`),
+// re-asserted against the FIXED handler: what the PoC recorded as a refusal
+// (`Custom(21)` `EngineLockActive`) is now the close the instruction exists to
+// perform.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn cw02_effective_ceil(raw_abs_q: u128, a_basis: u128, current_a: u128) -> u128 {
+    assert!(a_basis != 0);
+    if current_a >= a_basis {
+        return raw_abs_q;
+    }
+    let num = raw_abs_q
+        .checked_mul(current_a)
+        .expect("fixture stays inside u128");
+    num.div_ceil(a_basis)
+}
+
+/// Build a Recovery pair whose raw basis exceeds its effective quantity on BOTH
+/// sides (`a_long`/`a_short` < ADL_ONE), with `force_close_delay_slots` elapsed.
+/// Returns `(market, long_account, short_account, cranker, long_owner, wrapper_clamped_q,
+/// engine_clamped_q)`.
+fn cw02_adl_recovery_pair() -> (
+    TestAccount,
+    TestAccount,
+    TestAccount,
+    TestAccount,
+    TestAccount,
+    u128,
+    u128,
+) {
+    let mut admin = signer();
+    let cranker = signer();
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut market = market_account_with_capacity(2);
+    let mut long_account = portfolio_account_for_market_slots(2);
+    let mut short_account = portfolio_account_for_market_slots(2);
+    let _mint = init_market(&mut admin, &mut market);
+
+    run_ix(
+        Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 9000,
+            force_close_delay_slots: 5,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+    )
+    .unwrap();
+
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 1,
+            size_q: (POS_SCALE * 2) as i128,
+            exec_price: 150,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    // The A-scaling event: an owner-signed partial risk reduction on each side,
+    // i.e. the engine's own ADL/A-scaling path (`rebalance_reduce_position_not_atomic`),
+    // the same one the engine spec test
+    // `v16_recovery_pair_close_clamps_stale_work_to_dual_adl_effective_oi`
+    // (2c38570a:tests/v16_spec_tests.rs:2509) uses to make raw > effective.
+    let reduce_q = POS_SCALE / 100;
+    run_ix(
+        Instruction::RebalanceReduce {
+            asset_index: 1,
+            reduce_q,
+        },
+        &mut [&mut long_owner, &mut market, &mut long_account],
+    )
+    .unwrap();
+    run_ix(
+        Instruction::RebalanceReduce {
+            asset_index: 1,
+            reduce_q,
+        },
+        &mut [&mut short_owner, &mut market, &mut short_account],
+    )
+    .unwrap();
+
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_SHUTDOWN,
+        1,
+        2,
+        0,
+    )
+    .unwrap();
+
+    let (_, g) = state::read_market(&market.data).unwrap();
+    let asset = g.assets[1];
+    assert_eq!(asset.lifecycle, AssetLifecycleV16::Recovery);
+    assert!(
+        asset.a_long < percolator::ADL_ONE,
+        "long side took an A haircut"
+    );
+    assert!(
+        asset.a_short < percolator::ADL_ONE,
+        "short side took an A haircut"
+    );
+
+    let long_leg = active_leg_for_asset(&state::read_portfolio(&long_account.data).unwrap(), 1);
+    let short_leg = active_leg_for_asset(&state::read_portfolio(&short_account.data).unwrap(), 1);
+    let raw_long = long_leg.basis_pos_q.unsigned_abs();
+    let raw_short = short_leg.basis_pos_q.unsigned_abs();
+    // effective_pos_q = ceil(|raw_basis| * current_A_side / leg_a_basis)
+    // (av:spec.md:103-106). The engine's kernel is `pub(crate)`, so the definition is
+    // restated and cross-checked against the engine-maintained `oi_eff_*_q` below.
+    let eff_long = cw02_effective_ceil(raw_long, long_leg.a_basis, asset.a_long);
+    let eff_short = cw02_effective_ceil(raw_short, short_leg.a_basis, asset.a_short);
+    assert_eq!(
+        eff_long, asset.oi_eff_long_q,
+        "restated ceil == engine oi_eff_long_q"
+    );
+    assert_eq!(
+        eff_short, asset.oi_eff_short_q,
+        "restated ceil == engine oi_eff_short_q"
+    );
+    assert!(raw_long > eff_long, "long raw basis exceeds its effective");
+    assert!(raw_short > eff_short, "short raw basis exceeds its effective");
+
+    //   OLD wrapper clamp, origin/main:9010-9012 : close_q.min(|raw_a|).min(|raw_b|)
+    //   engine clamp,      2c38570a:18565-18571  : q.min(eff_a).min(eff_b).min(oi_eff_long).min(oi_eff_short)
+    let wrapper_clamped = u128::MAX.min(raw_long).min(raw_short);
+    let engine_clamped = u128::MAX
+        .min(eff_long)
+        .min(eff_short)
+        .min(asset.oi_eff_long_q)
+        .min(asset.oi_eff_short_q);
+    println!(
+        "(cw02) raw_long={raw_long} raw_short={raw_short} eff_long={eff_long} eff_short={eff_short} \
+oi_eff_long={} oi_eff_short={} | old_wrapper_clamp={wrapper_clamped} engine_clamp={engine_clamped}",
+        asset.oi_eff_long_q, asset.oi_eff_short_q
+    );
+    assert!(
+        wrapper_clamped > engine_clamped,
+        "the raw clamp asks for MORE than the effective position"
+    );
+
+    (
+        market,
+        long_account,
+        short_account,
+        cranker,
+        long_owner,
+        wrapper_clamped,
+        engine_clamped,
+    )
+}
+
+/// THE REGRESSION. The documented "pass the full size" call (`u128::MAX`) now closes
+/// the ADL'd Recovery pair exactly, instead of being refused with `Custom(21)`.
+#[test]
+fn cw02_tag64_full_size_closes_the_adl_pair_exactly() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, raw_q, eff_q) =
+        cw02_adl_recovery_pair();
+    println!(
+        "(cw02) old_wrapper_clamp={raw_q} engine_clamp={eff_q} delta={}",
+        raw_q - eff_q
+    );
+
+    let r = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    );
+    println!("(cw02) tag 64, close_q=u128::MAX (full size) -> {r:?}");
+    assert_eq!(
+        r,
+        Ok(()),
+        "the engine primitive clamps the budget to the EFFECTIVE position and closes it"
+    );
+    let (_, g_after) = state::read_market(&market.data).unwrap();
+    println!(
+        "(cw02) after: oi_eff_long={} oi_eff_short={}",
+        g_after.assets[1].oi_eff_long_q, g_after.assets[1].oi_eff_short_q
+    );
+    assert_eq!(
+        g_after.assets[1].oi_eff_long_q, 0,
+        "effective OI fully closed"
+    );
+    assert_eq!(g_after.assets[1].oi_eff_short_q, 0);
+}
+
+/// The other natural "full size" — the raw basis itself — is now also fine: the
+/// engine clamps it down instead of classifying the over-sized request as a flip.
+#[test]
+fn cw02_tag64_raw_basis_budget_is_clamped_not_refused() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, raw_q, eff_q) =
+        cw02_adl_recovery_pair();
+    let r = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        raw_q,
+    );
+    println!("(cw02) tag 64, close_q=old_wrapper_clamp(min raw basis)={raw_q} -> {r:?}");
+    assert_eq!(r, Ok(()));
+    let (_, g_after) = state::read_market(&market.data).unwrap();
+    assert_eq!(g_after.assets[1].oi_eff_long_q, 0);
+    assert_eq!(g_after.assets[1].oi_eff_short_q, 0);
+
+    // And the already-correct call still behaves: a second close has nothing left to do.
+    let again = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        eff_q,
+    );
+    println!("(cw02) tag 64 again on the closed pair -> {again:?}");
+    assert!(
+        again.is_err(),
+        "nothing left to close: the engine refuses rather than re-trading"
+    );
+}
+
+/// The ORIGINAL DEFECT ASSERTION, as the PoC wrote it. It must FAIL now; reverting
+/// `src/v16_program.rs` makes it pass again and turns this test red.
+#[test]
+#[should_panic(expected = "PRE-C-W-02")]
+fn cw02_old_defect_tag64_refuses_the_full_size_close() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, _raw_q, _eff_q) =
+        cw02_adl_recovery_pair();
+    let r = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    );
+    println!("(cw02-old) tag 64, close_q=u128::MAX -> {r:?}");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineLockActive.into()),
+        "PRE-C-W-02: the raw-clamped size exceeds the effective position, the route classifies \
+         as a FLIP and require_asset_risk_change_allowed refuses with LockActive -> Custom(21)"
+    );
+}
+
+/// Site enumeration, re-pinned. Before B-3 there were FOUR `basis_pos_q.unsigned_abs()`
+/// occurrences: the two tag-64 clamp lines and two signed-position READS. The clamp is
+/// gone, so only the reads remain.
+#[test]
+fn cw02_basis_clamp_site_enumeration_is_reads_only() {
+    let src = include_str!("../src/v16_program.rs");
+    let hits: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("basis_pos_q.unsigned_abs()"))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    for (line, text) in &hits {
+        println!("(cw02) v16_program.rs:{line}: {text}");
+    }
+    assert_eq!(
+        hits.len(),
+        2,
+        "only the two signed-position reads in signed_position_for_asset_view survive"
+    );
+    for (_, text) in &hits {
+        assert!(
+            text.contains("SideV16::"),
+            "each survivor is a signed-position read, not a clamp: {text}"
+        );
+    }
+    assert_eq!(
+        src.matches(".force_close_recovery_pair_not_atomic(").count(),
+        1,
+        "and the engine primitive now has exactly one caller (it had none)"
+    );
+}
+
+/// Non-regression (4): the owner's independent dead-leg exit, tag 43
+/// `ForfeitRecoveryLeg`, still works on the very fixture B-3 changes. This is the
+/// route that keeps the one-sided residue case owner-signed in this fork -- see the
+/// decision recorded in `verify/fixes/C-W-02.md`.
+#[test]
+fn cw02_tag43_owner_forfeit_still_works_on_the_adl_recovery_leg() {
+    let (mut market, mut long_account, _short_account, _cranker, mut long_owner, _raw_q, _eff_q) =
+        cw02_adl_recovery_pair();
+    let long_before = state::read_portfolio(&long_account.data).unwrap();
+    assert!(has_active_leg_for_asset(&long_before, 1));
+
+    let r = run_ix(
+        Instruction::ForfeitRecoveryLeg {
+            asset_index: 1,
+            b_loss_atom_budget: 1,
+        },
+        &mut [&mut long_owner, &mut market, &mut long_account],
+    );
+    println!("(cw02) tag 43 owner forfeit on the ADL'd Recovery leg -> {r:?}");
+    assert_eq!(r, Ok(()), "the owner-signed dead-leg exit is untouched by B-3");
+}
+
+/// The state upstream's extra branch (`upstream/main:9037-9077`) exists for, chased
+/// rather than assumed: close the ADL'd pair with tag 64 and look at what the pair is
+/// left holding. MEASURED HERE — the engine primitive leaves NO one-sided raw residue
+/// on this route (both legs detach, both `oi_eff` reach 0), and a second tag 64 is
+/// refused with `EngineInvalidLeg` rather than forfeiting anything on a cranker's
+/// say-so. This test records the decision NOT to adopt upstream's branch; the
+/// reasoning is in `verify/fixes/C-W-02.md`.
+#[test]
+fn cw02_engine_primitive_leaves_no_one_sided_residue_for_a_cranker_to_forfeit() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, _raw_q, eff_q) =
+        cw02_adl_recovery_pair();
+    force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    )
+    .expect("the pair closes");
+
+    let (_, g) = state::read_market(&market.data).unwrap();
+    let long = state::read_portfolio(&long_account.data).unwrap();
+    let short = state::read_portfolio(&short_account.data).unwrap();
+    let long_active = has_active_leg_for_asset(&long, 1);
+    let short_active = has_active_leg_for_asset(&short, 1);
+    let long_raw = if long_active {
+        active_leg_for_asset(&long, 1).basis_pos_q
+    } else {
+        0
+    };
+    let short_raw = if short_active {
+        active_leg_for_asset(&short, 1).basis_pos_q
+    } else {
+        0
+    };
+    println!(
+        "(cw02-1s) after a full close (landed {eff_q}): long_raw={long_raw} short_raw={short_raw} \
+long_leg_active={long_active} short_leg_active={short_active} oi_eff_long={} oi_eff_short={}",
+        g.assets[1].oi_eff_long_q, g.assets[1].oi_eff_short_q
+    );
+    assert_eq!(g.assets[1].oi_eff_long_q, 0);
+    assert_eq!(g.assets[1].oi_eff_short_q, 0);
+    assert_eq!(long_raw, 0, "no raw residue is left behind on the long side");
+    assert_eq!(short_raw, 0, "nor on the short side");
+
+    // With nothing left, tag 64 refuses. It does NOT fall through to a permissionless
+    // forfeit of one side's leftovers, which is what upstream's branch would do.
+    let residual_call = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    );
+    println!("(cw02-1s) tag 64 again -> {residual_call:?}");
+    assert_eq!(
+        residual_call,
+        Err(percolator_prog::error::PercolatorError::EngineInvalidLeg.into()),
+        "no active leg pair to close; the owner-signed tag 43 remains the exit for anything left"
+    );
+}
+/// THE DECISION, measured. Upstream's extra branch routes a one-sided pair through
+/// `forfeit_recovery_leg_not_atomic` under this PERMISSIONLESS instruction, i.e. it
+/// lets a cranker substitute a FORFEIT for a CLOSE. The two are not the same outcome
+/// for the account holder, and this test shows the difference on one fixture: the
+/// close settles the position at the frozen mark and leaves the capital, the forfeit
+/// gives the leg up. Recorded here so the choice not to adopt the branch is evidence,
+/// not preference — `verify/fixes/C-W-02.md`.
+#[test]
+fn cw02_forfeit_is_not_the_same_outcome_as_a_close_for_the_holder() {
+    // (a) the close, through the fixed tag 64.
+    let (mut market_c, mut long_c, mut short_c, mut cranker, _o, _raw, _eff) =
+        cw02_adl_recovery_pair();
+    let before = state::read_portfolio(&long_c.data).unwrap();
+    force_close_abandoned_asset(&mut cranker, &mut market_c, &mut long_c, &mut short_c, 1, 7, u128::MAX)
+        .expect("the pair closes");
+    let closed = state::read_portfolio(&long_c.data).unwrap();
+
+    // (b) the forfeit, through the owner-signed tag 43, on the same fixture.
+    let (mut market_f, mut long_f, _short_f, _cranker2, mut long_owner, _raw2, _eff2) =
+        cw02_adl_recovery_pair();
+    run_ix(
+        Instruction::ForfeitRecoveryLeg { asset_index: 1, b_loss_atom_budget: u128::MAX },
+        &mut [&mut long_owner, &mut market_f, &mut long_f],
+    )
+    .expect("the owner may forfeit");
+    let forfeited = state::read_portfolio(&long_f.data).unwrap();
+
+    println!(
+        "(cw02-dec) before      capital={} pnl={} leg_active={}",
+        before.capital, before.pnl, has_active_leg_for_asset(&before, 1)
+    );
+    println!(
+        "(cw02-dec) tag64 close capital={} pnl={} leg_active={}",
+        closed.capital, closed.pnl, has_active_leg_for_asset(&closed, 1)
+    );
+    println!(
+        "(cw02-dec) tag43 forfeit capital={} pnl={} leg_active={}",
+        forfeited.capital, forfeited.pnl, has_active_leg_for_asset(&forfeited, 1)
+    );
+    assert!(
+        !has_active_leg_for_asset(&closed, 1),
+        "the close settles the pair at the frozen mark and RETIRES the leg"
+    );
+    assert!(
+        has_active_leg_for_asset(&forfeited, 1),
+        "the forfeit at the same budget settles the B debt (none here) and leaves the leg \
+         ATTACHED -- it is a different operation, not a slower close"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C-W-03 — tag 43's wire field carries COLLATERAL ATOMS, not a B-index delta.
+//
+// The engine parameter it lands in has been `b_loss_atom_budget` /
+// `endpoint_loss_atom_budget` since engine `2c38570a` ("Both limits are collateral
+// atoms", `src/v16.rs:14149-14150`); the wrapper's field still carried its old
+// B-delta name, which is what the DEPLOYED engine `9483ee90` actually bounded.
+// Same bytes, same layout, different meaning — the rename makes the unit visible.
+//
+// These tests re-assert the C-W-03 PoC (`verify/poc/C-W-03/`) under the new name:
+// the atom semantics are unchanged (this is a clarity fix, not a behaviour fix),
+// and the WIRE LAYOUT is proven byte-identical so the rename cannot be an ABI break.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy)]
+struct Cw03Forfeit {
+    delta_b: u128,
+    loss_booked_atoms: u128,
+    capital_consumed: u128,
+    detached: bool,
+    loss_weight: u128,
+    b_debt: u128,
+    public_b_chunk_atoms: u128,
+}
+
+fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    // Recovery market + a REAL outstanding B debt on the long leg: `b_target_for_leg`
+    // reads `asset.b_long_num` for a Long leg whose b_epoch_snap matches the side epoch,
+    // and the leg's own `b_snap` is still 0, so `b_remaining == b_debt`. Seeding committed
+    // state is the technique this file's own `seed_cancellable_close_progress` uses.
+    let b_debt: u128 = 4 * percolator::SOCIAL_LOSS_DEN; // 4e21 B-index units
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        group.mode = MarketModeV16::Recovery;
+        group.recovery_reason = Some(PermissionlessRecoveryReasonV16::BelowProgressFloor);
+        group.assets[0].b_long_num = b_debt;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before_a = state::read_portfolio(&long_account.data).unwrap();
+    let before_leg = active_leg_for_asset(&before_a, 0);
+    let result = run_ix(
+        Instruction::ForfeitRecoveryLeg {
+            asset_index: 0,
+            b_loss_atom_budget: budget,
+        },
+        &mut [&mut long_owner, &mut market, &mut long_account],
+    );
+    let after_a = state::read_portfolio(&long_account.data).unwrap();
+    let detached = percolator::active_bitmap_is_empty(after_a.active_bitmap);
+    let after_b_snap = if detached {
+        b_debt
+    } else {
+        active_leg_for_asset(&after_a, 0).b_snap
+    };
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let out = Cw03Forfeit {
+        delta_b: after_b_snap,
+        loss_booked_atoms: (before_a.pnl - after_a.pnl).unsigned_abs()
+            + before_a.capital.saturating_sub(after_a.capital),
+        capital_consumed: before_a.capital.saturating_sub(after_a.capital),
+        detached,
+        loss_weight: before_leg.loss_weight,
+        b_debt,
+        public_b_chunk_atoms: group.config.public_b_chunk_atoms,
+    };
+    (result, out)
+}
+
+/// THE REGRESSION. The PoC's four wire values, re-measured under the new field
+/// name: the semantics are ATOMS and they are unchanged by the rename.
+#[test]
+fn cw03_tag43_budget_is_collateral_atoms_under_the_new_name() {
+    let mut rows = Vec::new();
+    for (label, budget) in [
+        ("1", 1u128),
+        ("POS_SCALE", POS_SCALE),
+        // The whole outstanding debt expressed in ATOMS (4e21 B-index units at
+        // loss_weight == POS_SCALE == 1e6 is 4e6 collateral atoms). A legacy caller
+        // passing this as a B-INDEX delta means "settle 4 million B-units, a 4e-15
+        // fraction of the debt"; this engine reads it as "settle four million atoms"
+        // -- the entire debt, terminally.
+        ("debt_atoms", 4_000_000u128),
+        ("u128::MAX", u128::MAX),
+    ] {
+        let (res, f) = cw03_run(budget);
+        println!("[cw03] b_loss_atom_budget={label:>9} ({budget}) -> res={res:?} {f:?}");
+        assert!(res.is_ok(), "tag 43 must be accepted for budget {label}: {res:?}");
+        rows.push(f);
+    }
+    let one = rows[0];
+    let pos = rows[1];
+    let debt = rows[2];
+    let max = rows[3];
+
+    assert_eq!(
+        one.loss_weight, POS_SCALE,
+        "fixture assumption: leg loss_weight == POS_SCALE"
+    );
+    assert_eq!(
+        one.loss_booked_atoms, 1,
+        "budget=1 is read as ONE COLLATERAL ATOM: exactly 1 atom of loss is booked"
+    );
+    assert_eq!(
+        pos.loss_booked_atoms, POS_SCALE,
+        "budget=POS_SCALE is read as 1_000_000 COLLATERAL ATOMS"
+    );
+    assert_eq!(
+        pos.loss_booked_atoms,
+        one.loss_booked_atoms * POS_SCALE,
+        "the wire value scales the FORFEIT one-for-one in atoms"
+    );
+    assert!(
+        !one.detached && !pos.detached,
+        "a bounded atom budget leaves the leg attached"
+    );
+    assert!(
+        debt.detached,
+        "budget == the debt IN ATOMS terminally forfeits the leg in one call -- the hazard \
+         the new name and the README now spell out for a legacy B-index-scale caller"
+    );
+    assert_eq!(
+        debt.capital_consumed, 4_000_000,
+        "the whole debt is taken out of principal"
+    );
+    assert!(max.detached);
+    assert_eq!(
+        max.delta_b, max.b_debt,
+        "u128::MAX collapses to public_b_chunk_atoms and settles the whole debt in one call"
+    );
+    assert!(
+        max.loss_booked_atoms >= 4_000_000,
+        "the whole 4e21 B debt at loss_weight=POS_SCALE is 4_000_000 atoms of loss"
+    );
+    println!(
+        "[cw03] public_b_chunk_atoms={} -- the budget only ever enters through a min(), so \
+nothing settles beyond min(public_b_chunk_atoms, b_remaining)",
+        max.public_b_chunk_atoms
+    );
+}
+
+/// The rename must be a RENAME: the encoded instruction is byte-identical to the
+/// layout tag 43 has always had — `[43][asset_index: u16 LE][budget: u128 LE]` —
+/// and it round-trips through `decode`. No ABI break, so no tag bump.
+#[test]
+fn cw03_tag43_wire_layout_is_byte_identical_after_the_rename() {
+    for (asset_index, budget) in [
+        (0u16, 0u128),
+        (1, 1),
+        (7, 4_000_000),
+        (u16::MAX, u128::MAX),
+    ] {
+        let encoded = Instruction::ForfeitRecoveryLeg {
+            asset_index,
+            b_loss_atom_budget: budget,
+        }
+        .encode();
+        let mut expected = Vec::with_capacity(19);
+        expected.push(43u8);
+        expected.extend_from_slice(&asset_index.to_le_bytes());
+        expected.extend_from_slice(&budget.to_le_bytes());
+        assert_eq!(
+            encoded, expected,
+            "tag 43 is [43][u16 LE asset_index][u128 LE budget]; the rename moves no bytes"
+        );
+        assert_eq!(encoded.len(), 19, "1 + 2 + 16");
+        match Instruction::decode(&encoded).expect("round-trips") {
+            Instruction::ForfeitRecoveryLeg {
+                asset_index: got_asset,
+                b_loss_atom_budget: got_budget,
+            } => {
+                assert_eq!(got_asset, asset_index);
+                assert_eq!(got_budget, budget);
+            }
+            other => panic!("decoded to the wrong variant: {other:?}"),
+        }
+    }
+    println!("[cw03] tag 43 wire layout unchanged: 19 bytes, [43][u16][u128], round-trips");
+}
+
+/// Anti-rot: the old name is gone from source, tests and the README, and the
+/// README documents the unit. W-18's stale rationale comment is gone too.
+#[test]
+fn cw03_old_name_and_stale_comment_are_gone_from_the_repo() {
+    let src = include_str!("../src/v16_program.rs");
+    let readme = include_str!("../README.md");
+    let this_test_file = include_str!("../tests/v16_wrapper.rs");
+
+    // Built at runtime so this test file does not match its own needle.
+    let old_name = concat!("b_delta", "_budget");
+    let code_hits: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(old_name))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    for (line, text) in &code_hits {
+        println!("[cw03] v16_program.rs:{line}: {text}");
+    }
+    for (line, text) in &code_hits {
+        assert!(
+            text.starts_with("///") || text.starts_with("//"),
+            "the old name survives only as a legacy-alias COMMENT, never as code \
+             (v16_program.rs:{line}: {text})"
+        );
+    }
+    assert_eq!(
+        code_hits.len(),
+        2,
+        "two comment mentions: the unit-change note and the upstream-still-calls-it note"
+    );
+    assert_eq!(
+        this_test_file.matches(old_name).count(),
+        0,
+        "and the old name is gone from this test file"
+    );
+    assert!(
+        src.matches("b_loss_atom_budget").count() >= 8,
+        "the new name is carried through variant, decode, encode, dispatch and handler"
+    );
+    assert_eq!(
+        readme.matches("B-delta budget").count(),
+        0,
+        "README no longer documents tag 43 with the stale unit"
+    );
+    assert!(
+        readme.contains("collateral-atom loss budget"),
+        "README names the unit"
+    );
+    assert!(
+        readme.contains("legacy B-index-scale value now forfeits that many ATOMS"),
+        "README states the legacy-value hazard"
+    );
+
+    // W-18 — three rationale comments named a function the linked engine no longer has
+    // (grep count 4 -> 0 between 9483ee90 and 2c38570a). WRAPPER_IMPACT W-18 lists only
+    // the one in handle_expire_backing_bucket; the other two (:4409, :13913) were found by
+    // grepping and are corrected in the same commit. Each surviving mention must say the
+    // symbol was REMOVED and name what replaced it.
+    let gone = "realize_source_backed_claims_for_resolved_close_not_atomic";
+    let stale: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(gone))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    for (line, text) in &stale {
+        println!("[cw03] W-18 mention v16_program.rs:{line}: {text}");
+    }
+    assert_eq!(stale.len(), 3, "the three mentions, all now historical");
+    let src_lines: Vec<&str> = src.lines().collect();
+    for (line, text) in &stale {
+        assert!(
+            text.starts_with("///") || text.starts_with("//"),
+            "comment only (v16_program.rs:{line})"
+        );
+        let window = src_lines[line.saturating_sub(4)..*line].join("\n");
+        assert!(
+            window.contains("W-18"),
+            "each mention sits under the W-18 correction note (v16_program.rs:{line}: {text})"
+        );
+    }
+    assert!(
+        src.contains("realize_one_source_domain_for_resolved_close_not_atomic")
+            && src.contains("prepare_one_source_domain_for_resolved_close_not_atomic"),
+        "the comments now point at the bounded per-domain pair that replaced it"
+    );
+    println!("[cw03] rename complete; W-18 comment repointed");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// W-21 regression — the lapsed-bucket refusal, tag 50 + tag 91.
+//
+// Fixture helpers below (`W91_*`, `w91_*`, `W91Env`) are COPIED VERBATIM from
+// `verify/poc/W-91/poc_W-91_appended_to_v16_wrapper.rs:44-309` so the regression
+// runs on exactly the state the PoC measured. The `w21_*` tests underneath assert
+// the FIXED behaviour; `w21_old_*` carry the PoC's original defect assertions
+// under `#[should_panic]`.
+// ═══════════════════════════════════════════════════════════════════════════
+/// asset 1 LONG — the THIRD-PARTY provider's finite-expiry bucket (domain = asset*2 + side)
+const W91_FROM_DOMAIN: u16 = 2;
+/// asset 1 SHORT — the LP vault's own pot (`registry.domain`)
+const W91_TO_DOMAIN: u16 = 3;
+/// unliened principal, mirroring C-S-20b's measured `[cap] PRE = 97_376e12`
+const W91_U_ATOMS: u128 = 97_376;
+/// liened principal, mirroring C-S-20b's `lien = 2_624e12` (97_376 + 2_624 = 100_000)
+const W91_L_ATOMS: u128 = 2_624;
+const W91_FINITE_EXPIRY: u64 = 20;
+const W91_FEE_SHARE_BPS: u16 = 10_000;
+
+fn w91_signer_writable() -> TestAccount {
+    TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0)
+        .signer()
+        .writable()
+}
+
+/// Exactly what `handle_deposit_to_lp_vault` (`:15566`) and
+/// `handle_execute_redemption` (`:16324`) price a share against, per domain:
+/// `lp_vault_domain_nav_atoms` (`:10300-10326`). An uninitialised ledger
+/// contributes 0, exactly as that function documents.
+fn w91_nav(l: &TestAccount) -> u128 {
+    let Ok(ledger) = state::read_backing_domain_ledger(&l.data) else {
+        return 0;
+    };
+    percolator::lp_vault::lp_vault_nav_atoms(
+        ledger.total_principal_atoms,
+        ledger.total_earnings_atoms,
+        ledger.total_earnings_withdrawn_atoms,
+        ledger.cumulative_loss_atoms,
+        ledger.cumulative_recovery_atoms,
+        W91_FEE_SHARE_BPS,
+    )
+    .unwrap()
+}
+
+fn w91_principal(l: &TestAccount) -> u128 {
+    state::read_backing_domain_ledger(&l.data)
+        .map(|x| x.total_principal_atoms)
+        .unwrap_or(0)
+}
+
+/// The junior residual pool, transcribed from `percolator:src/v16.rs:8770-8779`
+/// (`residual()`, private) over the public host mirror fields.
+fn w91_residual(group: &MarketGroupV16) -> u128 {
+    group.vault.saturating_sub(
+        group
+            .c_tot
+            .saturating_add(group.insurance)
+            .saturating_add(group.backing_provider_earnings_total)
+            .saturating_add(group.source_fresh_backing_total_num / BOUND_SCALE),
+    )
+}
+
+fn w91_set_slot(market: &mut TestAccount, slot: u64) {
+    let (cfg, mut group) = state::read_market(&market.data).unwrap();
+    group.current_slot = slot;
+    state::write_market(&mut market.data, &cfg, &group).unwrap();
+}
+
+fn w91_group(market: &TestAccount) -> MarketGroupV16 {
+    state::read_market(&market.data).unwrap().1
+}
+
+fn w91_bucket(market: &TestAccount, domain: u16) -> percolator::BackingBucketV16 {
+    w91_group(market).source_backing_buckets[domain as usize]
+}
+
+struct W91Env {
+    admin: TestAccount,
+    provider: TestAccount,
+    cranker: TestAccount,
+    market: TestAccount,
+    from_ledger: TestAccount,
+    to_ledger: TestAccount,
+    registry: TestAccount,
+    sysprog: TestAccount,
+    token_program: TestAccount,
+    vault: TestAccount,
+    mint: Pubkey,
+    registry_pda: Pubkey,
+}
+
+/// `handle_create_lp_vault`'s FIND-1 binding, transcribed VERBATIM from
+/// `percolator-prog origin/main:src/v16_program.rs:15478-15484`:
+///
+/// ```ignore
+/// let asset_index = domain as usize / 2;
+/// let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
+/// profile.backing_bucket_authority = registry_pda.to_bytes();
+/// state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)?;
+/// ```
+///
+/// It is per-ASSET, so it takes BOTH domains of the asset away from whoever
+/// funded them — which `:15430-15436`'s own comment states outright ("the
+/// provider who funded the bucket can no longer withdraw because the authority
+/// they held is gone"). The `already_funded` guard at `:15443-15449` inspects
+/// ONLY `registry.domain`; a finite-expiry bucket on the SIBLING domain passes
+/// CreateLpVault untouched. Touches no engine counter.
+fn w91_bind_backing_authority(market: &mut TestAccount, asset_index: usize, authority: [u8; 32]) {
+    let mut profile = state::read_asset_oracle_profile(&market.data, asset_index).unwrap();
+    profile.backing_bucket_authority = authority;
+    state::write_asset_oracle_profile(&mut market.data, asset_index, &profile).unwrap();
+}
+
+/// Fixture: asset 1 active, a THIRD-PARTY provider's FINITE-expiry bucket on
+/// domain 2 funded through the real tag 50 `TopUpBackingBucket`, then the LP
+/// vault welded to domain 3 (registry created, FIND-1 binding applied).
+fn w91_env() -> W91Env {
+    let mut admin = signer();
+    let mut provider = signer();
+    let cranker = w91_signer_writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    // The PRE-vault world: a normal, signable backing authority for asset 1.
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let mut from_ledger = canonical_backing_ledger_account(&market, W91_FROM_DOMAIN);
+    let to_ledger = canonical_backing_ledger_account(&market, W91_TO_DOMAIN);
+    let mut sysprog = system_program_account();
+    let mut token_program = token_program_account();
+    let mut vault = vault_token_account(&market, mint, 0);
+    let mut source = user_token_account(provider.key, mint, W91_U_ATOMS as u64);
+
+    // Real tag 50: the provider funds domain 2 at a FINITE expiry.
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: W91_FROM_DOMAIN,
+            amount: W91_U_ATOMS,
+            expiry_slot: W91_FINITE_EXPIRY,
+        },
+        &mut [
+            &mut provider,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+            &mut from_ledger,
+            &mut sysprog,
+        ],
+    )
+    .expect("finite-expiry provider top-up must fund domain 2");
+
+    // The LP vault is created afterwards on the SIBLING domain (3).
+    let (registry_pda, registry_bump) = state::derive_lp_vault_registry(&program_id(), &market.key);
+    let mut registry = TestAccount::new(
+        registry_pda,
+        program_id(),
+        state::lp_vault_registry_account_len(),
+    )
+    .writable();
+    let reg = state::LpVaultRegistryV16 {
+        market_group: market.key.to_bytes(),
+        lp_mint: mint.to_bytes(),
+        fee_share_bps: W91_FEE_SHARE_BPS,
+        domain: W91_TO_DOMAIN,
+        paused: 0,
+        version: percolator_prog::constants::LP_VAULT_VERSION,
+        bump: registry_bump,
+        ..Default::default()
+    };
+    state::init_lp_vault_registry(&mut registry.data, &reg).unwrap();
+    // CreateLpVault :15478-15484 — takes BOTH domains of asset 1.
+    w91_bind_backing_authority(&mut market, 1, registry_pda.to_bytes());
+
+    W91Env {
+        admin,
+        provider,
+        cranker,
+        market,
+        from_ledger,
+        to_ledger,
+        registry,
+        sysprog,
+        token_program,
+        vault,
+        mint,
+        registry_pda,
+    }
+}
+
+/// COUNTERFACTUAL ONLY — re-stamp the source ledger's `authority` field with the
+/// registry PDA, which is what makes `read_or_new_backing_domain_ledger`
+/// (:16199-16205 -> :10470-10513) pass. NOT a reachable state: see
+/// `poc_w91_reachability_*` below. Used solely to isolate the gate at :16207.
+fn w91_forge_ledger_authority_to_registry(e: &mut W91Env) {
+    let a = e.registry_pda.to_bytes();
+    w91_stamp_ledger_authority(&mut e.from_ledger, a);
+}
+
+fn w91_stamp_ledger_authority(ledger: &mut TestAccount, authority: [u8; 32]) {
+    let mut l = state::read_backing_domain_ledger(&ledger.data).unwrap();
+    l.authority = authority;
+    state::write_backing_domain_ledger(&mut ledger.data, &l).unwrap();
+}
+
+fn w91_rebalance(e: &mut W91Env, amount: u128) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: W91_FROM_DOMAIN,
+            to_domain: W91_TO_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.from_ledger,
+            &mut e.to_ledger,
+            &mut e.sysprog,
+        ],
+    )
+}
+
+/// Same call WITHOUT the harness's on-Err snapshot/restore, so a
+/// "must not mutate" assertion is falsifiable.
+fn w91_rebalance_no_rollback(e: &mut W91Env, amount: u128) -> Result<(), ProgramError> {
+    run_ix_no_rollback(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: W91_FROM_DOMAIN,
+            to_domain: W91_TO_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.from_ledger,
+            &mut e.to_ledger,
+            &mut e.sysprog,
+        ],
+    )
+}
+
+fn w91_expire(e: &mut W91Env, domain: u16) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::ExpireBackingBucket { domain },
+        &mut [&mut e.market],
+    )
+}
+
+fn w91_resolve_with_open_trader(e: &mut W91Env) {
+    let mut trader = signer();
+    let mut portfolio = portfolio_account_for_market_slots(2);
+    init_portfolio(&mut trader, &mut e.market, &mut portfolio);
+    deposit(&mut trader, &mut e.market, &mut portfolio, 500);
+    run_ix(
+        Instruction::ResolveMarket,
+        &mut [&mut e.admin, &mut e.market],
+    )
+    .expect("admin resolve");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W-21 (a) — tag 50 `WithdrawBackingBucket` on a LAPSED Fresh bucket.
+//
+// Defect (`verify/items/C-S-10b.md`, `verify/poc/C-S-10/` part (c); wrapper-side
+// realization measured by the W-91 verifier): the engine's withdrawal gate
+// `prepare_counterparty_backing_withdraw_delta` (`2c38570a:src/v16.rs:2815-2819`)
+// tests `status != Fresh` only, so between `expiry_slot` and the next tag-89 crank
+// the provider withdraws principal the expiry rule forfeits into the junior pool.
+// Fix: the wrapper refuses first, on upstream's predicate.
+// ───────────────────────────────────────────────────────────────────────────
+
+struct W21Tag50Env {
+    provider: TestAccount,
+    market: TestAccount,
+    ledger: TestAccount,
+    token_program: TestAccount,
+    admin: TestAccount,
+    mint: Pubkey,
+}
+
+/// A third-party provider funding domain 2 through the REAL tag 50
+/// `TopUpBackingBucket`, at a finite expiry. No LP vault anywhere: the provider
+/// still holds `backing_bucket_authority`, so nothing but the clock is in play.
+fn w21_tag50_env(expiry_slot: u64) -> W21Tag50Env {
+    let mut admin = signer();
+    let mut provider = signer();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let mut ledger = canonical_backing_ledger_account(&market, W91_FROM_DOMAIN);
+    let mut sysprog = system_program_account();
+    let mut token_program = token_program_account();
+    let mut vault = vault_token_account(&market, mint, 0);
+    let mut source = user_token_account(provider.key, mint, W91_U_ATOMS as u64);
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: W91_FROM_DOMAIN,
+            amount: W91_U_ATOMS,
+            expiry_slot,
+        },
+        &mut [
+            &mut provider,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+            &mut ledger,
+            &mut sysprog,
+        ],
+    )
+    .expect("finite-expiry provider top-up must fund domain 2");
+
+    W21Tag50Env {
+        provider,
+        market,
+        ledger,
+        token_program,
+        admin,
+        mint,
+    }
+}
+
+/// `run_ix_no_rollback`, so "0 atoms moved" is a real assertion and not a
+/// harness restore.
+fn w21_tag50_withdraw(e: &mut W21Tag50Env, amount: u128) -> Result<(), ProgramError> {
+    let mut dest = user_token_account(e.provider.key, e.mint, 0);
+    let mut vault = vault_token_account(&e.market, e.mint, W91_U_ATOMS as u64);
+    let mut vault_auth = vault_authority_account(&e.market);
+    run_ix_no_rollback(
+        Instruction::WithdrawBackingBucket {
+            domain: W91_FROM_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.provider,
+            &mut e.market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut e.token_program,
+            &mut e.ledger,
+        ],
+    )
+}
+
+#[test]
+fn w21_tag50_refuses_a_lapsed_fresh_bucket_and_pays_an_unexpired_one() {
+    // ── (1) LAPSED: now == expiry_slot + 1. Refused, nothing moves. ──
+    let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    let g0 = w91_group(&e.market);
+    let b0 = g0.source_backing_buckets[W91_FROM_DOMAIN as usize];
+    let market_before = e.market.data.clone();
+    let ledger_before = e.ledger.data.clone();
+    println!(
+        "[w21-50] LAPSED  bucket status={:?} expiry={} now={} fresh_unliened={} | vault={} principal={}",
+        b0.status,
+        b0.expiry_slot,
+        g0.current_slot,
+        b0.fresh_unliened_backing_num,
+        g0.vault,
+        w91_principal(&e.ledger)
+    );
+    assert_eq!(b0.status, BackingBucketStatusV16::Fresh);
+    assert!(b0.expiry_slot <= g0.current_slot, "the bucket IS lapsed");
+
+    let r = w21_tag50_withdraw(&mut e, W91_U_ATOMS);
+    println!("[w21-50] LAPSED  provider tag50 withdraw(U={W91_U_ATOMS}) -> {r:?}   (was Ok(()) before W-21)");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineStale.into()),
+        "W-21: the lapsed-bucket refusal, upstream 2b1d025c:10561-10567"
+    );
+    let g1 = w91_group(&e.market);
+    println!(
+        "[w21-50] LAPSED  0 atoms moved: vault {} (flat), ledger.principal {} (flat), fresh_unliened {} (flat)",
+        g1.vault,
+        w91_principal(&e.ledger),
+        g1.source_backing_buckets[W91_FROM_DOMAIN as usize].fresh_unliened_backing_num
+    );
+    assert_eq!(e.market.data, market_before, "no byte of the market moved");
+    assert_eq!(e.ledger.data, ledger_before, "no byte of the ledger moved");
+
+    // …and the canonical transition is still available: tag 89 forfeits it.
+    let mut market_only = [&mut e.market];
+    let x = run_ix(
+        Instruction::ExpireBackingBucket {
+            domain: W91_FROM_DOMAIN,
+        },
+        &mut market_only,
+    );
+    println!("[w21-50] LAPSED  tag89 ExpireBackingBucket -> {x:?}   (the rule W-21 stops the provider front-running)");
+    assert_eq!(x, Ok(()));
+    assert_eq!(
+        w91_group(&e.market).source_backing_buckets[W91_FROM_DOMAIN as usize].status,
+        BackingBucketStatusV16::Expired
+    );
+
+    // ── (2) UNEXPIRED: now < expiry_slot. Unchanged — still pays out. ──
+    let mut u = w21_tag50_env(W91_FINITE_EXPIRY);
+    w91_set_slot(&mut u.market, W91_FINITE_EXPIRY - 1);
+    let vault_pre = w91_group(&u.market).vault;
+    let ok = w21_tag50_withdraw(&mut u, W91_U_ATOMS);
+    let gu = w91_group(&u.market);
+    println!(
+        "[w21-50] UNEXPIRED now={} < expiry={} provider tag50 withdraw(U={W91_U_ATOMS}) -> {ok:?} | vault {vault_pre} -> {} | ledger.principal -> {}",
+        W91_FINITE_EXPIRY - 1,
+        W91_FINITE_EXPIRY,
+        gu.vault,
+        w91_principal(&u.ledger)
+    );
+    assert_eq!(ok, Ok(()), "W-21 must not touch an unexpired withdrawal");
+    assert_eq!(gu.vault, vault_pre - W91_U_ATOMS);
+    assert_eq!(w91_principal(&u.ledger), 0);
+}
+
+#[test]
+fn w21_tag50_refuses_a_lapsed_bucket_in_terminal_flat_resolved_too() {
+    // The shape the W-91 verifier measured paying out: Resolved, no materialized
+    // portfolios, c_tot == 0, bucket Fresh but lapsed. It paid `header.vault
+    // 97376 -> 0`; it must now refuse.
+    let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
+    run_ix(
+        Instruction::ResolveMarket,
+        &mut [&mut e.admin, &mut e.market],
+    )
+    .expect("admin resolve on an empty market");
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    let g0 = w91_group(&e.market);
+    println!(
+        "[w21-50R] mode={:?} materialized={} c_tot={} | bucket status={:?} expiry={} now={} | vault={}",
+        g0.mode,
+        g0.materialized_portfolio_count,
+        g0.c_tot,
+        g0.source_backing_buckets[W91_FROM_DOMAIN as usize].status,
+        g0.source_backing_buckets[W91_FROM_DOMAIN as usize].expiry_slot,
+        g0.current_slot,
+        g0.vault
+    );
+    assert_eq!(g0.mode, MarketModeV16::Resolved);
+    assert_eq!(g0.materialized_portfolio_count, 0);
+    assert_eq!(g0.c_tot, 0);
+
+    let r = w21_tag50_withdraw(&mut e, W91_U_ATOMS);
+    println!("[w21-50R] terminal-flat Resolved, provider tag50 on the LAPSED bucket -> {r:?}   (was Ok(()), vault 97376 -> 0)");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineStale.into())
+    );
+    assert_eq!(
+        w91_group(&e.market).vault,
+        g0.vault,
+        "header.vault is flat — the atoms did not leave"
+    );
+}
+
+/// The original defect assertion, in the form the wrapper-side C-S-10b claim
+/// takes: a lapsed Fresh bucket pays the provider. It must now PANIC.
+#[test]
+#[should_panic(expected = "PRE-W-21: a lapsed Fresh bucket still pays the provider")]
+fn w21_old_tag50_lapsed_payout_assertion_must_now_fail() {
+    let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    let r = w21_tag50_withdraw(&mut e, W91_U_ATOMS);
+    println!("[w21-old50] provider tag50 on the LAPSED bucket -> {r:?}");
+    assert_eq!(r, Ok(()), "PRE-W-21: a lapsed Fresh bucket still pays the provider");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W-21 (b) — tag 91 `RebalanceLpVaultBacking`'s inline gate (`:16207`).
+//
+// `verify/poc/W-91/` is DEFEATED one gate earlier (the ledger-authority bind),
+// so these use the PoC's own counterfactual — `w91_forge_ledger_authority_to_registry`
+// — to isolate `:16207`, exactly as the PoC and its negative control do.
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn w21_tag91_refuses_a_lapsed_bucket_and_the_two_orderings_converge() {
+    // ORDERING B (rebalance first) is now refused, so the only transition left is
+    // the canonical expiry — which is ORDERING A. The race is gone.
+    let mut e = w91_env();
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    w91_forge_ledger_authority_to_registry(&mut e);
+    let residual_pre = w91_residual(&w91_group(&e.market));
+
+    let r = w91_rebalance(&mut e, W91_U_ATOMS);
+    println!("[w21-91] tag91 on the LAPSED bucket -> {r:?}   (was Ok(()) before W-21)");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineLockActive.into()),
+        "W-21: :16207 now carries the expiry test"
+    );
+    assert_eq!(w91_principal(&e.to_ledger), 0, "nothing moved into the LP pot");
+
+    w91_expire(&mut e, W91_FROM_DOMAIN).expect("the canonical transition still runs");
+    let g = w91_group(&e.market);
+    println!(
+        "[w21-91] then tag89 -> bucket{}={:?}; junior residual {residual_pre} -> {} (+{})",
+        W91_FROM_DOMAIN,
+        g.source_backing_buckets[W91_FROM_DOMAIN as usize].status,
+        w91_residual(&g),
+        w91_residual(&g) - residual_pre
+    );
+    assert_eq!(
+        w91_residual(&g) - residual_pre,
+        W91_U_ATOMS,
+        "ORDERINGS CONVERGE: both land exactly U in the junior residual pool"
+    );
+
+    // ORDERING A, run separately, for the same endpoint.
+    let mut a = w91_env();
+    w91_set_slot(&mut a.market, W91_FINITE_EXPIRY + 1);
+    w91_forge_ledger_authority_to_registry(&mut a);
+    let res_a_pre = w91_residual(&w91_group(&a.market));
+    w91_expire(&mut a, W91_FROM_DOMAIN).expect("a lapsed Fresh bucket must expire");
+    let ra = w91_rebalance(&mut a, W91_U_ATOMS);
+    println!(
+        "[w21-91] ORDERING A: tag89 then tag91 -> {ra:?} | junior residual +{}",
+        w91_residual(&w91_group(&a.market)) - res_a_pre
+    );
+    assert_eq!(
+        ra,
+        Err(percolator_prog::error::PercolatorError::EngineLockActive.into())
+    );
+    assert_eq!(
+        w91_residual(&w91_group(&a.market)) - res_a_pre,
+        W91_U_ATOMS
+    );
+}
+
+#[test]
+fn w21_tag91_still_rebalances_an_unexpired_bucket_and_the_sentinel_pot() {
+    // (1) UNEXPIRED finite bucket — the ordinary case, untouched.
+    let mut e = w91_env();
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY - 1);
+    w91_forge_ledger_authority_to_registry(&mut e);
+    let r = w91_rebalance(&mut e, W91_U_ATOMS);
+    let g = w91_group(&e.market);
+    println!(
+        "[w21-91ok] UNEXPIRED now={} < expiry={} tag91 -> {r:?} | to.principal={} to.expiry={}",
+        W91_FINITE_EXPIRY - 1,
+        W91_FINITE_EXPIRY,
+        w91_principal(&e.to_ledger),
+        g.source_backing_buckets[W91_TO_DOMAIN as usize].expiry_slot
+    );
+    assert_eq!(r, Ok(()), "W-21 must not break a live rebalance");
+    assert_eq!(w91_principal(&e.to_ledger), W91_U_ATOMS);
+
+    // (2) …and the LP vault's OWN pot, which sits at LP_VAULT_BACKING_EXPIRY_SLOT
+    //     (= u64::MAX/2), is never lapsed for any reachable slot: rebalancing back
+    //     out of it still works at a far-future slot.
+    let sentinel = percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT;
+    w91_set_slot(&mut e.market, 10_000_000_000u64);
+    let back = run_ix(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: W91_TO_DOMAIN,
+            to_domain: W91_FROM_DOMAIN,
+            amount: W91_U_ATOMS,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.to_ledger,
+            &mut e.from_ledger,
+            &mut e.sysprog,
+        ],
+    );
+    println!(
+        "[w21-91ok] SENTINEL pot (expiry={sentinel}) rebalanced back at slot 10_000_000_000 -> {back:?}"
+    );
+    assert_eq!(
+        back,
+        Ok(()),
+        "the sentinel expiry must stay above every reachable slot"
+    );
+}
+
+/// `verify/poc/W-91/poc_W-91_appended_to_v16_wrapper.rs`'s counterfactual
+/// assertion (LIVE, ORDERING B), verbatim. It must now PANIC.
+#[test]
+#[should_panic(
+    expected = "the gate at :16207-16212 tests `status != Fresh` only — a lapsed Fresh bucket passes"
+)]
+fn w21_old_w91_counterfactual_assertion_must_now_fail() {
+    let mut e = w91_env();
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    w91_forge_ledger_authority_to_registry(&mut e);
+    let r = w91_rebalance(&mut e, W91_U_ATOMS);
+    println!("[w21-old91] LIVE tag91 on the LAPSED bucket -> {r:?}");
+    r.expect("the gate at :16207-16212 tests `status != Fresh` only — a lapsed Fresh bucket passes");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// W-22 regression — `CreateLpVault`'s born-dead guard reads the SIBLING domain too.
+//
+// Fixture helpers below (`WSIB_*`, `wsib_*`, `WsibEnv`) are COPIED VERBATIM from
+// `verify/poc/W-SIB/poc_W-SIB_appended_to_v16_wrapper.rs:44-421`, so the regression
+// runs on exactly the state the PoC measured. The `w22_*` tests underneath assert the
+// FIXED behaviour; `w22_old_*` carries the PoC's original defect assertion under
+// `#[should_panic]`.
+// ═══════════════════════════════════════════════════════════════════════════
+// byte is changed for the PASS runs (only for the negative control).
+//
+// HARNESS NOTE (true of every test in this binary): `sol_invoke_signed` is the
+// default no-op stub, so SPL-token CPIs move no bytes. Token-account balances
+// are therefore fixtures, and every "moved / did not move" assertion below is
+// made against the ENGINE counters the handler itself writes
+// (`header.vault`, the bucket, the `BackingDomainLedger`), never against an ATA.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// asset 1 LONG — the SIBLING domain: the third-party provider's bucket.
+const WSIB_PROVIDER_DOMAIN: u16 = 2;
+/// asset 1 SHORT — `registry.domain`: the LP vault's own pot.
+const WSIB_VAULT_DOMAIN: u16 = 3;
+/// the provider's unliened principal U
+const WSIB_U_ATOMS: u128 = 97_376;
+const WSIB_FINITE_EXPIRY: u64 = 20;
+const WSIB_LAPSED_SLOT: u64 = 21;
+const WSIB_FEE_SHARE_BPS: u16 = 10_000;
+
+const WSIB_ERR_UNAUTHORIZED: u32 = 8;
+const WSIB_ERR_ENGINE_LOCK_ACTIVE: u32 = 21;
+const WSIB_ERR_LP_VAULT_AUTHORITY_MISMATCH: u32 = 40;
+const WSIB_ERR_LP_VAULT_BACKING_BUCKET_NOT_EMPTY: u32 = 63;
+
+struct WsibEnv {
+    admin: TestAccount,
+    provider: TestAccount,
+    cranker: TestAccount,
+    market: TestAccount,
+    provider_ledger: TestAccount,
+    vault_ledger: TestAccount,
+    registry: TestAccount,
+    sysprog: TestAccount,
+    token_program: TestAccount,
+    vault: TestAccount,
+    vault_auth: TestAccount,
+    provider_dest: TestAccount,
+    admin_dest: TestAccount,
+    mint: Pubkey,
+    registry_pda: Pubkey,
+}
+
+fn wsib_signer_writable() -> TestAccount {
+    TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0)
+        .signer()
+        .writable()
+}
+
+fn wsib_group(market: &TestAccount) -> MarketGroupV16 {
+    state::read_market(&market.data).unwrap().1
+}
+
+fn wsib_bucket(market: &TestAccount, domain: u16) -> percolator::BackingBucketV16 {
+    wsib_group(market).source_backing_buckets[domain as usize]
+}
+
+fn wsib_set_slot(market: &mut TestAccount, slot: u64) {
+    let (cfg, mut group) = state::read_market(&market.data).unwrap();
+    group.current_slot = slot;
+    state::write_market(&mut market.data, &cfg, &group).unwrap();
+}
+
+/// The junior residual pool, transcribed from `percolator:src/v16.rs:8770-8779`
+/// (`residual()`, a private fn) over the public host mirror fields.
+fn wsib_residual(group: &MarketGroupV16) -> u128 {
+    group.vault.saturating_sub(
+        group
+            .c_tot
+            .saturating_add(group.insurance)
+            .saturating_add(group.backing_provider_earnings_total)
+            .saturating_add(group.source_fresh_backing_total_num / BOUND_SCALE),
+    )
+}
+
+fn wsib_principal(l: &TestAccount) -> u128 {
+    state::read_backing_domain_ledger(&l.data)
+        .map(|x| x.total_principal_atoms)
+        .unwrap_or(0)
+}
+
+fn wsib_ledger_authority(l: &TestAccount) -> [u8; 32] {
+    state::read_backing_domain_ledger(&l.data)
+        .map(|x| x.authority)
+        .unwrap_or([0u8; 32])
+}
+
+/// Exactly what `handle_deposit_to_lp_vault` (`:15566`) and
+/// `handle_execute_redemption` (`:16324`) price a share against, per domain:
+/// `lp_vault_domain_nav_atoms` (`:10300-10326`).
+fn wsib_nav(l: &TestAccount) -> u128 {
+    let Ok(ledger) = state::read_backing_domain_ledger(&l.data) else {
+        return 0;
+    };
+    percolator::lp_vault::lp_vault_nav_atoms(
+        ledger.total_principal_atoms,
+        ledger.total_earnings_atoms,
+        ledger.total_earnings_withdrawn_atoms,
+        ledger.cumulative_loss_atoms,
+        ledger.cumulative_recovery_atoms,
+        WSIB_FEE_SHARE_BPS,
+    )
+    .unwrap()
+}
+
+fn wsib_backing_authority(market: &TestAccount) -> [u8; 32] {
+    state::read_asset_oracle_profile(&market.data, 1)
+        .unwrap()
+        .backing_bucket_authority
+}
+
+fn wsib_asset_admin(market: &TestAccount) -> [u8; 32] {
+    state::read_asset_oracle_profile(&market.data, 1)
+        .unwrap()
+        .asset_admin
+}
+
+/// `handle_create_lp_vault`'s FIND-1 binding, transcribed VERBATIM from
+/// `percolator-prog origin/main:src/v16_program.rs:15478-15484`:
+///
+/// ```ignore
+/// let asset_index = domain as usize / 2;
+/// let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
+/// profile.backing_bucket_authority = registry_pda.to_bytes();
+/// state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)?;
+/// ```
+///
+/// Transcribed rather than executed because `CreateLpVault` creates two PDAs and
+/// initializes an SPL mint by CPI, and this harness's `sol_invoke_signed` is the
+/// no-op stub. `poc_wsib_create_lp_vault_*` below runs the REAL instruction up
+/// to and including both gates that precede this write, so the only untested
+/// step is the four-line write quoted above.
+fn wsib_bind_backing_authority(market: &mut TestAccount, authority: [u8; 32]) {
+    let mut profile = state::read_asset_oracle_profile(&market.data, 1).unwrap();
+    profile.backing_bucket_authority = authority;
+    state::write_asset_oracle_profile(&mut market.data, 1, &profile).unwrap();
+}
+
+/// The world BEFORE any LP vault: asset 1 active with a signable
+/// `backing_bucket_authority` (the provider), who funds domain 2 at a FINITE
+/// expiry through the real tag 50. The LP-vault registry account exists (domain
+/// 3) but the FIND-1 binding has NOT been applied.
+fn wsib_env_unbound() -> WsibEnv {
+    let mut admin = signer();
+    let provider = signer();
+    let cranker = wsib_signer_writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let mut provider_ledger = canonical_backing_ledger_account(&market, WSIB_PROVIDER_DOMAIN);
+    let vault_ledger = canonical_backing_ledger_account(&market, WSIB_VAULT_DOMAIN);
+    let mut sysprog = system_program_account();
+    let mut token_program = token_program_account();
+    // Funded to U: the top-up's token CPI is the no-op stub, so the ATA must
+    // already carry the balance the engine counter will claim.
+    let mut vault = vault_token_account(&market, mint, WSIB_U_ATOMS as u64);
+    let vault_auth = vault_authority_account(&market);
+    let mut source = user_token_account(provider.key, mint, WSIB_U_ATOMS as u64);
+    let provider_dest = user_token_account(provider.key, mint, 0);
+    let admin_dest = user_token_account(admin.key, mint, 0);
+
+    let mut provider_signing = TestAccount::new(provider.key, provider.owner, 0).signer();
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: WSIB_PROVIDER_DOMAIN,
+            amount: WSIB_U_ATOMS,
+            expiry_slot: WSIB_FINITE_EXPIRY,
+        },
+        &mut [
+            &mut provider_signing,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+            &mut provider_ledger,
+            &mut sysprog,
+        ],
+    )
+    .expect("finite-expiry provider top-up must fund the sibling domain");
+
+    let (registry_pda, registry_bump) = state::derive_lp_vault_registry(&program_id(), &market.key);
+    let mut registry = TestAccount::new(
+        registry_pda,
+        program_id(),
+        state::lp_vault_registry_account_len(),
+    )
+    .writable();
+    let reg = state::LpVaultRegistryV16 {
+        market_group: market.key.to_bytes(),
+        lp_mint: mint.to_bytes(),
+        fee_share_bps: WSIB_FEE_SHARE_BPS,
+        domain: WSIB_VAULT_DOMAIN,
+        paused: 0,
+        version: percolator_prog::constants::LP_VAULT_VERSION,
+        bump: registry_bump,
+        ..Default::default()
+    };
+    state::init_lp_vault_registry(&mut registry.data, &reg).unwrap();
+
+    WsibEnv {
+        admin,
+        provider,
+        cranker,
+        market,
+        provider_ledger,
+        vault_ledger,
+        registry,
+        sysprog,
+        token_program,
+        vault,
+        vault_auth,
+        provider_dest,
+        admin_dest,
+        mint,
+        registry_pda,
+    }
+}
+
+/// Same world AFTER `CreateLpVault` on domain 3 — i.e. with the FIND-1 binding.
+fn wsib_env() -> WsibEnv {
+    let mut e = wsib_env_unbound();
+    let a = e.registry_pda.to_bytes();
+    wsib_bind_backing_authority(&mut e.market, a);
+    e
+}
+
+/// Tag 50 `WithdrawBackingBucket` on the provider's own domain, signed by `who`,
+/// paying into `dest`. `run_ix_no_rollback` so "must not mutate" is falsifiable.
+fn wsib_withdraw_no_rollback(
+    e: &mut WsibEnv,
+    who_key: Pubkey,
+    who_owner: Pubkey,
+    dest_is_admin: bool,
+    amount: u128,
+) -> Result<(), ProgramError> {
+    let mut who = TestAccount::new(who_key, who_owner, 0).signer();
+    let dest: &mut TestAccount = if dest_is_admin {
+        &mut e.admin_dest
+    } else {
+        &mut e.provider_dest
+    };
+    run_ix_no_rollback(
+        Instruction::WithdrawBackingBucket {
+            domain: WSIB_PROVIDER_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut who,
+            &mut e.market,
+            dest,
+            &mut e.vault,
+            &mut e.vault_auth,
+            &mut e.token_program,
+            &mut e.provider_ledger,
+        ],
+    )
+}
+
+fn wsib_provider_withdraw(e: &mut WsibEnv, amount: u128) -> Result<(), ProgramError> {
+    let (k, o) = (e.provider.key, e.provider.owner);
+    wsib_withdraw_no_rollback(e, k, o, false, amount)
+}
+
+/// The REAL tag 74 `CreateLpVault`, run as far as this harness allows. Both
+/// gates that matter (`:15423-15424` marketauth, `:15443-15449` born-dead)
+/// precede every CPI, so their verdicts are executed, not argued.
+/// `bogus_registry = true` passes a non-PDA registry account, so a run that gets
+/// past the born-dead guard dies at `expect_key` (`:15455`) with
+/// `ProgramError::InvalidArgument` — a marker distinct from every `Custom(n)`.
+fn wsib_create_lp_vault(
+    e: &mut WsibEnv,
+    signer_key: Pubkey,
+    signer_owner: Pubkey,
+    domain: u16,
+    bogus_registry: bool,
+) -> Result<(), ProgramError> {
+    let mut who = TestAccount::new(signer_key, signer_owner, 0)
+        .signer()
+        .writable();
+    let mut registry_ai = if bogus_registry {
+        TestAccount::new(Pubkey::new_unique(), solana_program::system_program::ID, 0).writable()
+    } else {
+        TestAccount::new(e.registry_pda, solana_program::system_program::ID, 0).writable()
+    };
+    let (mint_pda, _) = state::derive_lp_vault_mint(&program_id(), &e.market.key);
+    let mut mint_ai =
+        TestAccount::new(mint_pda, solana_program::system_program::ID, 0).writable();
+    run_ix_no_rollback(
+        Instruction::CreateLpVault {
+            fee_share_bps: WSIB_FEE_SHARE_BPS,
+            redemption_cooldown_slots: 0,
+            oi_reservation_threshold_bps: 0,
+            domain,
+        },
+        &mut [
+            &mut who,
+            &mut e.market,
+            &mut registry_ai,
+            &mut mint_ai,
+            &mut e.sysprog,
+            &mut e.token_program,
+        ],
+    )
+}
+
+fn wsib_expire(e: &mut WsibEnv, domain: u16) -> Result<(), ProgramError> {
+    // Account 0 and ONLY account 0 (`:10867`). No signer anywhere.
+    run_ix(
+        Instruction::ExpireBackingBucket { domain },
+        &mut [&mut e.market],
+    )
+}
+
+fn wsib_rebalance(e: &mut WsibEnv, amount: u128) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: WSIB_PROVIDER_DOMAIN,
+            to_domain: WSIB_VAULT_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.provider_ledger,
+            &mut e.vault_ledger,
+            &mut e.sysprog,
+        ],
+    )
+}
+
+/// Tag 65 `UpdateAssetAuthority`, rotating `backing_bucket_authority` back to a
+/// signable key. `registry_live = false` zeroes the registry account, which is
+/// the state `CloseLpVault` (`:17512-17518`) leaves behind.
+fn wsib_rotate_backing_authority(
+    e: &mut WsibEnv,
+    new_key: Pubkey,
+    new_owner: Pubkey,
+    registry_live: bool,
+) -> Result<(), ProgramError> {
+    let admin_key = e.admin.key;
+    let admin_owner = e.admin.owner;
+    let mut current = TestAccount::new(admin_key, admin_owner, 0).signer();
+    let mut new_authority = TestAccount::new(new_key, new_owner, 0).signer();
+    let mut registry_ai = if registry_live {
+        TestAccount::new_with_data(e.registry_pda, program_id(), e.registry.data.clone())
+    } else {
+        TestAccount::new(e.registry_pda, program_id(), e.registry.data.len())
+    };
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 1,
+            kind: ASSET_AUTH_BACKING_BUCKET,
+            new_pubkey: new_key.to_bytes(),
+        },
+        &mut [
+            &mut current,
+            &mut new_authority,
+            &mut e.market,
+            &mut registry_ai,
+        ],
+    )
+}
+
+
+/// `wsib_env_unbound` with the provider top-up SKIPPED: both domains of asset 1
+/// are Empty, which is the shape an LP vault is meant to be created over.
+fn w22_env_unfunded() -> WsibEnv {
+    let mut admin = signer();
+    let provider = signer();
+    let cranker = wsib_signer_writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let provider_ledger = canonical_backing_ledger_account(&market, WSIB_PROVIDER_DOMAIN);
+    let vault_ledger = canonical_backing_ledger_account(&market, WSIB_VAULT_DOMAIN);
+    let sysprog = system_program_account();
+    let token_program = token_program_account();
+    let vault = vault_token_account(&market, mint, WSIB_U_ATOMS as u64);
+    let vault_auth = vault_authority_account(&market);
+    let provider_dest = user_token_account(provider.key, mint, 0);
+    let admin_dest = user_token_account(admin.key, mint, 0);
+
+    let (registry_pda, registry_bump) = state::derive_lp_vault_registry(&program_id(), &market.key);
+    let mut registry = TestAccount::new(
+        registry_pda,
+        program_id(),
+        state::lp_vault_registry_account_len(),
+    )
+    .writable();
+    let reg = state::LpVaultRegistryV16 {
+        market_group: market.key.to_bytes(),
+        lp_mint: mint.to_bytes(),
+        fee_share_bps: WSIB_FEE_SHARE_BPS,
+        domain: WSIB_VAULT_DOMAIN,
+        paused: 0,
+        version: percolator_prog::constants::LP_VAULT_VERSION,
+        bump: registry_bump,
+        ..Default::default()
+    };
+    state::init_lp_vault_registry(&mut registry.data, &reg).unwrap();
+
+    WsibEnv {
+        admin,
+        provider,
+        cranker,
+        market,
+        provider_ledger,
+        vault_ledger,
+        registry,
+        sysprog,
+        token_program,
+        vault,
+        vault_auth,
+        provider_dest,
+        admin_dest,
+        mint,
+        registry_pda,
+    }
+}
+
+#[test]
+fn w22_create_lp_vault_refuses_over_a_funded_sibling_and_the_provider_keeps_their_exit() {
+    let mut e = wsib_env_unbound();
+    let provider_key = e.provider.key.to_bytes();
+    assert_eq!(
+        wsib_backing_authority(&e.market),
+        provider_key,
+        "fixture: the provider holds backing_bucket_authority before any vault"
+    );
+    let market_before = e.market.data.clone();
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+
+    // (a) the FUNDED domain — refused before and after W-22.
+    let r_funded = wsib_create_lp_vault(&mut e, ak, ao, WSIB_PROVIDER_DOMAIN, true);
+    println!("[w22] marketauth CreateLpVault(domain=2, the FUNDED one) -> {r_funded:?}");
+    assert_eq!(
+        r_funded,
+        Err(ProgramError::Custom(
+            WSIB_ERR_LP_VAULT_BACKING_BUCKET_NOT_EMPTY
+        ))
+    );
+
+    // (b) THE FLIPPED CASE — its SIBLING. Was Err(InvalidArgument) (the expect_key
+    //     marker: the guard had passed and the FIND-1 binding would have run).
+    let r_sibling = wsib_create_lp_vault(&mut e, ak, ao, WSIB_VAULT_DOMAIN, true);
+    println!(
+        "[w22] marketauth CreateLpVault(domain=3, sibling of the funded 2) -> {r_sibling:?}   (was InvalidArgument: the guard did not bite)"
+    );
+    assert_eq!(
+        r_sibling,
+        Err(ProgramError::Custom(
+            WSIB_ERR_LP_VAULT_BACKING_BUCKET_NOT_EMPTY
+        )),
+        "W-22: the guard now reads sibling_domain(domain) too, and refuses BEFORE any binding"
+    );
+
+    // Nothing was taken: no partial write, and the authority is still the provider's.
+    assert_eq!(
+        e.market.data, market_before,
+        "a refused CreateLpVault must not touch the market (run_ix_no_rollback: no harness restore)"
+    );
+    assert_eq!(
+        wsib_backing_authority(&e.market),
+        provider_key,
+        "the refusal leaves the bucket's owner intact (:15438)"
+    );
+
+    // …so the provider's exit still works: the whole W-SIB loss is gone.
+    let vault_before = wsib_group(&e.market).vault;
+    let w = wsib_provider_withdraw(&mut e, WSIB_U_ATOMS);
+    println!(
+        "[w22] provider tag50 withdraw(U={WSIB_U_ATOMS}) -> {w:?} | header.vault {vault_before} -> {} | ledger.principal -> {}",
+        wsib_group(&e.market).vault,
+        wsib_principal(&e.provider_ledger)
+    );
+    assert_eq!(w, Ok(()), "the provider is no longer stranded");
+    assert_eq!(wsib_group(&e.market).vault, 0);
+    assert_eq!(wsib_principal(&e.provider_ledger), 0);
+}
+
+#[test]
+fn w22_create_lp_vault_still_passes_the_guard_when_both_domains_are_empty() {
+    // The legitimate case must be untouched. Same marker logic as the PoC:
+    // reaching `expect_key` (`:15455`, the first fallible statement after the
+    // guard block) proves the guard did NOT refuse.
+    let mut e = w22_env_unfunded();
+    for d in [WSIB_PROVIDER_DOMAIN, WSIB_VAULT_DOMAIN] {
+        let b = wsib_bucket(&e.market, d);
+        println!(
+            "[w22-ok] bucket{d} status={:?} fresh_unliened={} valid={} consumed={} impaired={}",
+            b.status,
+            b.fresh_unliened_backing_num,
+            b.valid_liened_backing_num,
+            b.consumed_liened_backing_num,
+            b.impaired_liened_backing_num
+        );
+        assert_eq!(b.status, BackingBucketStatusV16::Empty);
+    }
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+    for d in [WSIB_PROVIDER_DOMAIN, WSIB_VAULT_DOMAIN] {
+        let r = wsib_create_lp_vault(&mut e, ak, ao, d, true);
+        println!("[w22-ok] marketauth CreateLpVault(domain={d}) over EMPTY buckets -> {r:?}   (PAST the guard, died at expect_key :15455)");
+        assert_eq!(
+            r,
+            Err(ProgramError::InvalidArgument),
+            "W-22 must not refuse a vault over two empty domains"
+        );
+    }
+}
+
+#[test]
+fn w22_gh453_spent_ledger_adoption_path_is_unaffected() {
+    // GH#453's shape: the provider funded a domain and withdrew it ALL, so the
+    // canonical ledger PDA persists with a stale authority and zero principal
+    // while the BUCKET is empty. `read_or_new_backing_domain_ledger:10474-10483`
+    // adopts exactly that. W-22 reads BUCKETS, so it must not refuse here — the
+    // guard is widened over the sibling, not over spent history.
+    let mut e = wsib_env_unbound();
+    let w = wsib_provider_withdraw(&mut e, WSIB_U_ATOMS);
+    assert_eq!(w, Ok(()), "the provider empties their own domain first");
+    let b2 = wsib_bucket(&e.market, WSIB_PROVIDER_DOMAIN);
+    println!(
+        "[w22-453] after a FULL withdrawal: bucket2 status={:?} fresh_unliened={} valid={} consumed={} impaired={} | ledger.authority==provider: {} principal={} earnings={}",
+        b2.status,
+        b2.fresh_unliened_backing_num,
+        b2.valid_liened_backing_num,
+        b2.consumed_liened_backing_num,
+        b2.impaired_liened_backing_num,
+        wsib_ledger_authority(&e.provider_ledger) == e.provider.key.to_bytes(),
+        wsib_principal(&e.provider_ledger),
+        state::read_backing_domain_ledger(&e.provider_ledger.data)
+            .unwrap()
+            .total_earnings_atoms
+    );
+    assert_eq!(b2.status, BackingBucketStatusV16::Empty);
+    assert_eq!(wsib_principal(&e.provider_ledger), 0);
+    assert_eq!(
+        wsib_ledger_authority(&e.provider_ledger),
+        e.provider.key.to_bytes(),
+        "the SPENT ledger keeps its stale authority — that is #453's whole premise"
+    );
+
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+    let r = wsib_create_lp_vault(&mut e, ak, ao, WSIB_VAULT_DOMAIN, true);
+    println!("[w22-453] marketauth CreateLpVault(domain=3) over a SPENT sibling ledger -> {r:?}   (PAST the guard)");
+    assert_eq!(
+        r,
+        Err(ProgramError::InvalidArgument),
+        "#453's adoption path stays reachable: W-22 refuses on VALUE in the bucket, not on a spent ledger"
+    );
+}
+
+/// `verify/poc/W-SIB/poc_W-SIB_appended_to_v16_wrapper.rs`'s §1 case (c)
+/// assertion, verbatim. It must now PANIC.
+#[test]
+#[should_panic(expected = "must be the expect_key marker, NOT Custom(63): the guard did not bite on the sibling")]
+fn w22_old_wsib_sibling_assertion_must_now_fail() {
+    let mut e = wsib_env_unbound();
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+    let r_sibling = wsib_create_lp_vault(&mut e, ak, ao, WSIB_VAULT_DOMAIN, true);
+    println!(
+        "[w22-old] marketauth CreateLpVault(domain=3, sibling of the funded 2) -> {r_sibling:?}"
+    );
+    assert_eq!(
+        r_sibling,
+        Err(ProgramError::InvalidArgument),
+        "must be the expect_key marker, NOT Custom(63): the guard did not bite on the sibling"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// W-GEN-L — the asset GENERATION stamp on `BackingDomainLedgerAccountV16`.
+//
+// The ledger PDA is keyed `(market_group, domain)` only, so it survives a
+// retire + re-activate of the asset slot — and tag 40's
+// `permissionless_reuse_target` lets any caller who pays the market-init fee
+// perform that re-activation. Before this fix `read_or_new_backing_domain_ledger`
+// compared only `market_group` / `authority` / `domain`, so the NEW market
+// inherited the OLD market's `total_deposited_atoms`,
+// `total_principal_withdrawn_atoms`, `cumulative_loss_atoms` (==
+// `residual_received_atoms()`, the deterministic LP-farm reward counter) and
+// `last_observed_unavailable_principal_atoms`.
+//
+// Measured as W-GEN PoC attempt 2b
+// (`verify/poc/W-GEN/poc_W-GEN.rs::poc_wgen_2b_backing_domain_ledger_counters_survive_the_generation_flip`),
+// which asserted the DEFECT: 700 atoms deposited under generation M1 plus 300
+// under M2 reported as a single `total_deposited_atoms = 1_000`. The port below
+// asserts the FIXED behaviour on the same staging.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A second signing handle on the SAME key (W-GEN PoC helper: instructions that
+/// want the incoming authority to co-sign alongside the caller).
+fn wgenl_co_signer(key: Pubkey) -> TestAccount {
+    TestAccount::new(key, Pubkey::new_unique(), 0).signer()
+}
+
+fn wgenl_lifecycle_ix(
+    action: u8,
+    asset_index: u16,
+    now_slot: u64,
+    initial_price: u64,
+    auth: [u8; 32],
+) -> Instruction {
+    Instruction::UpdateAssetLifecycle {
+        action,
+        asset_index,
+        now_slot,
+        initial_price,
+        insurance_authority: auth,
+        insurance_operator: auth,
+        backing_bucket_authority: auth,
+        oracle_authority: auth,
+    }
+}
+
+fn wgenl_group_of(market: &TestAccount) -> MarketGroupV16 {
+    state::read_market(&market.data).unwrap().1
+}
+
+/// Stage the W-GEN attempt-2b world up to (but not including) the generation
+/// flip: a market whose slot 1 is activated with `victim` as every domain
+/// authority, and 700 atoms deposited into domain 2 then fully withdrawn so the
+/// slot can retire.
+struct WgenlStage {
+    admin: TestAccount,
+    attacker: TestAccount,
+    victim_key: Pubkey,
+    market: TestAccount,
+    mint: Pubkey,
+    ledger: TestAccount,
+    token_program: TestAccount,
+    sysprog: TestAccount,
+    old_market_id: u64,
+}
+
+fn wgenl_stage_generation_one() -> WgenlStage {
+    let mut admin = signer();
+    let attacker = signer();
+    let victim = signer();
+    let mut market = market_account_with_capacity(4);
+    let mint = init_market(&mut admin, &mut market);
+    run_ix(
+        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    run_ix(
+        wgenl_lifecycle_ix(
+            processor::ASSET_ACTION_ACTIVATE,
+            1,
+            1,
+            101,
+            victim.key.to_bytes(),
+        ),
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    let old_market_id = wgenl_group_of(&market).assets[1].market_id;
+    assert_ne!(old_market_id, 0, "a live asset never carries market_id 0");
+
+    let mut ledger = canonical_backing_ledger_account(&market, 2);
+    let mut token_program = token_program_account();
+    let mut sysprog = system_program_account();
+    {
+        let mut victim_co = wgenl_co_signer(victim.key);
+        let mut source = user_token_account(victim.key, mint, 700);
+        let mut vault = vault_token_account(&market, mint, 0);
+        run_ix(
+            Instruction::TopUpBackingBucket {
+                domain: 2,
+                amount: 700,
+                expiry_slot: 10_000,
+            },
+            &mut [
+                &mut victim_co,
+                &mut market,
+                &mut source,
+                &mut vault,
+                &mut token_program,
+                &mut ledger,
+                &mut sysprog,
+            ],
+        )
+        .unwrap();
+        // Take it back out so the slot can retire.
+        let mut dest = user_token_account(victim.key, mint, 0);
+        let mut vault = vault_token_account(&market, mint, 700);
+        let mut vault_auth = vault_authority_account(&market);
+        run_ix(
+            Instruction::WithdrawBackingBucket {
+                domain: 2,
+                amount: 700,
+            },
+            &mut [
+                &mut victim_co,
+                &mut market,
+                &mut dest,
+                &mut vault,
+                &mut vault_auth,
+                &mut token_program,
+                &mut ledger,
+            ],
+        )
+        .unwrap();
+    }
+    WgenlStage {
+        admin,
+        attacker,
+        victim_key: victim.key,
+        market,
+        mint,
+        ledger,
+        token_program,
+        sysprog,
+        old_market_id,
+    }
+}
+
+/// Retire slot 1 and re-activate it through the PERMISSIONLESS reuse branch
+/// (attacker pays the 50-atom init fee, keeps the victim as backing authority).
+/// Returns the freshly minted generation.
+fn wgenl_flip_generation(s: &mut WgenlStage) -> u64 {
+    run_ix(
+        wgenl_lifecycle_ix(processor::ASSET_ACTION_RETIRE, 1, 3, 0, [0u8; 32]),
+        &mut [&mut s.admin, &mut s.market],
+    )
+    .unwrap();
+    let mut reuse_source = user_token_account(s.attacker.key, s.mint, 50);
+    let mut reuse_vault = vault_token_account(&s.market, s.mint, 0);
+    let victim_bytes = s.victim_key.to_bytes();
+    let attacker_bytes = s.attacker.key.to_bytes();
+    run_ix(
+        Instruction::UpdateAssetLifecycle {
+            action: processor::ASSET_ACTION_ACTIVATE,
+            asset_index: 1,
+            now_slot: 4,
+            initial_price: 201,
+            insurance_authority: attacker_bytes,
+            insurance_operator: attacker_bytes,
+            backing_bucket_authority: victim_bytes,
+            oracle_authority: attacker_bytes,
+        },
+        &mut [
+            &mut s.attacker,
+            &mut s.market,
+            &mut reuse_source,
+            &mut reuse_vault,
+            &mut s.token_program,
+        ],
+    )
+    .unwrap();
+    let new_market_id = wgenl_group_of(&s.market).assets[1].market_id;
+    assert!(
+        new_market_id > s.old_market_id,
+        "the engine must mint a fresh generation on re-activation"
+    );
+    new_market_id
+}
+
+fn wgenl_topup(s: &mut WgenlStage, amount: u128) -> Result<(), ProgramError> {
+    let mut victim_co = wgenl_co_signer(s.victim_key);
+    let mut source = user_token_account(s.victim_key, s.mint, amount as u64);
+    let mut vault = vault_token_account(&s.market, s.mint, 0);
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: 2,
+            amount,
+            expiry_slot: 10_000,
+        },
+        &mut [
+            &mut victim_co,
+            &mut s.market,
+            &mut source,
+            &mut vault,
+            &mut s.token_program,
+            &mut s.ledger,
+            &mut s.sysprog,
+        ],
+    )
+}
+
+// ───────────────────────── layout pins (zero ABI: 224 bytes, unchanged) ──────
+
+/// `market_id` occupies bytes 216..224 — the only 8-aligned slot in the old
+/// `_padding: [u8; 14]` — so the record and therefore
+/// `backing_domain_ledger_account_len()` do not move. Same shape (and same
+/// reason) as the creator-fee counter pinned in `tests/v16_fee_split.rs`.
+#[test]
+fn wgenl_ledger_layout_market_id_is_in_the_old_padding_tail() {
+    use percolator_prog::state::BackingDomainLedgerAccountV16;
+
+    assert_eq!(core::mem::size_of::<BackingDomainLedgerAccountV16>(), 224);
+    // Host only: `u128` is 16-aligned here and 8-aligned on BPF. The size and the
+    // offsets are target-independent and are ALSO pinned by `const _` asserts in
+    // `src/v16_program.rs`, which `cargo build-sbf` evaluates on the BPF target.
+    assert_eq!(core::mem::align_of::<BackingDomainLedgerAccountV16>(), 16);
+    assert_eq!(
+        core::mem::align_of::<BackingDomainLedgerAccountV16>(),
+        core::mem::align_of::<u128>()
+    );
+    assert_eq!(
+        core::mem::offset_of!(BackingDomainLedgerAccountV16, domain),
+        208
+    );
+    assert_eq!(
+        core::mem::offset_of!(BackingDomainLedgerAccountV16, _padding),
+        210
+    );
+    assert_eq!(
+        core::mem::offset_of!(BackingDomainLedgerAccountV16, market_id),
+        216,
+        "market_id must start at byte 216 — the 8-aligned tail of the old 14-byte pad"
+    );
+    assert_eq!(
+        state::backing_domain_ledger_account_len(),
+        HEADER_LEN + 224,
+        "the ACCOUNT length must not move: existing ledger PDAs are already this size"
+    );
+
+    let ledger = BackingDomainLedgerAccountV16 {
+        domain: 0x1122,
+        last_observed_unavailable_principal_atoms: 0x0a0b_0c0d_0e0f_1011,
+        market_id: 0x0102_0304_0506_0708,
+        ..Default::default()
+    };
+
+    let bytes = bytemuck::bytes_of(&ledger);
+    assert_eq!(bytes.len(), 224);
+    assert_eq!(
+        &bytes[208..210],
+        &0x1122u16.to_le_bytes(),
+        "domain must still read at 208..210"
+    );
+    assert_eq!(
+        &bytes[210..216],
+        &[0u8; 6],
+        "the 6-byte remnant of _padding must stay zero, not absorb market_id bytes"
+    );
+    assert_eq!(
+        &bytes[216..224],
+        &0x0102_0304_0506_0708u64.to_le_bytes(),
+        "market_id must occupy bytes 216..224, little-endian"
+    );
+
+    let reparsed: BackingDomainLedgerAccountV16 = bytemuck::pod_read_unaligned(bytes);
+    assert_eq!(reparsed.market_id, 0x0102_0304_0506_0708);
+    assert_eq!(reparsed.domain, 0x1122);
+    assert_eq!(
+        reparsed.last_observed_unavailable_principal_atoms,
+        0x0a0b_0c0d_0e0f_1011
+    );
+}
+
+/// Every ledger a previous build wrote has the whole 14-byte pad zeroed
+/// (`validate_backing_domain_ledger` refused non-zero padding), so it parses as
+/// `market_id == 0` — "unstamped", never a live generation: the engine's
+/// `next_market_id` starts at 1.
+#[test]
+fn wgenl_legacy_zeroed_padding_tail_parses_as_unstamped_market_id_zero() {
+    use percolator_prog::state::BackingDomainLedgerAccountV16;
+
+    let ledger = BackingDomainLedgerAccountV16 {
+        domain: 2,
+        total_deposited_atoms: 700,
+        cumulative_loss_atoms: 41,
+        market_id: u64::MAX, // zeroed below
+        ..Default::default()
+    };
+
+    let mut bytes = bytemuck::bytes_of(&ledger).to_vec();
+    for b in bytes[210..224].iter_mut() {
+        *b = 0;
+    }
+    let parsed: BackingDomainLedgerAccountV16 = bytemuck::pod_read_unaligned(&bytes);
+    assert_eq!(
+        parsed.market_id, 0,
+        "an old ledger's zeroed pad tail must read as an UNSTAMPED generation"
+    );
+    assert_eq!(parsed.domain, 2, "domain must survive the zeroed tail");
+    assert_eq!(parsed.total_deposited_atoms, 700);
+    assert_eq!(parsed.cumulative_loss_atoms, 41);
+}
+
+// ───────────────────────── the PoC flip (W-GEN attempt 2b) ───────────────────
+
+/// **W-GEN PoC attempt 2b, flipped.** Identical staging to
+/// `poc_wgen_2b_backing_domain_ledger_counters_survive_the_generation_flip`,
+/// which measured `total_deposited_atoms == 1_000` across the flip (defect).
+/// With the generation stamp the new market's ledger starts at zero.
+#[test]
+fn wgenl_poc_2b_generation_flip_starts_the_new_ledger_at_zero() {
+    let mut s = wgenl_stage_generation_one();
+
+    let gen1 = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(gen1.total_deposited_atoms, 700);
+    assert_eq!(gen1.total_principal_withdrawn_atoms, 700);
+    assert_eq!(gen1.total_principal_atoms, 0);
+    assert_eq!(
+        gen1.market_id, s.old_market_id,
+        "the generation-1 ledger must be stamped with generation 1"
+    );
+
+    let new_market_id = wgenl_flip_generation(&mut s);
+    wgenl_topup(&mut s, 300).unwrap();
+
+    let gen2 = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    // The COUNTERS are asserted before the stamp on purpose: this line is the one
+    // the PoC measured at 1_000, so it is the line a negative control must break.
+    assert_eq!(
+        gen2.total_deposited_atoms, 300,
+        "W-GEN 2b: generation {new_market_id} must NOT inherit generation {}'s \
+         700 atoms (the defect reported 1_000)",
+        s.old_market_id
+    );
+    assert_eq!(
+        gen2.total_principal_withdrawn_atoms, 0,
+        "the previous market's withdrawal history must not carry over"
+    );
+    assert_eq!(gen2.total_principal_atoms, 300);
+    assert_eq!(
+        gen2.cumulative_loss_atoms, 0,
+        "residual_received (the LP-farm reward counter) must start at zero"
+    );
+    assert_eq!(gen2.residual_received_atoms(), 0);
+    assert_eq!(gen2.cumulative_recovery_atoms, 0);
+    assert_eq!(gen2.total_earnings_atoms, 0);
+    assert_eq!(gen2.total_earnings_withdrawn_atoms, 0);
+    assert_eq!(
+        gen2.market_id, new_market_id,
+        "the ledger must be re-stamped with the new generation"
+    );
+}
+
+/// The old totals are not merely overwritten by coincidence — they are not READ.
+/// Plant a large, distinctive generation-1 history (including a non-zero
+/// `residual_received`), flip, and show every counter starts from zero.
+#[test]
+fn wgenl_old_generation_totals_are_not_read_by_the_new_generation() {
+    let mut s = wgenl_stage_generation_one();
+
+    // Plant generation-1 history directly in the ledger account, keeping its
+    // generation-1 stamp. (Wrapper-owned account; the engine never reads it.)
+    let mut planted = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    planted.total_deposited_atoms = 1_000_000;
+    planted.total_principal_withdrawn_atoms = 999_999;
+    planted.cumulative_loss_atoms = 777;
+    planted.cumulative_recovery_atoms = 13;
+    planted.total_earnings_atoms = 4_242;
+    planted.total_earnings_withdrawn_atoms = 4_242;
+    assert_eq!(planted.market_id, s.old_market_id);
+    state::write_backing_domain_ledger(&mut s.ledger.data, &planted).unwrap();
+
+    let new_market_id = wgenl_flip_generation(&mut s);
+    wgenl_topup(&mut s, 300).unwrap();
+
+    let gen2 = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        gen2.total_deposited_atoms, 300,
+        "generation 1's planted 1_000_000 must not be read"
+    );
+    assert_eq!(gen2.total_principal_withdrawn_atoms, 0);
+    assert_eq!(gen2.total_principal_atoms, 300);
+    assert_eq!(
+        gen2.cumulative_loss_atoms, 0,
+        "generation 1's 777 atoms of impairment must not price generation 2's rewards"
+    );
+    assert_eq!(gen2.residual_received_atoms(), 0);
+    assert_eq!(gen2.cumulative_recovery_atoms, 0);
+    assert_eq!(gen2.total_earnings_atoms, 0);
+    assert_eq!(gen2.total_earnings_withdrawn_atoms, 0);
+    assert_eq!(gen2.authority, s.victim_key.to_bytes());
+    assert_eq!(gen2.domain, 2);
+    assert_eq!(gen2.market_id, new_market_id);
+}
+
+// ───────────────────────── the no-op case ────────────────────────────────────
+
+/// SAME generation: the ledger PERSISTS across calls. The stamp must not turn
+/// every instruction into a re-seed — that would silently zero a live provider's
+/// accounting on every top-up.
+#[test]
+fn wgenl_same_generation_ledger_persists_across_calls() {
+    let mut s = wgenl_stage_generation_one();
+    let after_stage = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(after_stage.total_deposited_atoms, 700);
+    assert_eq!(after_stage.market_id, s.old_market_id);
+
+    // Three more top-ups in the SAME generation accumulate.
+    wgenl_topup(&mut s, 300).unwrap();
+    wgenl_topup(&mut s, 25).unwrap();
+    wgenl_topup(&mut s, 1).unwrap();
+
+    let after = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        after.total_deposited_atoms, 1_026,
+        "700 + 300 + 25 + 1, all under generation {}",
+        s.old_market_id
+    );
+    assert_eq!(after.total_principal_atoms, 326);
+    assert_eq!(after.total_principal_withdrawn_atoms, 700);
+    assert_eq!(
+        after.market_id, s.old_market_id,
+        "the stamp must be stable while the generation is"
+    );
+
+    // A pure read path (SyncBackingDomainLedger) must also leave it alone.
+    let victim_key = s.victim_key;
+    let mut victim_co = wgenl_co_signer(victim_key);
+    run_ix(
+        Instruction::SyncBackingDomainLedger { domain: 2 },
+        &mut [&mut victim_co, &mut s.market, &mut s.ledger],
+    )
+    .unwrap();
+    let after_sync = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(after_sync.total_deposited_atoms, 1_026);
+    assert_eq!(after_sync.total_principal_atoms, 326);
+    assert_eq!(after_sync.market_id, s.old_market_id);
+}
+
+// ───────────────────────── the legacy (unstamped) decision ───────────────────
+
+/// LEGACY DECISION: `market_id == 0` means "written before this change", so the
+/// record is STAMPED and its counters KEPT — never zeroed. Zeroing would, on the
+/// flag day, wipe a live market's provider/LP accounting the first time anyone
+/// touched it.
+#[test]
+fn wgenl_legacy_unstamped_ledger_is_stamped_not_zeroed() {
+    let mut s = wgenl_stage_generation_one();
+
+    // Reproduce the on-chain shape of a ledger written by the OLD program: the
+    // whole 14-byte pad region zero, i.e. market_id == 0, counters intact.
+    let mut legacy = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    legacy.market_id = 0;
+    state::write_backing_domain_ledger(&mut s.ledger.data, &legacy).unwrap();
+    let before = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(before.market_id, 0);
+    assert_eq!(before.total_deposited_atoms, 700);
+    assert_eq!(before.total_principal_withdrawn_atoms, 700);
+
+    // Touch it in the SAME (live) generation.
+    wgenl_topup(&mut s, 300).unwrap();
+
+    let after = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        after.market_id, s.old_market_id,
+        "an unstamped legacy ledger must be stamped with the CURRENT generation"
+    );
+    assert_eq!(
+        after.total_deposited_atoms, 1_000,
+        "and its counters must be KEPT (700 legacy + 300 now), not zeroed"
+    );
+    assert_eq!(after.total_principal_withdrawn_atoms, 700);
+    assert_eq!(after.total_principal_atoms, 300);
+}
+
+/// …and once stamped, the very next generation flip IS caught. This is the whole
+/// safety argument for accepting 0: nothing is destroyed, and the gap closes from
+/// the first write onward.
+#[test]
+fn wgenl_legacy_ledger_is_protected_from_the_next_flip_once_stamped() {
+    let mut s = wgenl_stage_generation_one();
+    let mut legacy = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    legacy.market_id = 0;
+    state::write_backing_domain_ledger(&mut s.ledger.data, &legacy).unwrap();
+
+    wgenl_topup(&mut s, 300).unwrap(); // stamps generation 1, keeps 700 + 300
+    assert_eq!(
+        state::read_backing_domain_ledger(&s.ledger.data)
+            .unwrap()
+            .total_deposited_atoms,
+        1_000
+    );
+
+    // Withdraw so the slot can retire, then flip.
+    {
+        let victim_key = s.victim_key;
+        let mut victim_co = wgenl_co_signer(victim_key);
+        let mut dest = user_token_account(victim_key, s.mint, 0);
+        let mut vault = vault_token_account(&s.market, s.mint, 300);
+        let mut vault_auth = vault_authority_account(&s.market);
+        run_ix(
+            Instruction::WithdrawBackingBucket {
+                domain: 2,
+                amount: 300,
+            },
+            &mut [
+                &mut victim_co,
+                &mut s.market,
+                &mut dest,
+                &mut vault,
+                &mut vault_auth,
+                &mut s.token_program,
+                &mut s.ledger,
+            ],
+        )
+        .unwrap();
+    }
+    let new_market_id = wgenl_flip_generation(&mut s);
+    wgenl_topup(&mut s, 11).unwrap();
+
+    let after = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        after.total_deposited_atoms, 11,
+        "the once-legacy ledger is now stamped, so THIS flip re-seeds"
+    );
+    assert_eq!(after.total_principal_withdrawn_atoms, 0);
+    assert_eq!(after.cumulative_loss_atoms, 0);
+    assert_eq!(after.market_id, new_market_id);
+}
+
+/// Why the legacy branch does not matter in production: W-19 bumped the account
+/// header `VERSION` 17 -> 18, and `read_backing_domain_ledger` -> `check_header`
+/// refuses a version-17 ledger with `InvalidVersion` BEFORE
+/// `read_or_new_backing_domain_ledger` can look at the generation. Every ledger
+/// the deployed wrapper (`e8acd708`) created is therefore unreadable under this
+/// build and must be re-created by the F-01 re-seed — already stamped.
+#[test]
+fn wgenl_w19_version18_refuses_a_version17_ledger_before_the_generation_branch() {
+    let s = wgenl_stage_generation_one();
+    // Sanity: it reads at VERSION 18.
+    assert!(state::read_backing_domain_ledger(&s.ledger.data).is_ok());
+    assert_eq!(
+        u16::from_le_bytes([s.ledger.data[8], s.ledger.data[9]]),
+        18,
+        "W-19 header version"
+    );
+
+    let mut old_image = s.ledger.data.clone();
+    old_image[8..10].copy_from_slice(&17u16.to_le_bytes());
+    assert_eq!(
+        state::read_backing_domain_ledger(&old_image),
+        Err(ProgramError::Custom(1)),
+        "a VERSION-17 ledger is InvalidVersion — the legacy market_id == 0 branch \
+         is unreachable for any account the deployed wrapper wrote"
     );
 }

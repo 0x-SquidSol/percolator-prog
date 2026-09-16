@@ -12,7 +12,7 @@ extern crate std;
 
 use alloc::vec::Vec;
 use percolator::{
-    v16_domain_count_for_market_slots, BackingBucketStatusV16, MarketModeV16,
+    v16_domain_count_for_market_slots, AutoCrankWorkV16, BackingBucketStatusV16, MarketModeV16,
     PermissionlessCrankActionV16, PermissionlessCrankRequestV16, RebalanceRequestV16, SideV16,
     SourceCreditStateV16, TradeRequestV16, V16Config, V16Error, BOUND_SCALE,
 };
@@ -1465,8 +1465,52 @@ pub mod state {
         pub cumulative_recovery_atoms: u128,
         pub last_observed_unavailable_principal_atoms: u128,
         pub domain: u16,
-        pub _padding: [u8; 14],
+        pub _padding: [u8; 6],
+        /// W-GEN-L: the asset GENERATION these counters belong to — the engine's
+        /// `AssetStateV16::market_id` for `domain / 2` at the time the ledger was
+        /// seeded.
+        ///
+        /// Without it the account is keyed only by `(market_group, domain)`, and a
+        /// slot that is retired and re-activated (permissionlessly, via tag 40's
+        /// `permissionless_reuse_target`) gets a FRESH engine generation while this
+        /// ledger keeps the previous market's `total_deposited_atoms`,
+        /// `cumulative_loss_atoms` and `residual_received_atoms` — so one market's
+        /// impairment history prices the next market's LP-farm rewards and NAV.
+        /// Measured as W-GEN PoC attempt 2b (700 atoms from generation M1 + 300 from
+        /// M2 reported as a single `total_deposited_atoms = 1_000`).
+        ///
+        /// It is carved out of the 8 top bytes of the old `_padding: [u8; 14]`, at
+        /// offset 216..224 of an unchanged 224-byte record — see the layout pins
+        /// immediately below and `wgenl_*` in `tests/v16_wrapper.rs`. Every ledger
+        /// written by an earlier build has those bytes zeroed (`validate_backing_
+        /// domain_ledger` refused non-zero padding), so `market_id == 0` means
+        /// "unstamped legacy record", never a live generation: the engine's
+        /// `next_market_id` starts at 1 and an asset with `market_id == 0` is
+        /// rejected outright (`percolator::v16` `activate_empty_market_slot_not_
+        /// atomic` / `validate_market_id_binding`).
+        pub market_id: u64,
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // W-GEN-L layout pins. `market_id` was squeezed into the ONLY 8-aligned slot
+    // of the pre-existing 14-byte `_padding`, precisely so that
+    // `backing_domain_ledger_account_len()` does not move under ledgers the
+    // deployed program already created. A reorder or a re-typing that grew the
+    // record would silently change the account length and brick every existing
+    // ledger at read time; these break the build instead.
+    // ══════════════════════════════════════════════════════════════════════════
+    const _: () = assert!(core::mem::size_of::<BackingDomainLedgerAccountV16>() == 224);
+    // `u128` is 16-aligned on the host and 8-aligned on the BPF target, so the
+    // record's ALIGNMENT is target-dependent (16 host / 8 solana) while its size and
+    // every offset below are not. Pinning it to `align_of::<u128>()` keeps the guard
+    // meaningful on both — a literal `== 16` fails `cargo build-sbf`, which is how
+    // this was found.
+    const _: () = assert!(
+        core::mem::align_of::<BackingDomainLedgerAccountV16>() == core::mem::align_of::<u128>()
+    );
+    const _: () = assert!(core::mem::offset_of!(BackingDomainLedgerAccountV16, domain) == 208);
+    const _: () = assert!(core::mem::offset_of!(BackingDomainLedgerAccountV16, _padding) == 210);
+    const _: () = assert!(core::mem::offset_of!(BackingDomainLedgerAccountV16, market_id) == 216);
 
     impl BackingDomainLedgerAccountV16 {
         /// Farm-facing deterministic reward counter for this backing authority/domain.
@@ -1691,7 +1735,7 @@ pub mod state {
     ) -> Result<(), ProgramError> {
         if ledger.market_group == [0u8; 32]
             || ledger.authority == [0u8; 32]
-            || ledger._padding != [0u8; 14]
+            || ledger._padding != [0u8; 6]
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -4210,9 +4254,34 @@ pub mod ix {
         CureAndCancelClose {
             optional_deposit: u128,
         },
+        /// Tag 43 — owner-signed dead-leg forfeit.
+        ///
+        /// `b_loss_atom_budget` is a **collateral-atom** budget: the maximum loss, in
+        /// account atoms, that this call may settle out of the leg's outstanding B debt.
+        /// It is min'd with the market's `public_b_chunk_atoms` and converted to a B-index
+        /// delta exactly once, inside the engine
+        /// (`percolator 2c38570a:src/v16.rs:14149-14166`, "Both limits are collateral
+        /// atoms"), so nothing is ever settled beyond `min(public_b_chunk_atoms,
+        /// b_remaining)`.
+        ///
+        /// UNIT CHANGE — the field was called `b_delta_budget` and, against the deployed
+        /// engine (`9483ee90`), the same wire bytes bounded the **B-index delta** instead.
+        /// The byte layout is unchanged (tag 43, `u16`, `u128`), so a legacy caller's value
+        /// still decodes — and now means something else. A LEGACY B-INDEX-SCALE VALUE
+        /// FORFEITS THAT MANY **ATOMS**: it is scaled by `SOCIAL_LOSS_DEN / loss_weight`
+        /// relative to its old meaning (`1e15` for a leg whose `loss_weight == POS_SCALE`),
+        /// which turns a bounded chunk into a terminal forfeit that can spend the owner's
+        /// principal and detach the leg in one call. Measured in
+        /// `verify/items/C-W-03.md`: the wire value `4_000_000` moves 0 atoms at `9483ee90`
+        /// and settles a whole `4e21` debt for `4_000_000` atoms of principal at
+        /// `2c38570a`. Re-derive every off-repo caller in atoms before shipping.
+        ///
+        /// Upstream still calls this field `b_delta_budget`
+        /// (`percolator-prog upstream/main:src/v16_program.rs:3255`) with the same
+        /// atom-reading engine; this rename is ours, and the layout is identical to theirs.
         ForfeitRecoveryLeg {
             asset_index: u16,
-            b_delta_budget: u128,
+            b_loss_atom_budget: u128,
         },
         RebalanceReduce {
             asset_index: u16,
@@ -4400,11 +4469,15 @@ pub mod ix {
         ///     same arm. The bucket cannot even be paid to come back.
         ///
         /// The engine already owns the escape — `expire_source_backing_bucket_not_atomic`
-        /// — and uses it itself in `realize_source_backed_claims_for_resolved_close_not_atomic`,
-        /// whose comment states that without it a lapsed bucket "would
-        /// otherwise return Stale and strand the winner's close". That sweep
-        /// only runs on the RESOLVED path; nothing in this wrapper ever reached
-        /// the transition on a LIVE market. This tag is that missing call site.
+        /// — and uses it itself on the resolved-close path, whose comment states that
+        /// without it a lapsed bucket "would otherwise return Stale and strand the
+        /// winner's close". W-18: that used to be the one-shot sweep
+        /// `realize_source_backed_claims_for_resolved_close_not_atomic`, REMOVED at engine
+        /// `2c38570a`; the escape now lives in the bounded per-domain
+        /// `prepare_one_source_domain_for_resolved_close_not_atomic`
+        /// (`percolator 2c38570a:src/v16.rs:20451`, `:20499`). Either way it only runs on
+        /// the RESOLVED path; nothing in this wrapper ever reached the transition on a
+        /// LIVE market. This tag is that missing call site.
         ///
         /// PERMISSIONLESS BY DESIGN: a bricked market must be recoverable by
         /// any keeper, not only by an authority that may be a cold key or a
@@ -4687,7 +4760,7 @@ pub mod ix {
                 },
                 43 => Self::ForfeitRecoveryLeg {
                     asset_index: read_u16(&mut rest)?,
-                    b_delta_budget: read_u128(&mut rest)?,
+                    b_loss_atom_budget: read_u128(&mut rest)?,
                 },
                 44 => Self::RebalanceReduce {
                     asset_index: read_u16(&mut rest)?,
@@ -5187,11 +5260,11 @@ pub mod ix {
                 }
                 Self::ForfeitRecoveryLeg {
                     asset_index,
-                    b_delta_budget,
+                    b_loss_atom_budget,
                 } => {
                     out.push(43);
                     push_u16(&mut out, asset_index);
-                    push_u128(&mut out, b_delta_budget);
+                    push_u128(&mut out, b_loss_atom_budget);
                 }
                 Self::RebalanceReduce {
                     asset_index,
@@ -6578,6 +6651,27 @@ pub mod policy_v16 {
         }
         Ok(())
     }
+
+    /// W-21 / C-S-10b. Ported byte-for-byte from upstream
+    /// `aeyakovenko/percolator-prog` `2b1d025c:src/v16_program.rs:5461-5466`.
+    ///
+    /// A backing bucket that has reached `expiry_slot` is LAPSED: the expiry rule
+    /// (`ExpireBackingBucket`, tag 89) will forfeit its unliened principal into the
+    /// junior residual pool, and the whole lien family already tests the clock —
+    /// lien-create (`percolator:2748-2753`) and lien-release (`:2849`) both refuse a
+    /// lapsed bucket. Only the engine's principal-withdrawal gate
+    /// (`prepare_counterparty_backing_withdraw_delta`, `2c38570a:src/v16.rs:2815-2819`)
+    /// tests `status != Fresh` alone, so between `expiry_slot` and the next crank a
+    /// provider can withdraw principal the expiry rule is about to forfeit. That is a
+    /// race the wrapper decides, so the wrapper refuses it — upstream does the same in
+    /// its own `handle_withdraw_backing_bucket` (`2b1d025c:10561-10567`).
+    ///
+    /// The engine-side half (adding `now_slot < expiry_slot` to `:2815-2819`) is
+    /// tracked separately as engine row Q2 / `fix/Q`; the two are complementary, and
+    /// this predicate stays correct whether or not the engine gate is tightened.
+    pub fn backing_principal_withdrawal_is_fresh(expiry_slot: u64, authenticated_slot: u64) -> bool {
+        authenticated_slot < expiry_slot
+    }
 }
 
 pub mod processor {
@@ -7714,8 +7808,8 @@ pub mod processor {
             }
             Instruction::ForfeitRecoveryLeg {
                 asset_index,
-                b_delta_budget,
-            } => handle_forfeit_recovery_leg(program_id, accounts, asset_index, b_delta_budget),
+                b_loss_atom_budget,
+            } => handle_forfeit_recovery_leg(program_id, accounts, asset_index, b_loss_atom_budget),
             Instruction::RebalanceReduce {
                 asset_index,
                 reduce_q,
@@ -9108,44 +9202,48 @@ pub mod processor {
         if leg_a.side == leg_b.side {
             return Err(PercolatorError::EngineInvalidLeg.into());
         }
-        let close_q = close_q
-            .min(leg_a.basis_pos_q.unsigned_abs())
-            .min(leg_b.basis_pos_q.unsigned_abs());
-        if close_q == 0 {
-            return Err(PercolatorError::EngineNonProgress.into());
-        }
-        let req = TradeRequestV16 {
-            asset_index: asset_index_usize,
-            // signed size_q; force-close direction is carried by the long/short orientation
-            // selected just below, so pass the positive close magnitude here.
-            size_q: close_q as i128,
-            exec_price: frozen_mark,
-            fee_bps: 0,
-        };
-        // Taker-only: this path always trades at fee_bps: 0 (a cranker-driven
-        // forced close, not a fee-bearing trade), so `taker_is_long_account`
-        // is a documented no-op here -- `charge_account_fee_current_not_atomic`
-        // short-circuits on `requested_fee == 0` regardless of which side is
-        // nominally "taker" (design §1A.4).
-        if leg_a.side == SideV16::Short {
-            group
-                .execute_trade_with_fee_loss_stale_scoped_not_atomic(
-                    &mut account_a,
-                    &mut account_b,
-                    req,
-                    true,
-                )
-                .map_err(map_v16_error)?;
-        } else {
-            group
-                .execute_trade_with_fee_loss_stale_scoped_not_atomic(
-                    &mut account_b,
-                    &mut account_a,
-                    req,
-                    true,
-                )
-                .map_err(map_v16_error)?;
-        }
+        // C-W-02 / B-3 — size the close through the ENGINE primitive, not a raw-basis clamp.
+        //
+        // This used to clamp the caller's budget with
+        // `close_q.min(|leg_a.basis_pos_q|).min(|leg_b.basis_pos_q|)` and hand the result to
+        // `execute_trade_with_fee_loss_stale_scoped_not_atomic` itself. On a Recovery pair that
+        // has taken an ADL haircut the RAW basis exceeds the EFFECTIVE quantity, so the clamp
+        // asked to close more than the position that exists; the route then classified as a
+        // sign flip (`percolator 2c38570a:spec.md:1215`), `kernel_position_route_requires_unit_adl`
+        // fired and `require_asset_risk_change_allowed` refused the whole call with
+        // `LockActive` -> `Custom(21)`. Measured on an ADL'd pair: raw 1_990_000 / 1_989_949 vs
+        // effective 1_980_000 on both sides, and tag 64 with the documented "pass the full size"
+        // budget was unclosable.
+        //
+        // The spec draws the line at the QUANTITY, not the instruction: "liquidation sizing,
+        // full-close detection ... all use `effective_pos_q`; raw basis remains only for K/F
+        // settlement and social-loss weight accounting" (`av:spec.md:108-112`).
+        // `force_close_recovery_pair_not_atomic` (`2c38570a:src/v16.rs:18542`) is the engine's
+        // own implementation of that rule -- it clamps
+        // `close_request_q.min(effective_a).min(effective_b).min(oi_eff_long_q).min(oi_eff_short_q)`
+        // (`:18565-18571`), settles at the same frozen mark (`asset.effective_price`, `:18581`)
+        // with `fee_bps: 0` and the same `taker_is_long_account: true` selector in both
+        // orientations (`:18586-18594`), and returns the quantity it landed. This fork shipped
+        // that primitive with NO caller; upstream's wrapper calls it
+        // (`percolator-prog upstream/main:src/v16_program.rs:9078-9085`). Adopting the call is
+        // B-3: the caller's `close_q` stays a work BUDGET, and the engine decides the size.
+        //
+        // NOT adopted from upstream: its preceding one-sided-residue branch
+        // (`upstream/main:9037-9077`), which routes a pair with one zero-position side through
+        // `forfeit_recovery_leg_not_atomic` under this PERMISSIONLESS instruction. See the
+        // `cw02_` tests and `verify/fixes/C-W-02.md` for the measurements behind that decision:
+        // it would pass a POSITION quantity into an engine parameter that is a collateral-ATOM
+        // budget (`b_loss_atom_budget`, `2c38570a:src/v16.rs:21391`), letting any cranker spend
+        // an owner's principal. Our fork keeps that case on the owner-signed tag 43
+        // `ForfeitRecoveryLeg`.
+        group
+            .force_close_recovery_pair_not_atomic(
+                &mut account_a,
+                &mut account_b,
+                asset_index_usize,
+                close_q,
+            )
+            .map_err(map_v16_error)?;
         group.validate_shape().map_err(map_v16_error)?;
         account_a
             .validate_with_market(&group.as_view())
@@ -10559,6 +10657,44 @@ pub mod processor {
             .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
     }
 
+    /// W-GEN-L: a zeroed ledger record for `(market_group, authority, domain)`
+    /// stamped with the CURRENT asset generation, its observation watermarks pinned
+    /// to `bucket` so the `sync_backing_domain_ledger` that every caller runs next
+    /// is a no-op rather than a phantom loss or a phantom earning.
+    ///
+    /// Shared by all three seed paths (fresh account, GH#453 SPENT-authority
+    /// adoption, W-GEN-L generation re-seed) so they cannot drift apart.
+    fn new_backing_domain_ledger(
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        bucket: &percolator::BackingBucketV16,
+    ) -> Result<state::BackingDomainLedgerAccountV16, ProgramError> {
+        Ok(state::BackingDomainLedgerAccountV16 {
+            market_group,
+            authority,
+            total_principal_atoms: 0,
+            total_deposited_atoms: 0,
+            total_principal_withdrawn_atoms: 0,
+            total_earnings_atoms: 0,
+            total_earnings_withdrawn_atoms: 0,
+            last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
+            cumulative_loss_atoms: 0,
+            cumulative_recovery_atoms: 0,
+            last_observed_unavailable_principal_atoms: backing_unavailable_principal_atoms(bucket)?,
+            domain,
+            _padding: [0u8; 6],
+            // The bucket IS the generation: the engine keeps
+            // `backing_{long,short}.market_id == asset.market_id` and refuses any
+            // slot where it does not (`EngineAssetSlotV16Account::
+            // validate_market_id_binding` -> `InvalidConfig`), re-checking it on the
+            // retired slot before a new id is assigned. Every call site reads
+            // `bucket` from `backing_domain_parts_view(&group, domain)` for this same
+            // domain, so no caller can present a bucket from elsewhere.
+            market_id: bucket.market_id,
+        })
+    }
+
     fn read_or_new_backing_domain_ledger(
         data: &[u8],
         market_group: [u8; 32],
@@ -10570,6 +10706,49 @@ pub mod processor {
             let ledger = state::read_backing_domain_ledger(data)?;
             if ledger.market_group != market_group || ledger.domain != domain {
                 return Err(PercolatorError::Unauthorized.into());
+            }
+            // ── W-GEN-L: the asset GENERATION gate, checked BEFORE the authority
+            // gate below. ───────────────────────────────────────────────────────
+            //
+            // The account is a PDA of `(market_group, domain)` only, so it survives
+            // a retire + re-activate of the asset slot — and tag 40's
+            // `permissionless_reuse_target` lets ANY caller who pays
+            // `permissionless_market_init_fee` perform that re-activation. The
+            // engine then stamps a fresh `market_id` and hands the domain a bucket
+            // that is `empty_for_market(new_id)`. This ledger's counters, however,
+            // describe the PREVIOUS market: W-GEN PoC attempt 2b measures 700 atoms
+            // deposited under generation M1 and 300 under M2 reported as a single
+            // `total_deposited_atoms = 1_000`, and the same record carries
+            // `cumulative_loss_atoms` (== `residual_received_atoms()`, the
+            // deterministic LP-farm reward counter) and
+            // `last_observed_unavailable_principal_atoms`, so an unrelated market's
+            // impairment history prices the new market's rewards and NAV.
+            //
+            // A stale generation is therefore treated as ABSENT and re-seeded,
+            // exactly as a SPENT authority is below. This destroys no payable claim:
+            // the engine will not mint a new generation until the bucket is provably
+            // value-free — `activate_empty_market_slot_not_atomic` requires
+            // `backing_{long,short}.is_empty_amount_shape()`, which demands zero
+            // fresh/valid/consumed/impaired backing AND zero
+            // `utilization_fee_earnings` AND `status == Empty`; the restart path
+            // (`restart_empty_asset_preserving_insurance_budget_not_atomic`) rebuilds
+            // the whole slot from `empty_for_market(market_id)`. Whatever the old
+            // ledger still claimed on paper was already unpayable from the new
+            // bucket the moment the generation changed; keeping the number only
+            // mis-prices the new market.
+            //
+            // Not caller-steerable: `domain` comes from the instruction but is
+            // range-checked and pinned into the PDA, and the generation compared
+            // against is read from engine state for that same domain, never from the
+            // payload.
+            //
+            // `market_id == 0` is the LEGACY case, not a generation — see the
+            // `stamp` branch below.
+            if ledger.market_id != 0 && ledger.market_id != bucket.market_id {
+                return Ok((
+                    new_backing_domain_ledger(market_group, authority, domain, bucket)?,
+                    true,
+                ));
             }
             if ledger.authority != authority {
                 // GH#453. A domain ledger outlives the authority that opened it.
@@ -10612,45 +10791,41 @@ pub mod processor {
                 if has_principal || has_unclaimed_earnings || bucket_holds_backing {
                     return Err(PercolatorError::Unauthorized.into());
                 }
-                let adopted = state::BackingDomainLedgerAccountV16 {
-                    market_group,
-                    authority,
-                    total_principal_atoms: 0,
-                    total_deposited_atoms: 0,
-                    total_principal_withdrawn_atoms: 0,
-                    total_earnings_atoms: 0,
-                    total_earnings_withdrawn_atoms: 0,
-                    last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
-                    cumulative_loss_atoms: 0,
-                    cumulative_recovery_atoms: 0,
-                    last_observed_unavailable_principal_atoms: backing_unavailable_principal_atoms(
-                        bucket,
-                    )?,
-                    domain,
-                    _padding: [0u8; 14],
-                };
+                let adopted = new_backing_domain_ledger(market_group, authority, domain, bucket)?;
                 return Ok((adopted, true));
+            }
+            // W-GEN-L legacy: a ledger written by a build before this change has all
+            // 14 old padding bytes zero (`validate_backing_domain_ledger` refused any
+            // non-zero padding), so it reads back as `market_id == 0`. That is not a
+            // generation — the engine's `next_market_id` starts at 1 and an asset with
+            // `market_id == 0` is refused — so it means "unstamped".
+            //
+            // Such a record is STAMPED, not re-seeded: its counters are kept and the
+            // current generation is written in. The alternative (treat 0 as stale and
+            // zero the record) would, on the flag day, wipe the `total_principal_atoms`
+            // / `total_earnings_atoms` / `cumulative_loss_atoms` of every LIVE market's
+            // provider and LP vault the first time anyone touched them — destroying
+            // real claims to close a gap that only opens on a generation FLIP. Keeping
+            // the counters loses nothing: the one flip that could straddle the upgrade
+            // is the flip that happened before it, and no stamp could have caught that
+            // one either. Every flip after this write is caught.
+            //
+            // Post-W-19 this branch is unreachable in production anyway: W-19 bumped
+            // the account header `VERSION` 17 -> 18, and `read_backing_domain_ledger`
+            // -> `check_header` refuses any account carrying the old version with
+            // `InvalidVersion` BEFORE this function sees it, which is exactly the F-01
+            // full re-seed. It is kept as the fail-safe for any path that reaches a
+            // version-18 record with an unstamped tail (a ledger created by this build
+            // is always stamped).
+            if ledger.market_id == 0 {
+                let mut stamped = ledger;
+                stamped.market_id = bucket.market_id;
+                return Ok((stamped, true));
             }
             Ok((ledger, true))
         } else {
             Ok((
-                state::BackingDomainLedgerAccountV16 {
-                    market_group,
-                    authority,
-                    total_principal_atoms: 0,
-                    total_deposited_atoms: 0,
-                    total_principal_withdrawn_atoms: 0,
-                    total_earnings_atoms: 0,
-                    total_earnings_withdrawn_atoms: 0,
-                    last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
-                    cumulative_loss_atoms: 0,
-                    cumulative_recovery_atoms: 0,
-                    last_observed_unavailable_principal_atoms: backing_unavailable_principal_atoms(
-                        bucket,
-                    )?,
-                    domain,
-                    _padding: [0u8; 14],
-                },
+                new_backing_domain_ledger(market_group, authority, domain, bucket)?,
                 false,
             ))
         }
@@ -10974,10 +11149,18 @@ pub mod processor {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             // Live-only. A resolved/wound-down market already reaches the
-            // transition through the engine's own resolved-close sweep
-            // (`realize_source_backed_claims_for_resolved_close_not_atomic`),
-            // so re-entering it from outside would be a second, unsequenced
+            // transition through the engine's own resolved-close path, so
+            // re-entering it from outside would be a second, unsequenced
             // mutation of a terminal ledger.
+            //
+            // W-18: this used to name `realize_source_backed_claims_for_resolved_close_not_atomic`.
+            // That function is GONE at the linked engine (`percolator 2c38570a`, grep count
+            // 1 -> 0 since `9483ee90`); upstream `a0e27950` / #239 replaced the unbounded sweep
+            // with the bounded per-domain pair
+            // `prepare_one_source_domain_for_resolved_close_not_atomic` (`2c38570a:src/v16.rs:20399`)
+            // and `realize_one_source_domain_for_resolved_close_not_atomic` (`:20277`), driven from
+            // `close_resolved_account_not_atomic` (`:20597`). The gate below is unchanged and still
+            // correct; only its stated reason was pointing at a missing symbol.
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -11106,6 +11289,23 @@ pub mod processor {
             };
 
             let (_, bucket) = backing_domain_parts_view(&group, domain_usize)?;
+            // W-21 / C-S-10b — adopt upstream's lapsed-bucket refusal
+            // (`2b1d025c:src/v16_program.rs:10561-10567`), in the same position:
+            // after the bucket is read, before the ledger is touched or the engine is
+            // called. A Fresh bucket whose `expiry_slot` has been reached is going to
+            // be forfeited into the junior residual pool by the next tag-89
+            // `ExpireBackingBucket`, which is permissionless; the engine's own
+            // withdrawal gate (`2c38570a:src/v16.rs:2815-2819`) tests `status != Fresh`
+            // only, so without this the provider wins that race and takes principal the
+            // expiry rule has already earmarked. Refusing here is not a new
+            // authorization: the provider's own remedy is to re-fund the bucket at a
+            // later expiry (tag 50 top-up), which the bucket family already supports.
+            if !policy_v16::backing_principal_withdrawal_is_fresh(
+                bucket.expiry_slot,
+                authenticated_market_slot_or_fallback_view(&group),
+            ) {
+                return Err(PercolatorError::EngineStale.into());
+            }
             {
                 let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
                 let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
@@ -12715,19 +12915,25 @@ pub mod processor {
         Ok(())
     }
 
+    /// Tag 43 `ForfeitRecoveryLeg`. `b_loss_atom_budget` is a COLLATERAL-ATOM loss budget
+    /// and is passed to the engine verbatim; see the doc on `ix::Instruction::ForfeitRecoveryLeg`
+    /// for the unit, its bound, and the legacy-value hazard (a B-index-scale number forfeits
+    /// that many ATOMS). The handler validates only that the budget is nonzero — scale is the
+    /// caller's to get right, and the engine caps the settled amount at
+    /// `min(public_b_chunk_atoms, b_remaining)`.
     #[inline(never)]
     fn handle_forfeit_recovery_leg<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
-        b_delta_budget: u128,
+        b_loss_atom_budget: u128,
     ) -> ProgramResult {
-        if b_delta_budget == 0 {
+        if b_loss_atom_budget == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         with_one_portfolio_view(program_id, accounts, true, |group, portfolio, _cfg| {
             group
-                .forfeit_recovery_leg_not_atomic(portfolio, asset_index as usize, b_delta_budget)
+                .forfeit_recovery_leg_not_atomic(portfolio, asset_index as usize, b_loss_atom_budget)
                 .map(|_| ())
         })
     }
@@ -13971,10 +14177,13 @@ pub mod processor {
         // below outstanding winner claims and permanently strand them (close_resolved →
         // RecoveryRequired). No correct static floor exists: source-backed realization
         // already reduces the reserve with no tracked quantity to distinguish a malicious
-        // further decrease. The ONLY accounting-faithful refinement is the INTERNAL one in
-        // `realize_source_backed_claims_for_resolved_close_not_atomic` (engine
-        // `refine_resolved_unreceipted_bound_not_atomic`, clamped to realized face as
-        // receipts realize), which is a direct engine call and is unaffected. Reject the
+        // further decrease. The ONLY accounting-faithful refinement is the INTERNAL engine
+        // call `refine_resolved_unreceipted_bound_not_atomic` (clamped to realized face as
+        // receipts realize). W-18: it used to be reached from
+        // `realize_source_backed_claims_for_resolved_close_not_atomic`, REMOVED at engine
+        // `2c38570a`; it is now called from the bounded per-domain
+        // `realize_one_source_domain_for_resolved_close_not_atomic`
+        // (`percolator 2c38570a:src/v16.rs:20380`). Unaffected either way. Reject the
         // external entry point. Do NOT re-enable without a per-claim outstanding-obligation floor.
         Err(PercolatorError::InvalidInstruction.into())
     }
@@ -15190,6 +15399,50 @@ pub mod processor {
             if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            // FIX F-05 (register row C-W-04): a market in Recovery has exactly ONE
+            // bounded public step left -- release the remaining obligation, then the
+            // value-neutral transition to Resolved. The engine's escalation valve
+            // (`permissionless_auto_crank_not_atomic`, engine 2c38570a:src/v16.rs:15171,
+            // Recovery arm :15181-15210) is the ONLY writer of `Resolved` that a
+            // permissionless caller can reach: the admin `ResolveMarket` (tag 19,
+            // :12880) and `ResolveStalePermissionless` (tag 44, :14368) both refuse
+            // unless `mode == 0`, and `permissionless_crank_not_atomic` rejects every
+            // non-`Recover` action outside Live (engine :15436-15440). Without this
+            // branch Recovery is ABSORBING: every account's capital is locked in the
+            // market forever, with no admin exit.
+            //
+            // Shape copied from upstream `aeyakovenko/percolator-prog`
+            // `src/v16_program.rs:13668-13684` (`handle_permissionless_crank_zero_copy`),
+            // including its reason for passing NO observations: Recovery work is
+            // entirely committed-state work, and stale Live-mode oracle hints can land
+            // after another cranker declares Recovery. We therefore take this branch
+            // BEFORE any oracle read/write, so a stale feed cannot block the only exit.
+            //
+            // The caller-supplied `action` / `asset_index` are deliberately IGNORED
+            // here (they are validated above, so the ABI is unchanged): the engine
+            // self-classifies the step and its asset. The Live path below is untouched.
+            if group.header.mode == 2 {
+                let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+                let mut portfolio = state::portfolio_view_mut_for_market_slots(
+                    &mut portfolio_data,
+                    max_market_slots,
+                )?;
+                expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+                group
+                    .permissionless_auto_crank_not_atomic(
+                        &mut portfolio,
+                        AutoCrankWorkV16 {
+                            now_slot: authenticated_now_slot,
+                            observations: &[],
+                            resolved_close_fee_rate_per_slot: 0,
+                        },
+                    )
+                    .map_err(map_v16_error)?;
+                group.validate_shape().map_err(map_v16_error)?;
+                // `cfg` is untouched on this path, so there is nothing to write back
+                // (upstream returns here the same way).
+                return Ok(());
+            }
             let crank_action = match action {
                 0 => PermissionlessCrankActionV16::Refresh,
                 // FIX W3 (upstream #206, pairs with engine E3 / #92): close_q and
@@ -15537,16 +15790,43 @@ pub mod processor {
         // which permanently forfeits this market's ability to ever have an LP vault.
         //
         // Checked BEFORE the authority is taken, so a refusal leaves the bucket's owner intact.
+        //
+        // W-22 / W-SIB: the guard must have the SAME GRANULARITY AS THE WRITE IT GUARDS.
+        // The FIND-1 binding below is written on the per-ASSET oracle profile
+        // (`asset_index = domain / 2`), so it takes `domain` AND `sibling_domain(domain)`
+        // — `sibling_domain`'s own doc says as much ("The LP vault is authorised over
+        // both"), NAV is `own + sibling`, and tag 91 moves principal between them. This
+        // guard read `registry.domain` alone, so naming the FUNDED side refused safely
+        // with LpVaultBackingBucketNotEmpty while naming its SIBLING silently succeeded
+        // and stranded the provider: their tag 50 then returns Unauthorized
+        // (`verify_domain_withdrawal_preflight`), their principal exits only by a
+        // permissionless tag-89 expiry into the junior residual pool, and the new vault
+        // is itself bricked because both pricing paths read the sibling ledger with the
+        // registry PDA as authority. Those two choices are indistinguishable to the
+        // creator, so the guard — not the operator — has to know.
+        //
+        // "Funded" is widened to the SAME predicate GH#453 uses one layer down
+        // (`read_or_new_backing_domain_ledger`, `bucket_holds_backing`): any of the four
+        // backing classes, not just `fresh_unliened`. That is the ledger-side reading of
+        // "bind only EMPTY ledgers" expressed on the accounts this instruction actually
+        // has — post-#433 a funded bucket implies a ledger, and #453 adopts a foreign
+        // ledger only when the bucket agrees it is spent. Refusing here makes the
+        // stranding state unreachable in the first place, which is the stronger fix.
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (_cfg_r, group) = state::market_view_mut(&mut market_data)?;
-            let (_, bucket) = backing_domain_parts_view(&group, domain as usize)?;
-            let already_funded = bucket.status != percolator::BackingBucketStatusV16::Empty
-                || bucket.fresh_unliened_backing_num > 0;
-            if already_funded
-                && bucket.expiry_slot != crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
-            {
-                return Err(PercolatorError::LpVaultBackingBucketNotEmpty.into());
+            for d in [domain, sibling_domain(domain)] {
+                let (_, bucket) = backing_domain_parts_view(&group, d as usize)?;
+                let already_funded = bucket.status != percolator::BackingBucketStatusV16::Empty
+                    || bucket.fresh_unliened_backing_num > 0
+                    || bucket.valid_liened_backing_num > 0
+                    || bucket.consumed_liened_backing_num > 0
+                    || bucket.impaired_liened_backing_num > 0;
+                if already_funded
+                    && bucket.expiry_slot != crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+                {
+                    return Err(PercolatorError::LpVaultBackingBucketNotEmpty.into());
+                }
             }
         }
 
@@ -16305,7 +16585,19 @@ pub mod processor {
                 &from_bucket,
             )?;
             sync_backing_domain_ledger(&mut from_ledger, &from_bucket)?;
+            // W-21 — the same lapsed-bucket refusal as tag 50, on the same predicate
+            // (`policy_v16::backing_principal_withdrawal_is_fresh`, upstream
+            // `2b1d025c:5461-5466`). This gate is tag 50's inline twin: it is the
+            // wrapper's own re-statement of the engine's withdrawability rule, and it
+            // inherited the same blind spot — `status != Fresh` with no clock test. A
+            // rebalance out of a lapsed bucket re-homes principal that tag 89 would
+            // otherwise forfeit, so WHICH instruction lands first decides where the
+            // atoms end up. With the test, expire-first and rebalance-first converge.
             if from_bucket.status != BackingBucketStatusV16::Fresh
+                || !policy_v16::backing_principal_withdrawal_is_fresh(
+                    from_bucket.expiry_slot,
+                    authenticated_market_slot_or_fallback_view(&group),
+                )
                 || from_bucket.fresh_unliened_backing_num < backing_num
                 || from_source.fresh_reserved_backing_num < backing_num
             {
