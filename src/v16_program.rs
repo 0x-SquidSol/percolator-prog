@@ -47,7 +47,26 @@ pub mod constants {
                                                   // (additive at the tail). Bump VERSION so `check_header` fail-closed
                                                   // rejects any pre-existing (old-layout) account rather than misparsing
                                                   // it -- this forces the explicitly-allowed devnet re-seed.
-    pub const VERSION: u16 = 17;
+                                                  //
+                                                  // 17 -> 18 (W-19). The same policy, applied to the v17 engine layout bump:
+                                                  // `percolator::V16_LAYOUT_DISCRIMINATOR` moved 16 -> 18 and
+                                                  // `PortfolioAccountV16Account` grew 9227 -> 9419 B, so every account the
+                                                  // DEPLOYED wrapper stamped (VERSION 17, discriminator 16) is a different
+                                                  // layout under this build. Leaving VERSION at 17 left `check_header`
+                                                  // passing those images through to the ENGINE's provenance check, so the
+                                                  // refusal was the engine's `Custom(16)` and only on the routes that decode
+                                                  // provenance. At 18 the wrapper's own gate refuses first with
+                                                  // `InvalidVersion` = `Custom(1)`, uniformly, on every KIND_* account and
+                                                  // every route that touches one. It creates NO new exit: the refusal is
+                                                  // relabelled and made earlier, never relaxed. Consequence, deliberate: a
+                                                  // PARTIAL re-seed hard-fails, because the gate is generic over all seven
+                                                  // kinds (market, portfolio, backing ledger, insurance ledger, LP registry,
+                                                  // LP redemption, NFT registry) -- the deploy path is a FULL re-seed.
+                                                  // Cross-program: percolator-nft vendors this constant
+                                                  // (`src/slab_types_v16.rs:83`) and compares it for EXACT equality, and
+                                                  // `scripts/parity-check.sh` row `nft.header_version` asserts the two agree,
+                                                  // so the nft MUST bump to 18 and redeploy in the same flag day.
+    pub const VERSION: u16 = 18;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
     pub const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
@@ -6801,9 +6820,23 @@ pub mod processor {
             return Ok(true);
         }
         reject_permissionless_resolve_matured_live_view(cfg, group)?;
+        // E-LSA: `group.header.loss_stale_active` is a market-wide byte that the engine
+        // documents (percolator src/v16.rs:14740-14743) as a summary of ONLY the LAST-TOUCHED
+        // asset — "`slot_last` and `loss_stale_active` summarize only the touched asset; safety
+        // gates use account/asset-local stale checks." Reading it in this per-domain custody gate
+        // froze a clean, on-clock withdraw-target asset whenever some UNRELATED asset carried an
+        // open K/F settlement cohort. Kani harness
+        // `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+        // (percolator tests/proofs_v16.rs:9424) pins `loss_stale_active == 1` on an on-clock asset
+        // with an open cohort, so the engine byte CONFORMS; the fix narrows the disjunct to the
+        // WITHDRAW-TARGET asset's own K/F cohort (`asset_local_open_kf_cohort_view`, the cohort
+        // clause of the engine's `asset_is_loss_stale_at_slot`). Its clock-lag clause is already
+        // enforced asset-locally by `asset_local_loss_stale_view` immediately below; together they
+        // are the engine predicate `asset_is_loss_stale_at_slot` evaluated on the target asset, so
+        // a genuinely stale target is still refused and an unrelated asset's cohort no longer bites.
         if group.header.bankruptcy_hlock_active != 0
             || group.header.threshold_stress_active != 0
-            || group.header.loss_stale_active != 0
+            || asset_local_open_kf_cohort_view(group, asset_index)
             || group
                 .header
                 .recovery_reason
@@ -6818,6 +6851,33 @@ pub mod processor {
         }
         reject_exposed_target_effective_lag_view(group, asset_index)?;
         Ok(false)
+    }
+
+    /// Asset-local mirror of the K/F settlement-cohort clause of the engine's
+    /// `asset_is_loss_stale_at_slot` (percolator src/v16.rs:7558 @ 3c71bdc3):
+    /// `asset.stale_account_count_long != 0 || asset.stale_account_count_short != 0`.
+    ///
+    /// The market header byte `loss_stale_active` summarizes only the LAST-TOUCHED asset
+    /// (percolator src/v16.rs:14740-14743), so a market-wide read of it in a per-asset custody
+    /// gate blocks a clean withdraw-target asset on an unrelated asset's open cohort (finding
+    /// E-LSA). The custody gate must instead test the target asset asset-locally. The engine byte
+    /// is CONFORMING — Kani harness
+    /// `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+    /// (percolator tests/proofs_v16.rs:9424) asserts `loss_stale_active == 1` on an on-clock asset
+    /// with an open cohort — so the fix lives here in the consumer, not in the engine predicate.
+    ///
+    /// Fails closed (`true`) for an out-of-range index, matching `asset_local_loss_stale_view`.
+    fn asset_local_open_kf_cohort_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> bool {
+        if asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return true;
+        }
+        let asset = &group.markets[asset_index].engine.asset;
+        asset.stale_account_count_long.get() != 0 || asset.stale_account_count_short.get() != 0
     }
 
     fn asset_local_loss_stale_view(
@@ -8282,10 +8342,15 @@ pub mod processor {
                 } else {
                     0
                 };
-            // Four-way split (2026-07-19 design). Taker-only (§1A) guarantees
-            // exactly one of outcome.fee_a/fee_b is nonzero, so splitting 0 is
-            // all-zeros and the maker's domain gets exactly the 0 credit it
-            // should -- no special-casing needed.
+            // Four-way split (2026-07-19 design). Both aggregates are split and the two
+            // results are added leg by leg below, so this site is correct whether the taker
+            // paid the whole fee, the maker paid it under the N1 fallback, or -- since engine
+            // #160 (`percolator 2c38570a:src/v16.rs:18224-18230`) -- the taker paid part and
+            // the maker the remainder. Splitting 0 is all-zeros, so a side that paid nothing
+            // gets exactly the 0 credit it should and no special-casing is needed. (This
+            // comment used to claim taker-only guarantees exactly one of the two is nonzero;
+            // that guarantee, and the proof it rested on, are gone at the linked engine -- see
+            // `batch_fee_charge_within_owed`. The arithmetic here never depended on it.)
             let split_a = policy_v16::split_trade_fee(
                 outcome.fee_a,
                 constants::PROTOCOL_FEE_BPS,
@@ -8445,6 +8510,44 @@ pub mod processor {
         Ok((product / den) + u128::from(product % den != 0))
     }
 
+    /// B-4 (wrapper impact W-14) — the batch-aggregate fee invariant the engine ACTUALLY
+    /// guarantees, replacing the exclusivity guard this wrapper used to enforce.
+    ///
+    /// The old guard refused any batch whose outcome had both `fee_a > 0` and `fee_b > 0`,
+    /// citing `proof_v16_taker_only_charges_exactly_one_side`. That harness does not exist at
+    /// the engine this wrapper builds against (`percolator 2c38570a`, `git grep -c` over the
+    /// tree -> 0): engine #160 retired it and replaced it with
+    /// `proof_v16_taker_only_never_overcharges_and_maker_pays_only_shortfall`
+    /// (`2c38570a:tests/proofs_v16.rs:14466`), because the charge shape changed. The taker is
+    /// charged first and, on a SHORTFALL rather than only on a zero payment, the solvent maker
+    /// is charged the REMAINDER `fee - taker_fee`, bounded by `min(fee, C_m)`
+    /// (`2c38570a:src/v16.rs:18213`, `:18224-18227`, `:19306`). The engine says so itself at
+    /// `2c38570a:src/v16.rs:18229-18230`: "Second, BOTH return values can now be non-zero --
+    /// previously exactly one was."
+    ///
+    /// So exclusivity is not an invariant of the linked engine; the AMOUNT is. Across the whole
+    /// batch the two aggregates together never exceed the fee the batch owes: the maker is only
+    /// ever asked for what the taker did not pay, and a remainder neither side can pay is
+    /// FORGIVEN, never over-collected from the other side or socialized
+    /// (`percolator:src/v16.rs` `uncollectible_fees_forgiven_not_socialized`; `av:spec.md:61`
+    /// §0 #26 "No fee seniority"). "The maker is charged only when the taker fell short"
+    /// (`fee_b > 0` implies `fee_a < fee_owed`) is a CONSEQUENCE of this bound, not a separate
+    /// test: with `fee_a + fee_b <= fee_owed`, any nonzero `fee_b` forces `fee_a < fee_owed`.
+    ///
+    /// This is the wrapper's cross-ABI distrust check, kept in the same place the exclusivity
+    /// guard sat: before any per-asset fee accounting or mark movement. The post-pass
+    /// `reconstructed_total != engine_total` cross-check is STRICTER still (it pins the sum
+    /// exactly) and is unchanged; this bound is the named invariant, stated where an
+    /// over-collecting engine is caught before the wrapper credits anything.
+    ///
+    /// Returns false on overflow: an aggregate pair that cannot even be summed is refused.
+    pub fn batch_fee_charge_within_owed(fee_a: u128, fee_b: u128, fee_owed: u128) -> bool {
+        match fee_a.checked_add(fee_b) {
+            Some(total) => total <= fee_owed,
+            None => false,
+        }
+    }
+
     /// Atomic multi-leg batch trade. `account_a` (taker) is the long side, `account_b` (LP) the
     /// short side; each leg's SIGNED `size_q` decides that leg's direction, so one batch can carry
     /// a mixed long/short spread. The engine settles both accounts ONCE, applies every leg, then
@@ -8530,8 +8633,7 @@ pub mod processor {
             // Pre-pass: per leg, read its oracle profile, pin the fee basis to the asset mark, and
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
             let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(legs.len());
-            // (asset_index, oracle_profile, reported_exec_price, fee_basis_price, fee_bps_eff,
-            // abs_size).
+            // (asset_index, oracle_profile, reported_exec_price, fee_leg).
             //
             // A 7th element, `leg_size_q` (the raw signed per-leg size), used to
             // be carried through so the taker-only post-pass could pick the
@@ -8539,8 +8641,17 @@ pub mod processor {
             // credit. The creator-fee-claim change (2026-07-23) routes that leg
             // to `cfg.creator_fee_claimable_atoms` instead of a domain budget,
             // so no per-leg domain is selected any more and the field is gone.
-            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u64, u64, u128)> =
+            //
+            // B-4: `fee_basis_price` / `fee_bps_eff` / `abs_size` used to be carried so the
+            // post-pass could call `batch_leg_fee`. The per-leg fee is now reconstructed HERE,
+            // once, because the aggregate bound `batch_fee_charge_within_owed` needs the fee
+            // the batch owes BEFORE the engine's aggregates are inspected. The post-pass reads
+            // the cached value, so `batch_leg_fee` still runs exactly once per leg.
+            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u128)> =
                 Vec::with_capacity(legs.len());
+            // The fee this batch owes in total, reconstructed leg by leg. This is the ceiling
+            // the engine's two aggregates must respect (see `batch_fee_charge_within_owed`).
+            let mut fee_owed_total: u128 = 0;
             for leg in legs {
                 let asset_index = leg.asset_index as usize;
                 if requests.iter().any(|r| r.asset_index == asset_index) {
@@ -8576,14 +8687,11 @@ pub mod processor {
                     exec_price: fee_basis_price,
                     fee_bps: fee_bps_eff,
                 });
-                leg_ctx.push((
-                    asset_index,
-                    oracle_profile,
-                    leg.exec_price,
-                    fee_basis_price,
-                    fee_bps_eff,
-                    abs_size,
-                ));
+                let fee_leg = batch_leg_fee(abs_size, fee_basis_price, fee_bps_eff)?;
+                fee_owed_total = fee_owed_total
+                    .checked_add(fee_leg)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                leg_ctx.push((asset_index, oracle_profile, leg.exec_price, fee_leg));
             }
             ensure_trade_portfolios_current_for_requests_view(
                 &group, &account_a, &account_b, &requests,
@@ -8606,23 +8714,24 @@ pub mod processor {
                 )
                 .map_err(map_v16_error)?;
 
-            // Taker-only + N1 (design §1A.3/§1A.4): within one batch call,
-            // exactly one physical account pays across the WHOLE batch --
-            // pnl (the only thing `charge_account_fee_current_not_atomic`'s
-            // waiver reads) is invariant across legs within a single call
-            // (only capital changes as fees are charged; nothing in the
-            // per-leg loop -- position-delta application, residual-reward
-            // transfer, recertification -- touches pnl), so it is never a
-            // per-leg mix. `outcome.fee_a`/`outcome.fee_b` are the engine's
-            // AGGREGATE totals across all legs; whichever is nonzero
-            // identifies the uniform payer for this whole batch.
-            let taker_paid = outcome.fee_a > 0;
-            let maker_paid = outcome.fee_b > 0;
-            if taker_paid && maker_paid {
-                // Unreachable given the engine's taker-only charge shape
-                // (see proof_v16_taker_only_charges_exactly_one_side in
-                // percolator/tests/proofs_v16.rs), but the wrapper does not
-                // trust that invariant blindly across the ABI boundary.
+            // Taker-only + N1 (design §1A.3/§1A.4). `outcome.fee_a`/`outcome.fee_b` are the
+            // engine's AGGREGATE totals across all legs.
+            //
+            // B-4 (W-14): this used to refuse `fee_a > 0 && fee_b > 0` outright, on the ground
+            // that exactly one physical account pays across the whole batch. Engine #160 makes
+            // that state LEGITIMATE: a batch runs several fills against a RUNNING capital, and
+            // a taker that can pay one leg's fee in full but the next only in part is charged
+            // what it has while the solvent maker is charged the REMAINDER through the N1
+            // fallback (`percolator 2c38570a:src/v16.rs:18172-18178`, `:18213`, `:18224-18227`,
+            // and `:18229-18230` "BOTH return values can now be non-zero"). The proof the old
+            // comment cited, `proof_v16_taker_only_charges_exactly_one_side`, no longer exists
+            // at that ref. Refusing the state would block exactly the batches the engine fix
+            // was written to make chargeable.
+            //
+            // The wrapper still does not trust the ABI blindly -- it checks the invariant that
+            // DOES hold, in the same position, before any fee is credited or any mark moved:
+            // the two aggregates together never exceed the fee this batch owes.
+            if !batch_fee_charge_within_owed(outcome.fee_a, outcome.fee_b, fee_owed_total) {
                 return Err(PercolatorError::EngineArithmeticOverflow.into());
             }
 
@@ -8641,16 +8750,8 @@ pub mod processor {
             let mut lp_cut_running_total: u128 = 0;
             let mut insurance_cut_running_total: u128 = 0;
             let mut creator_cut_running_total: u128 = 0;
-            for (
-                asset_index,
-                oracle_profile,
-                reported_price,
-                fee_basis_price,
-                fee_bps_eff,
-                abs_size,
-            ) in leg_ctx.iter_mut()
-            {
-                let fee_leg = batch_leg_fee(*abs_size, *fee_basis_price, *fee_bps_eff)?;
+            for (asset_index, oracle_profile, reported_price, fee_leg) in leg_ctx.iter_mut() {
+                let fee_leg = *fee_leg;
                 if fee_leg != 0 {
                     let split_leg = policy_v16::split_trade_fee(
                         fee_leg,
@@ -9233,7 +9334,7 @@ pub mod processor {
         let lp_account_id = matcher_lp_account_id(&delegate);
         let (_, _, max_market_slots_pre, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+        ensure_cpi_trade_portfolios_current_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
@@ -9783,7 +9884,7 @@ pub mod processor {
         }
         let (_, _, max_market_slots_pre, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+        ensure_cpi_trade_portfolios_current_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
@@ -10522,8 +10623,9 @@ pub mod processor {
                     last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
                     cumulative_loss_atoms: 0,
                     cumulative_recovery_atoms: 0,
-                    last_observed_unavailable_principal_atoms:
-                        backing_unavailable_principal_atoms(bucket)?,
+                    last_observed_unavailable_principal_atoms: backing_unavailable_principal_atoms(
+                        bucket,
+                    )?,
                     domain,
                     _padding: [0u8; 14],
                 };
@@ -10723,8 +10825,7 @@ pub mod processor {
             let (cfg, group) = state::market_view_mut(&mut market_data)?;
             let configured_slots = group.header.config.max_market_slots.get() as usize;
             let asset_index = domain_usize / 2;
-            if domain_usize >= configured_slots.saturating_mul(2)
-                || asset_index >= configured_slots
+            if domain_usize >= configured_slots.saturating_mul(2) || asset_index >= configured_slots
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -18406,23 +18507,50 @@ pub mod processor {
         Ok(false)
     }
 
+    /// FIX E-CU-R / E-CU-C: the `>= 8`-leg currentness gate keys off the portfolio's **live**
+    /// active-leg count, and runs on **every** trade route, not only when a request happens to
+    /// touch an asset the portfolio already holds.
+    ///
+    /// The work the engine is about to do is `2N` stale-leg settlement over the portfolio's own
+    /// live legs. It is not a function of which asset the request names, so neither is the gate.
+    /// Before this change three short-circuits stood in front of it and two of them were
+    /// properties of something other than that work:
+    ///
+    /// * `touches_existing_asset` -- a portfolio with 13 stale legs opening a **fresh** asset
+    ///   returned `Ok(())` here and then died at the compute ceiling inside the engine:
+    ///   measured `consumed 1,399,676 of 1,399,700 ... exceeded CUs meter`,
+    ///   `ProgramFailedToComplete`, against `108,585` CU for the `EngineStale` refusal the same
+    ///   portfolio gets when it touches an asset it already holds. The caller could not tell that
+    ///   compute failure apart from any other, so it had no way to learn it must crank first.
+    /// * the cert-empty / zero-requirement short-circuit -- a property of the health cert, not of
+    ///   the legs that have to be settled. A portfolio whose cert bitmap is empty while its live
+    ///   bitmap carries 14 legs pays the full cliff.
+    ///
+    /// The live-bitmap-empty short-circuit is kept (and hoisted above the cert decode): with no
+    /// live legs there is no settlement work, and it saves the cert `try_to_runtime` on the
+    /// first-open path.
+    ///
+    /// This is upstream's own `force_high_stale_current` shape (aeyakovenko/percolator-prog
+    /// `cfb78578` "[codex] Reject stale fresh-asset TradeCpi CU cliff (#161)", 2026-06-24), with
+    /// one difference: upstream passed `true` on the single `TradeCpi` route only and left
+    /// `TradeNoCpi` and `BatchTradeCpi` on the old shape, then reverted the whole commit three
+    /// days later in `13b0a2cf` (and its `BatchTradeCpi` companion `897d4edb` in `847f2414`).
+    /// Neither revert records a reason beyond "This reverts commit ...", so the revert is not
+    /// evidence of a defect in the gate -- but it is the reason upstream is still exposed here.
+    /// Here the gate is unconditional, so there is no flag to pass and no route left uncovered.
+    ///
+    /// `_requests` is retained so the signature stays on upstream's line for re-sync; the gate
+    /// deliberately does not read it.
     fn ensure_trade_portfolio_current_for_requests_view(
         group: &state::MarketViewMutV16<'_>,
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
-        requests: &[TradeRequestV16],
+        _requests: &[TradeRequestV16],
     ) -> ProgramResult {
         let active_bitmap = portfolio
             .header
             .active_bitmap
             .map(percolator::V16PodU64::get);
-        let mut touches_existing_asset = false;
-        for request in requests {
-            if portfolio_has_active_asset_view(group, portfolio, request.asset_index)? {
-                touches_existing_asset = true;
-                break;
-            }
-        }
-        if !touches_existing_asset {
+        if percolator::active_bitmap_is_empty(active_bitmap) {
             return Ok(());
         }
         let cert = portfolio
@@ -18430,17 +18558,10 @@ pub mod processor {
             .health_cert
             .try_to_runtime()
             .map_err(map_v16_error)?;
-        if percolator::active_bitmap_is_empty(cert.active_bitmap_at_cert)
-            || (cert.certified_initial_req == 0
-                && cert.certified_maintenance_req == 0
-                && cert.certified_worst_case_loss == 0)
-        {
-            return Ok(());
-        }
         // Avoid the pathological 2N stale-leg settlement cliff. Smaller stale
         // portfolios remain engine-handled so first-open and normal UX are not
         // blocked by conservative wrapper currentness heuristics.
-        if percolator::active_bitmap_count_ones(cert.active_bitmap_at_cert) < 8 {
+        if percolator::active_bitmap_count_ones(active_bitmap) < 8 {
             return Ok(());
         }
         if portfolio.header.b_stale_state != 0 {
@@ -18540,10 +18661,22 @@ pub mod processor {
         Ok(())
     }
 
-    /// Account-borrowing wrapper for `ensure_cpi_trade_asset_lifecycle_before_matcher` --
-    /// builds the market + both portfolio views, runs the lifecycle gate, then drops every
-    /// borrow before returning so the caller is free to CPI into the matcher immediately after.
-    fn ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+    /// Account-borrowing wrapper for the two pre-matcher gates -- builds the market + both
+    /// portfolio views, runs the per-asset lifecycle gate AND the currentness gate, then drops
+    /// every borrow before returning so the caller is free to CPI into the matcher immediately
+    /// after.
+    ///
+    /// FIX E-CU-C: the currentness half is restored here. Upstream runs both gates before the
+    /// matcher CPI -- `ensure_cpi_trade_portfolios_current_before_matcher`
+    /// (`aeyakovenko/percolator-prog upstream/main:src/v16_program.rs:14560`) calls the lifecycle
+    /// gate at `:14586` and `ensure_trade_portfolios_current_for_requests_view` at `:14592`, from
+    /// `handle_trade_cpi` and the batch-CPI route. Upstream added the currentness half on
+    /// 2026-06-15 in `ba1e8d5f` "Reject active-stale CPI trades before matcher". Our `3a189159`
+    /// (2026-07-16, upstream #147 + #160) adopted only the lifecycle half, so until now
+    /// `TradeCpi`/`BatchTradeCpi` reached the 2N stale-leg settlement cliff even for an asset the
+    /// portfolio already holds -- the case the `TradeNoCpi` route has refused since `9cc574ea`.
+    /// The function is renamed to upstream's name so `git log -S` finds it on both trees.
+    fn ensure_cpi_trade_portfolios_current_before_matcher(
         market_ai: &AccountInfo<'_>,
         account_a_ai: &AccountInfo<'_>,
         account_b_ai: &AccountInfo<'_>,
@@ -18552,6 +18685,15 @@ pub mod processor {
     ) -> ProgramResult {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
+        let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(cpi_requests.len());
+        for &(asset_index, _) in cpi_requests {
+            requests.push(TradeRequestV16 {
+                asset_index: asset_index as usize,
+                size_q: 1,
+                exec_price: 1,
+                fee_bps: 0,
+            });
+        }
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (_cfg, group) = state::market_view_mut(&mut market_data)?;
         let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
@@ -18565,7 +18707,8 @@ pub mod processor {
             &account_a,
             &account_b,
             cpi_requests,
-        )
+        )?;
+        ensure_trade_portfolios_current_for_requests_view(&group, &account_a, &account_b, &requests)
     }
 
     fn ensure_trade_portfolios_current_for_requests_view(

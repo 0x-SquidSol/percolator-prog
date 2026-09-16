@@ -1209,23 +1209,38 @@ impl V16CuEnv {
                     .asset
                     .raw_oracle_target_price = percolator::V16PodU64::new(95);
             }
-            // v17 convergence matrix row: v17-cert-epoch-stale-seeding
-            // accrue_asset_to_not_atomic advances oracle_epoch, making the health cert
-            // issued by execute_trade_with_fee_loss_stale_scoped_not_atomic stale.
-            // Clear active_bitmap_at_cert on both portfolios so the wrapper's pre-trade
-            // staleness check short-circuits via active_bitmap_is_empty (line 12859 of
-            // v16_program.rs). The BPF engine recertifies during the actual trade.
-            // This only affects host-side benchmark seeding; no live invariant is weakened.
-            for word in long.header.health_cert.active_bitmap_at_cert.iter_mut() {
-                *word = percolator::V16PodU64::new(0);
-            }
-            for word in short.header.health_cert.active_bitmap_at_cert.iter_mut() {
-                *word = percolator::V16PodU64::new(0);
-            }
+            // FIX E-CU-R: this used to zero `active_bitmap_at_cert` on both portfolios so the
+            // wrapper's pre-trade currentness gate would short-circuit and the seeded stale
+            // portfolio would reach the engine's 2N stale-leg refresh. That made the fixture
+            // measure a shape the shipping wrapper refuses -- the CU number it produced was not a
+            // statement about any transaction that can land on chain. Upstream's own
+            // `seed_n_leg_position_for_benchmark` never did it. The two crank benchmarks that
+            // also use this seeder (`..._refresh_crank_...`, `..._liquidation_crank_...`) do not
+            // go through the trade gate and are unaffected; the trade benchmark now asserts the
+            // refusal instead (`v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff`).
         }
         self.svm.set_account(self.market, market_account).unwrap();
         self.svm.set_account(long_account, long_data).unwrap();
         self.svm.set_account(short_account, short_data).unwrap();
+    }
+
+    /// Accrue ONE asset to `now_slot` at `price` without touching any portfolio. Used by the
+    /// fresh-asset E-CU-R regression so the asset the trade opens is exactly as current as the
+    /// assets the stale legs sit on -- the refusal then has to be about the portfolio's
+    /// staleness and nothing else.
+    fn accrue_asset_for_benchmark(&mut self, asset_index: usize, now_slot: u64, price: u64) {
+        let mut market_account = self.svm.get_account(&self.market).expect("market account");
+        {
+            let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+            group
+                .accrue_asset_to_not_atomic(asset_index, now_slot, price, 0, true)
+                .unwrap();
+            group.markets[asset_index]
+                .engine
+                .asset
+                .raw_oracle_target_price = percolator::V16PodU64::new(price);
+        }
+        self.svm.set_account(self.market, market_account).unwrap();
     }
 
     fn seed_current_n_leg_position_for_benchmark(
@@ -6196,8 +6211,111 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
     );
 }
 
+// ── P-SR (2026-09-16) ─────────────────────────────────────────────────────────────────────────
+// Engine `7b703710` ports upstream `aeyakovenko/percolator@f06a04a7` ("keep strict trade
+// reductions open below initial margin", on `av/master`, byte-identical here): a strictly
+// risk-reducing trade — including a full close to flat — now SKIPS `ensure_initial_margin`,
+// `ensure_no_positive_credit_initial_margin` and `create_initial_margin_source_lien_if_needed`
+// (`trade_account_requires_initial_margin(current, next) = |next| >= |current|` is false for a
+// full close). That gate was the ONLY thing refusing a bilateral trade against a counterparty
+// with `certified_equity < 0`, so the five probes below — which asserted `close.is_err()` plus
+// byte-equality of every account touched — now assert the PRE-`f06a04a7` over-refusal, which
+// upstream has deliberately and irreversibly removed (ruled DESIGN-QUESTION, upstream-shared,
+// not a fork defect: `~/percolator-ops/sync/security-review/verify/items/E-SR.md`). The
+// "off_mark" framing in the old names measured nothing either: `exec_price` only ever reaches
+// `trade_notional_floor` / `trade_fee_notional_ceil` (v16 has no exec-vs-mark slippage transfer),
+// so exec 100/300/500/1,000,000 are economically identical — what the probes actually pinned was
+// "a bankrupt counterparty may not be a bilateral trade counterparty at all", not a price.
+//
+// Independently re-measured at the CURRENT engine (`origin/main` `c141d47f`, descendant of the
+// `dc01e542` ref the E-SR item used — `finish_trade_checks_not_atomic`,
+// `trade_account_requires_initial_margin` and `terminal_trade_residual_asset_before_refresh` are
+// byte-identical between the two): the closer realizes EXACTLY the same amount on the newly
+// permitted bilateral close as it would on the honest liquidation path (101,000 atoms either way
+// in the item's own fixture; `EXTRACTED = 0`, re-run in this task at `c141d47f` with identical
+// numbers to the item's `dc01e542` run — `verify/security-review/fixes/P-SR.md`). So this is NOT
+// a fund-extraction regression. What is real, and what these five probes must now protect
+// instead of the vanished refusal, is the invariant the engine's own liquidation path enforces
+// but the bilateral-close path does not:
+//
+//   after a strict-reduction close takes a certified-equity-negative counterparty flat —
+//     1. it is left with NO dangling exposure — the closed leg is fully unwound, not stranded
+//        half-open and unbacked (av spec.md:59 req 24: "basis, OI, PnL and side weights for
+//        bankrupt close MUST NOT be freed until residuals are booked, backed, explicitly
+//        assigned, or recovered" — here the exposure IS freed, so the "recovered" alternative
+//        must hold on the one field that survives: `pnl`);
+//     2. its residual debt is NOT silently forgiven — `pnl` remains a durable, visible negative
+//        balance rather than being reset to zero for free. `close_progress.b_loss_booked` stays
+//        0 on this path (E-SR item, test C) — the debt is not BOOKED to a domain — but `pnl`
+//        itself is the one place it still survives; erasing that too would be forgiveness with
+//        no trace at all, strictly worse than the bug `f06a04a7` removed;
+//     3. NO value is manufactured — the close itself must not move `vault` or `c_tot`. A
+//        bilateral trade is a zero-sum repricing between two portfolios, never a transfer of
+//        real backing (this is what "no dollar left the building" reduces to at the wrapper
+//        level; the deposit/withdraw simulation that proves `EXTRACTED = 0` end-to-end lives in
+//        the engine PoC — `verify/poc/E-SR/poc_E-SR.rs` test E — not here).
+//
+// A "fix" that lets the close silently zero the debt (2) or move real backing (3) would pass the
+// OLD `close.is_err()` assertion trivially — there is no error path left to check — while being a
+// strictly worse bug. That is what this helper exists to catch.
+#[track_caller]
+fn assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+    env: &V16CuEnv,
+    probe: Pubkey,
+    vault_before: u128,
+    c_tot_before: u128,
+    insurance_before: u128,
+) {
+    let market_data = env.svm.get_account(&env.market).unwrap().data;
+    let probe_data = env.svm.get_account(&probe).unwrap().data;
+    let (_, group) = state::read_market(&market_data).unwrap();
+    let probe_state = state::read_portfolio(&probe_data).unwrap();
+
+    // 1. no dangling exposure: the closed counterparty's leg is fully unwound, not left half-open.
+    assert!(
+        !probe_state.legs[0].active,
+        "P-SR invariant #1: the closed counterparty must not be left with a dangling open leg \
+         (an unbacked position); got active={}",
+        probe_state.legs[0].active
+    );
+    assert_eq!(
+        probe_state.legs[0].basis_pos_q, 0,
+        "P-SR invariant #1: the closed counterparty's basis must be fully unwound, got {}",
+        probe_state.legs[0].basis_pos_q
+    );
+
+    // 2. the residual is not silently forgiven: the debt survives as a durable negative pnl.
+    assert!(
+        probe_state.pnl < 0,
+        "P-SR invariant #2: a bankrupt counterparty's post-close debt must remain a durable, \
+         visible negative pnl balance, not be silently forgiven for free; got pnl={}",
+        probe_state.pnl
+    );
+
+    // 3. no value is manufactured: the trade itself must not move vault, c_tot or insurance.
+    assert_eq!(
+        group.vault, vault_before,
+        "P-SR invariant #3: the bilateral close must not move real backing (vault); \
+         before={vault_before} after={}",
+        group.vault
+    );
+    assert_eq!(
+        group.c_tot, c_tot_before,
+        "P-SR invariant #3: the bilateral close must not manufacture or destroy capital \
+         (c_tot); before={c_tot_before} after={}",
+        group.c_tot
+    );
+    assert_eq!(
+        group.insurance, insurance_before,
+        "P-SR invariant #3: the bilateral close must not touch insurance; \
+         before={insurance_before} after={}",
+        group.insurance
+    );
+}
+
 #[test]
-fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
+fn v16_bpf_tradenocpi_closes_liquidatable_counterparty_without_forgiving_debt_or_dangling_exposure()
+{
     let mut env = V16CuEnv::new();
     env.top_up_insurance(1_000_000);
     env.svm.warp_to_slot(1);
@@ -6243,14 +6361,13 @@ fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         },
     );
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
-    let before_probe = env.svm.get_account(&probe).unwrap();
     let (_, before_group) = state::read_market(&before_market.data).unwrap();
     assert_eq!(before_group.insurance, 1_000_000);
+    let before_probe = env.svm.get_account(&probe).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert!(
         before_probe_state.health_cert.certified_liq_deficit != 0,
-        "probe must be liquidatable before the attempted recycling trade"
+        "probe must be liquidatable before the close"
     );
 
     let close = env.try_trade_asset_with_cu(
@@ -6264,22 +6381,21 @@ fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         0,
     );
     assert!(
-        close.is_err(),
-        "liquidatable probe must not recycle an unsettled deficit through an off-mark close"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a liquidatable counterparty; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
 }
 
 #[test]
-fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
+fn v16_bpf_tradecpi_closes_liquidatable_counterparty_without_forgiving_debt_or_dangling_exposure() {
     let mut env = V16CuEnv::new();
     let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
@@ -6335,13 +6451,12 @@ fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         9_000,
     );
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
-    let before_matcher = env.svm.get_account(&matcher_ctx).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert!(
         before_probe_state.health_cert.certified_liq_deficit != 0,
-        "probe must be liquidatable before the attempted matcher recycling trade"
+        "probe must be liquidatable before the matcher close"
     );
 
     let close = env.try_trade_cpi_with_cu_on_asset(
@@ -6357,26 +6472,22 @@ fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         0,
     );
     assert!(
-        close.is_err(),
-        "liquidatable probe must not recycle an unsettled deficit through an off-mark matcher fill"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a liquidatable counterparty through the matcher route \
+         too; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
-    );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
-    assert_eq!(
-        env.svm.get_account(&matcher_ctx).unwrap().data,
-        before_matcher.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
 }
 
 #[test]
-fn v16_bpf_tradenocpi_rejects_when_counterparty_starts_bankrupt() {
+fn v16_bpf_tradenocpi_closes_bankrupt_counterparty_without_forgiving_debt_or_dangling_exposure() {
     let mut env = V16CuEnv::new();
     env.top_up_insurance(1_000_000);
 
@@ -6408,18 +6519,18 @@ fn v16_bpf_tradenocpi_rejects_when_counterparty_starts_bankrupt() {
     );
 
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert_eq!(before_probe_state.capital, 0);
     assert!(
         before_probe_state.pnl < 0,
-        "probe must start bankrupt before the attempted recycling trade"
+        "probe must start bankrupt before the close"
     );
     assert!(before_probe_state.health_cert.valid);
     assert!(
         before_probe_state.health_cert.certified_equity < 0,
-        "refreshed probe certificate must confirm negative equity before the attempted trade"
+        "refreshed probe certificate must confirm negative equity before the close"
     );
 
     let close = env.try_trade_asset_with_cu(
@@ -6433,22 +6544,21 @@ fn v16_bpf_tradenocpi_rejects_when_counterparty_starts_bankrupt() {
         0,
     );
     assert!(
-        close.is_err(),
-        "bankrupt probe must not use an off-mark close as a normal bilateral trade"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a bankrupt counterparty; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
 }
 
 #[test]
-fn v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt() {
+fn v16_bpf_tradecpi_closes_bankrupt_counterparty_without_forgiving_debt_or_dangling_exposure() {
     let mut env = V16CuEnv::new();
     let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
@@ -6490,19 +6600,18 @@ fn v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt() {
     );
 
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
-    let before_matcher = env.svm.get_account(&matcher_ctx).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert_eq!(before_probe_state.capital, 0);
     assert!(
         before_probe_state.pnl < 0,
-        "probe must start bankrupt before the attempted matcher recycling trade"
+        "probe must start bankrupt before the matcher close"
     );
     assert!(before_probe_state.health_cert.valid);
     assert!(
         before_probe_state.health_cert.certified_equity < 0,
-        "refreshed probe certificate must confirm negative equity before the attempted matcher trade"
+        "refreshed probe certificate must confirm negative equity before the matcher close"
     );
 
     let close = env.try_trade_cpi_with_cu_on_asset(
@@ -6518,26 +6627,23 @@ fn v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt() {
         0,
     );
     assert!(
-        close.is_err(),
-        "bankrupt probe must not use an off-mark matcher fill as a normal bilateral trade"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a bankrupt counterparty through the matcher route too; \
+         got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
-    );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
-    assert_eq!(
-        env.svm.get_account(&matcher_ctx).unwrap().data,
-        before_matcher.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
 }
 
 #[test]
-fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
+fn v16_bpf_tradenocpi_closes_both_bankrupt_counterparties_without_forgiving_debt_or_dangling_exposure(
+) {
     let mut env = V16CuEnv::new();
     env.top_up_insurance(1_000_000);
 
@@ -6580,6 +6686,7 @@ fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
     );
 
     let before_market = env.svm.get_account(&env.market).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_long = env.svm.get_account(&long_account).unwrap();
     let before_short = env.svm.get_account(&short_account).unwrap();
     let before_long_state = state::read_portfolio(&before_long.data).unwrap();
@@ -6600,20 +6707,25 @@ fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
         0,
     );
     assert!(
-        close.is_err(),
-        "two bankrupt counterparties must not use TradeNoCpi as a bankruptcy close"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets TWO simultaneously-bankrupt counterparties close against each other via \
+         TradeNoCpi; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
+    // both sides end flat with a pre-existing deficit; the invariant must hold for both.
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        long_account,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
-    assert_eq!(
-        env.svm.get_account(&long_account).unwrap().data,
-        before_long.data
-    );
-    assert_eq!(
-        env.svm.get_account(&short_account).unwrap().data,
-        before_short.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        short_account,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
 }
 
@@ -7025,8 +7137,42 @@ fn v16_bpf_current_full_14_leg_tradenocpi_is_under_tx_limit() {
     assert_eq!(short.legs[0].basis_pos_q, -((9 * POS_SCALE) as i128));
 }
 
+/// Pulls the `consumed <N> of <M>` figure out of a litesvm failure string so a refusal can be
+/// reported with the compute it actually cost. Returns `"?"` when the string carries no meter
+/// line (which itself is diagnostic).
+fn cu_consumed_from_err(err: &str) -> String {
+    match err.split("consumed ").nth(1) {
+        Some(rest) => rest
+            .split(' ')
+            .next()
+            .unwrap_or("?")
+            .replace(',', "")
+            .to_string(),
+        None => "?".to_string(),
+    }
+}
+
+// FIX E-CU-R. This test was `v16_bpf_stale_full_14_leg_tradenocpi_is_under_tx_limit` and asserted
+// `trade_cu <= 1_400_000` for a 14-leg stale `TradeNoCpi`. It reached that path only because
+// `seed_n_leg_position_for_benchmark` zeroed `active_bitmap_at_cert` on both portfolios, which
+// disabled `ensure_trade_portfolio_current_for_requests_view` -- the guard that exists to stop
+// exactly this. With the fixture honest, the shipping wrapper refuses the transaction with
+// `EngineStale` (`Custom(19)`) at ~108k CU instead of dying at the 1,400,000 CU ceiling with
+// `ProgramFailedToComplete`. That is upstream's contract for this shape: upstream renamed its own
+// copy to `..._rejects_before_cu_cliff` in `c6a68501` (2026-06-04), the same commit that
+// introduced the guard, and never budgeted CU for the stale path.
+//
+// This is not a weakened assertion. The old one was a CU bound on a shape no on-chain transaction
+// can take; the new one is that a real on-chain transaction fails CLOSED with a named error a
+// client can act on ("crank first") rather than running out of compute, which a client cannot tell
+// apart from any other compute failure. The CU watermarks that do describe reachable transactions
+// are untouched and still asserted:
+//   * `v16_bpf_current_full_14_leg_tradenocpi_is_under_tx_limit`   <= 1,150,000
+//   * `v16_bpf_full_14_leg_refresh_crank_is_under_tx_limit`        <=   900,000
+//   * `v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit`    <= 1,375,000
+// and the refresh crank is the bounded second instruction this refusal points the client at.
 #[test]
-fn v16_bpf_stale_full_14_leg_tradenocpi_is_under_tx_limit() {
+fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -7036,34 +7182,369 @@ fn v16_bpf_stale_full_14_leg_tradenocpi_is_under_tx_limit() {
     env.deposit(&short_owner, short_account, 100_000);
     env.seed_n_leg_position_for_benchmark(long_account, short_account, 14);
     env.svm.warp_to_slot(16);
-    let trade_cu = env.trade_with_cu(
-        &long_owner,
-        long_account,
-        &short_owner,
-        short_account,
-        -(POS_SCALE as i128),
-        95,
-        0,
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let long_before = env.svm.get_account(&long_account).unwrap();
+    let short_before = env.svm.get_account(&short_account).unwrap();
+
+    let stale_err = env
+        .try_trade_asset_with_cu(
+            0,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            -(POS_SCALE as i128),
+            95,
+            0,
+        )
+        .expect_err("stale active accounts must pre-crank before trading");
+    println!(
+        "v16 stale full-14-leg TradeNoCpi (existing asset) refused at CU: {}",
+        cu_consumed_from_err(&stale_err)
     );
-    println!("v16 stale full-14-leg TradeNoCpi CU: {trade_cu}");
     assert!(
-        trade_cu <= 1_400_000,
-        "stale full-14-leg TradeNoCpi CU {} exceeded limit {}",
-        trade_cu,
-        1_400_000
+        stale_err.contains("Custom(19)") || stale_err.contains("custom program error: 0x13"),
+        "stale active trade should reject as EngineStale, got: {stale_err}"
+    );
+    assert!(
+        !stale_err.contains("exceeded CUs"),
+        "stale active trade must reject before the CU cliff: {stale_err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "refused stale trade leaves market bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&long_account).unwrap(),
+        long_before,
+        "refused stale trade leaves the long portfolio bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&short_account).unwrap(),
+        short_before,
+        "refused stale trade leaves the short portfolio bytes unchanged"
     );
 
-    let long_data = env.svm.get_account(&long_account).unwrap().data;
-    let short_data = env.svm.get_account(&short_account).unwrap().data;
-    let long = state::read_portfolio(&long_data).unwrap();
-    let short = state::read_portfolio(&short_data).unwrap();
+    let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
+    let short = state::read_portfolio(&env.svm.get_account(&short_account).unwrap().data).unwrap();
     assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
     assert_eq!(
         percolator::active_bitmap_count_ones(short.active_bitmap),
         14
     );
-    assert_eq!(long.legs[0].basis_pos_q, (9 * POS_SCALE) as i128);
-    assert_eq!(short.legs[0].basis_pos_q, -((9 * POS_SCALE) as i128));
+    assert_eq!(long.legs[0].basis_pos_q, (10 * POS_SCALE) as i128);
+    assert_eq!(short.legs[0].basis_pos_q, -((10 * POS_SCALE) as i128));
+}
+
+// FIX E-CU-R, the route the guard did NOT cover and upstream still does not: a portfolio with 13
+// stale legs OPENING A FRESH ASSET. `ensure_trade_portfolio_current_for_requests_view` used to
+// return `Ok(())` before it read the cert at all whenever no request touched an asset the
+// portfolio already held (`touches_existing_asset == false`), so this shape walked straight into
+// the same 2N stale-leg refresh the 14-leg case above is refused for. Measured on prog
+// `origin/fix/W-19` at engine `a90fb27f` AND on `aeyakovenko/percolator-prog upstream/main`
+// `2b1d025c` at engine `394fd0bf`: `consumed 1,399,676 of 1,399,700 compute units ... exceeded CUs
+// meter`, `ProgramFailedToComplete`. Upstream shipped a fix for this
+// (`cfb78578`, test `v16_attack_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff`)
+// on 2026-06-24 for the `TradeCpi` route only, and reverted it in full on 2026-06-27 (`13b0a2cf`,
+// no reason recorded); `TradeNoCpi` was never covered even while that fix was in.
+#[test]
+fn v16_bpf_stale_thirteen_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 20_000);
+    env.deposit(&short_owner, short_account, 100_000);
+    // 13 legs on assets 0..12; all 14 assets accrued to slot 16, so asset 13 is a FRESH asset the
+    // portfolio has no leg on.
+    env.seed_n_leg_position_for_benchmark(long_account, short_account, 13);
+    env.accrue_asset_for_benchmark(13, 16, 95);
+    env.svm.warp_to_slot(16);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let long_before = env.svm.get_account(&long_account).unwrap();
+    let short_before = env.svm.get_account(&short_account).unwrap();
+
+    let fresh_err = env
+        .try_trade_asset_with_cu(
+            13,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            95,
+            0,
+        )
+        .expect_err("a 13-leg stale portfolio must pre-crank before opening a fresh asset");
+    println!(
+        "v16 stale 13-leg TradeNoCpi (fresh asset) refused at CU: {}",
+        cu_consumed_from_err(&fresh_err)
+    );
+    assert!(
+        fresh_err.contains("Custom(19)") || fresh_err.contains("custom program error: 0x13"),
+        "stale fresh-asset trade should reject as EngineStale, got: {fresh_err}"
+    );
+    assert!(
+        !fresh_err.contains("exceeded CUs"),
+        "stale fresh-asset trade must reject before the CU cliff: {fresh_err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "refused fresh-asset trade leaves market bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&long_account).unwrap(),
+        long_before,
+        "refused fresh-asset trade leaves the taker portfolio bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&short_account).unwrap(),
+        short_before,
+        "refused fresh-asset trade leaves the counterparty portfolio bytes unchanged"
+    );
+    let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
+    assert!(
+        !has_active_leg_for_asset(&long, 13),
+        "the refused trade must not have opened the fresh asset"
+    );
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 13);
+}
+
+/// Builds a 14-asset market with a REAL `percolator-match` matcher registered on the LP portfolio
+/// and returns everything a `TradeCpi` needs. Shared by the CPI tests below.
+#[allow(clippy::type_complexity)]
+fn ecu_cpi_env() -> (V16CuEnv, Pubkey, Keypair, Pubkey, Pubkey, Pubkey, Pubkey) {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 20_000);
+    env.deposit(&lp, lp_account, 100_000);
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+    (
+        env,
+        matcher_program,
+        taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ecu_send_trade_cpi(
+    env: &mut V16CuEnv,
+    matcher_program: Pubkey,
+    taker: &Keypair,
+    taker_account: Pubkey,
+    lp_account: Pubkey,
+    ctx: Pubkey,
+    delegate: Pubkey,
+    asset_index: u16,
+    size_q: i128,
+) -> Result<u64, String> {
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::TradeCpi {
+            asset_index,
+            size_q,
+            fee_bps: 0,
+            limit_price: 0,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ],
+        &[taker],
+    )
+}
+
+// FIX E-CU-R on the CPI route -- upstream `cfb78578`'s own shape, whose test was named
+// `v16_attack_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff`. Upstream landed it
+// on 2026-06-24 and reverted it in full on 2026-06-27 (`13b0a2cf`; the companion `BatchTradeCpi`
+// fix `897d4edb` went the same way in `847f2414`). Neither revert records a reason beyond "This
+// reverts commit ...". Measured on prog `origin/fix/W-19` at engine `a90fb27f` before this fix:
+// the untrusted matcher is invoked (`invoke [2]` in the logs) and the instruction then dies with
+// `exceeded CUs meter`.
+#[test]
+fn v16_bpf_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff() {
+    let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
+    env.seed_n_leg_position_for_benchmark(taker_account, lp_account, 13);
+    env.accrue_asset_for_benchmark(13, 16, 95);
+    env.svm.warp_to_slot(16);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+    let cpi_err = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        13,
+        POS_SCALE as i128,
+    )
+    .expect_err("a 13-leg stale portfolio must pre-crank before a fresh-asset matcher-CPI trade");
+    println!(
+        "v16 stale 13-leg TradeCpi (fresh asset) refused at CU: {}",
+        cu_consumed_from_err(&cpi_err)
+    );
+    assert!(
+        cpi_err.contains("Custom(19)") || cpi_err.contains("custom program error: 0x13"),
+        "stale fresh-asset CPI trade should reject as EngineStale, got: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("exceeded CUs"),
+        "stale fresh-asset CPI trade must reject before the CU cliff: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("invoke [2]"),
+        "stale fresh-asset CPI trade must reject BEFORE the matcher CPI: {cpi_err}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
+}
+
+// FIX E-CU-C, the fork-only half: our CPI trade routes ran upstream's per-asset lifecycle gate but
+// not its currentness gate. Upstream's `ensure_cpi_trade_portfolios_current_before_matcher`
+// (`upstream/main:src/v16_program.rs:14560`) runs both before invoking the matcher -- it added the
+// currentness half on 2026-06-15 in `ba1e8d5f` "Reject active-stale CPI trades before matcher" --
+// but our `3a189159` (2026-07-16) adopted only the lifecycle half.
+//
+// For an asset the portfolio ALREADY HOLDS this is NOT a CU cliff. Measured on `origin/fix/W-19`
+// at engine `a90fb27f`: refused `Custom(19)` at 315,221 CU. What it is, is a free CPI into an
+// arbitrary LP-registered matcher program for a trade that is already known to be refused -- the
+// log carries `invoke [2]`, i.e. the untrusted matcher ran and burned its own CU before the engine
+// rejected the fill. That is exactly the argument our own `3a189159` made for adopting the
+// lifecycle half. The `invoke [2]` assertion is what makes this test non-vacuous: a failed
+// transaction is rolled back, so "accounts unchanged" alone would hold either way.
+#[test]
+fn v16_bpf_stale_thirteen_leg_existing_asset_tradecpi_rejects_before_matcher_cpi() {
+    let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
+    env.seed_n_leg_position_for_benchmark(taker_account, lp_account, 13);
+    env.svm.warp_to_slot(16);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    let cpi_err = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        0,
+        -(POS_SCALE as i128),
+    )
+    .expect_err("a 13-leg stale portfolio must pre-crank before a matcher-CPI trade");
+    println!(
+        "v16 stale 13-leg TradeCpi (existing asset) refused at CU: {}",
+        cu_consumed_from_err(&cpi_err)
+    );
+    assert!(
+        cpi_err.contains("Custom(19)") || cpi_err.contains("custom program error: 0x13"),
+        "stale CPI trade should reject as EngineStale, got: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("exceeded CUs"),
+        "stale CPI trade must reject before the CU cliff: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("invoke [2]"),
+        "stale CPI trade must reject BEFORE the untrusted matcher is invoked: {cpi_err}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
+}
+
+// THE CONTROL THAT KEEPS THE THREE TESTS ABOVE FROM BEING A REFUSE-EVERYTHING GATE. The gate now
+// counts the portfolio's LIVE active legs, so a 13-leg portfolio is over the `>= 8` threshold on
+// EVERY trade it makes, fresh asset or not. It must still be allowed to trade when it is CURRENT.
+// Both routes are driven, because the fix gates both: `TradeNoCpi` through
+// `ensure_trade_portfolios_current_for_requests_view` and `TradeCpi` through
+// `ensure_cpi_trade_portfolios_current_before_matcher`. Measured at `origin/fix/W-19` with engine
+// `a90fb27f` BEFORE the fix, the CPI leg of this control already filled (716,909 CU) -- so a
+// failure here is the fix refusing a trade that used to work, which is the thing to catch.
+#[test]
+fn v16_bpf_current_thirteen_leg_fresh_asset_trade_still_fills_on_both_routes() {
+    // (a) TradeNoCpi.
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 20_000);
+    env.deposit(&short_owner, short_account, 100_000);
+    env.seed_current_n_leg_position_for_benchmark(long_account, short_account, 13);
+    let nocpi_cu = env
+        .try_trade_asset_with_cu(
+            13,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            100,
+            0,
+        )
+        .expect("a CURRENT 13-leg portfolio must still open a fresh asset (TradeNoCpi)");
+    println!("v16 current 13-leg TradeNoCpi (fresh asset) filled at CU: {nocpi_cu}");
+    let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
+    assert!(
+        has_active_leg_for_asset(&long, 13),
+        "the fresh asset must actually be open on the taker"
+    );
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
+
+    // (b) TradeCpi, through the real matcher.
+    let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
+    env.seed_current_n_leg_position_for_benchmark(taker_account, lp_account, 13);
+    let cpi_cu = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        13,
+        POS_SCALE as i128,
+    )
+    .expect("a CURRENT 13-leg portfolio must still open a fresh asset (TradeCpi)");
+    println!("v16 current 13-leg TradeCpi (fresh asset) filled at CU: {cpi_cu}");
+    let taker_after =
+        state::read_portfolio(&env.svm.get_account(&taker_account).unwrap().data).unwrap();
+    assert!(
+        has_active_leg_for_asset(&taker_after, 13),
+        "the fresh asset must actually be open on the taker through the CPI route"
+    );
+    assert_eq!(
+        percolator::active_bitmap_count_ones(taker_after.active_bitmap),
+        14
+    );
 }
 
 #[test]
@@ -9182,7 +9663,19 @@ fn v16_attack_live_insurance_withdraw_rejects_while_stressed_or_hlocked() {
     env.svm.expire_blockhash();
     env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100)
         .expect("flat healthy live insurance withdrawal must succeed");
-    // Each engine "insurance still protecting loss" flag must independently block the withdrawal.
+    // Each engine "insurance still protecting loss" state must independently block the withdrawal.
+    //
+    // E-LSA-W reconciliation: `loss_stale_active` is a market-wide HEADER BYTE that the engine
+    // documents (percolator src/v16.rs:14740-14743) as a summary of only the LAST-TOUCHED asset,
+    // and Kani harness `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+    // (percolator tests/proofs_v16.rs:9424) pins it to 1 on an on-clock asset with an open cohort.
+    // The per-asset custody gate `live_domain_withdraw_health_or_shutdown_view` therefore no longer
+    // reads that byte; it tests the WITHDRAW-TARGET asset's own K/F settlement cohort asset-locally.
+    // The security invariant is UNCHANGED — insurance must stay protected while the asset is
+    // absorbing loss — and in this single-asset market the asset's open K/F cohort is exactly that
+    // condition, so this case now establishes it via asset-0's cohort counter instead of the raw
+    // byte (which, post-fix, can be set market-wide by an UNRELATED asset and must not freeze this
+    // asset's custody — see v16_bpf_elsa_market_wide_loss_stale_does_not_block_clean_target_withdraw).
     let cases: [(&str, fn(&mut MarketGroupV16, bool)); 3] = [
         ("bankruptcy_hlock_active", |g, v| {
             g.bankruptcy_hlock_active = v
@@ -9190,7 +9683,9 @@ fn v16_attack_live_insurance_withdraw_rejects_while_stressed_or_hlocked() {
         ("threshold_stress_active", |g, v| {
             g.threshold_stress_active = v
         }),
-        ("loss_stale_active", |g, v| g.loss_stale_active = v),
+        ("asset-0 open K/F loss-stale cohort", |g, v| {
+            g.assets[0].stale_account_count_long = u64::from(v)
+        }),
     ];
     for (label, set) in cases {
         env.mutate_market(|_cfg, group| set(group, true));
@@ -10032,12 +10527,65 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
 
     // Lapse past the bucket expiry (slot 2), resolve, then A closes (drains valid_liened to 0 via
     // its release + the shared-bucket expire).
+    //
+    // BOUNDED CONTINUATION. Since engine a0ed48a8 (our port of upstream
+    // aeyakovenko/percolator@e57296cd, "fix: prepare lapsed source before resolved settlement"),
+    // a resolved close of an account whose source domain holds a LAPSED backing bucket first
+    // normalises exactly ONE lapsed source domain per call and returns
+    // `ResolvedCloseOutcomeV16::ProgressOnly`; the close therefore takes more than one
+    // instruction and the caller is expected to loop. The wrapper LIBRARY already loops on
+    // ProgressOnly — this TEST hard-coded a single CloseResolved and asserted the payout on it,
+    // which is what made it red. The engine's own twin,
+    // `tests/backing_double_claim_fuzz.rs::terminal_close_with_expired_backing_does_not_strand`,
+    // was adapted by that same commit (`while steps < 8`, `assert!(steps >= 2)`); this is the
+    // identical adaptation. The property under test is unchanged: both co-tenants of the shared
+    // bucket must still be paid, and the domain must still wind down to zero residue. Only the
+    // number of CloseResolved instructions it takes is different.
     env.svm.warp_to_slot(5);
     env.resolve();
-    let dest_a = env.close_resolved(&owner_a, a);
+    let dest_a = env.token_account(owner_a.pubkey(), 0);
+    let mut steps_a = 0usize;
+    for i in 0..8 {
+        env.svm.expire_blockhash();
+        let result_a = env.send(
+            ProgInstruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+            vec![
+                AccountMeta::new_readonly(owner_a.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(a, false),
+                AccountMeta::new(dest_a, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[],
+        );
+        steps_a = i + 1;
+        eprintln!(
+            "A-CLOSE step {i}: {result_a:?}  | A dest token = {}",
+            env.token_amount(dest_a)
+        );
+        assert!(
+            result_a.is_ok(),
+            "A's CloseResolved step {i} must succeed — a bounded continuation never reverts; got {result_a:?}"
+        );
+        if env.token_amount(dest_a) > 0 {
+            break;
+        }
+    }
     assert!(
         env.token_amount(dest_a) > 0,
         "A (first winner) closes and is paid"
+    );
+    // Discriminator, so the loop does not turn this test into one that cannot fail: against a
+    // pre-a0ed48a8 engine the FIRST CloseResolved already returns Closed{payout} (the lapsed
+    // source domain is never normalised as its own bounded step) and this assertion fires.
+    assert!(
+        steps_a >= 2,
+        "A must take the bounded-continuation path (>= 2 CloseResolved steps, the first returning \
+         ProgressOnly); took {steps_a}"
     );
     let (_, g_after_a) = env.market_state();
     eprintln!(
@@ -10048,23 +10596,39 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
         g_after_a.source_credit[1].impaired_liened_backing_num,
     );
 
-    // B's CloseResolved — STRANDED.
+    // B's CloseResolved — the co-tenant that this test exists to prove is NOT stranded. Same
+    // bounded continuation as A: loop, never accept a revert, assert the payout after the loop.
     let dest_b = env.token_account(owner_b.pubkey(), 0);
-    let result_b = env.send(
-        ProgInstruction::CloseResolved {
-            fee_rate_per_slot: 0,
-        },
-        vec![
-            AccountMeta::new_readonly(owner_b.pubkey(), false),
-            AccountMeta::new(env.market, false),
-            AccountMeta::new(b, false),
-            AccountMeta::new(dest_b, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(env.vault_authority, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
-        &[],
-    );
+    let mut steps_b = 0usize;
+    let mut result_b: Result<u64, String> = Err("B's CloseResolved was never sent".to_string());
+    for i in 0..8 {
+        env.svm.expire_blockhash();
+        result_b = env.send(
+            ProgInstruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+            vec![
+                AccountMeta::new_readonly(owner_b.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(b, false),
+                AccountMeta::new(dest_b, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[],
+        );
+        steps_b = i + 1;
+        eprintln!(
+            "B-CLOSE step {i}: {result_b:?}  | B dest token = {}",
+            env.token_amount(dest_b)
+        );
+        // Stop on the first revert so the `result_b.is_ok()` guard below sees it (every
+        // intermediate result is therefore asserted Ok too), or as soon as B has been paid.
+        if result_b.is_err() || env.token_amount(dest_b) > 0 {
+            break;
+        }
+    }
     eprintln!(
         "B-CLOSE result: {result_b:?}  | B dest token = {}",
         env.token_amount(dest_b)
@@ -10079,6 +10643,12 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
     assert!(
         env.token_amount(dest_b) > 0,
         "B (second winner) is paid its resolved claim — no longer stranded"
+    );
+    // Same discriminator as A's: B's close also goes through at least one ProgressOnly step.
+    assert!(
+        steps_b >= 2,
+        "B must take the bounded-continuation path (>= 2 CloseResolved steps, the first returning \
+         ProgressOnly); took {steps_b}"
     );
     // The shared domain is fully wound down — no valid or impaired residue left behind.
     let (_, g_final) = env.market_state();
@@ -12656,16 +13226,10 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
     const DOMAIN: u16 = 1;
 
     let mut env = V16CuEnv::new();
-    let ledger =
-        state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
+    let ledger = state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
 
     // Recreate a legacy funded domain whose canonical ledger never existed.
-    seed_legacy_ledgerless_consumed_backing(
-        &mut env,
-        DOMAIN as usize,
-        60,
-        40,
-    );
+    seed_legacy_ledgerless_consumed_backing(&mut env, DOMAIN as usize, 60, 40);
 
     // Historical provider earnings also existed before the ledger did.
     env.mutate_market(|_cfg, group| {
@@ -12676,12 +13240,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
             .expect("#433 legacy earnings vault overflow");
     });
 
-    env.set_token_account_amount(
-        env.vault,
-        env.mint,
-        env.vault_authority,
-        130,
-    );
+    env.set_token_account_amount(env.vault, env.mint, env.vault_authority, 130);
 
     assert!(
         env.svm.get_account(&ledger).is_none(),
@@ -12724,8 +13283,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
         .svm
         .get_account(&ledger)
         .expect("migration must create the canonical ledger");
-    let migrated =
-        state::read_backing_domain_ledger(&ledger_account.data).unwrap();
+    let migrated = state::read_backing_domain_ledger(&ledger_account.data).unwrap();
 
     assert_eq!(migrated.total_principal_atoms, 100);
     assert_eq!(migrated.cumulative_loss_atoms, 40);
@@ -12773,8 +13331,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
     assert_eq!(env.token_amount(vault), 110);
 
     let ledger_after = env.svm.get_account(&ledger).unwrap();
-    let ledger_after =
-        state::read_backing_domain_ledger(&ledger_after.data).unwrap();
+    let ledger_after = state::read_backing_domain_ledger(&ledger_after.data).unwrap();
 
     assert_eq!(ledger_after.total_earnings_atoms, 30);
     assert_eq!(ledger_after.total_earnings_withdrawn_atoms, 20);
@@ -12792,16 +13349,10 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     const DOMAIN: u16 = 1;
 
     let mut env = V16CuEnv::new();
-    let ledger =
-        state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
+    let ledger = state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
 
     // Legacy backing exists, but the canonical ledger does not.
-    seed_legacy_ledgerless_consumed_backing(
-        &mut env,
-        DOMAIN as usize,
-        100,
-        0,
-    );
+    seed_legacy_ledgerless_consumed_backing(&mut env, DOMAIN as usize, 100, 0);
 
     assert!(
         env.svm.get_account(&ledger).is_none(),
@@ -12893,16 +13444,16 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         ],
         &[&admin],
     )
-    .expect(
-        "#433 resolved zero-capital migration must create the missing canonical ledger",
-    );
+    .expect("#433 resolved zero-capital migration must create the missing canonical ledger");
 
     assert_eq!(
-        env.token_amount(source), 1,
+        env.token_amount(source),
+        1,
         "zero-capital migration must not consume source tokens"
     );
     assert_eq!(
-        env.token_amount(vault), vault_before,
+        env.token_amount(vault),
+        vault_before,
         "zero-capital migration must not change vault balance"
     );
 
@@ -12911,8 +13462,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         .get_account(&ledger)
         .expect("resolved migration must create the canonical ledger");
 
-    let migrated =
-        state::read_backing_domain_ledger(&ledger_account.data).unwrap();
+    let migrated = state::read_backing_domain_ledger(&ledger_account.data).unwrap();
 
     assert_eq!(migrated.total_principal_atoms, 100);
     assert_eq!(migrated.cumulative_loss_atoms, 0);
@@ -12952,8 +13502,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     assert_eq!(env.token_amount(vault), vault_before - 40);
 
     let ledger_after = env.svm.get_account(&ledger).unwrap();
-    let ledger_after =
-        state::read_backing_domain_ledger(&ledger_after.data).unwrap();
+    let ledger_after = state::read_backing_domain_ledger(&ledger_after.data).unwrap();
 
     assert_eq!(ledger_after.total_principal_atoms, 60);
     assert_eq!(ledger_after.total_principal_withdrawn_atoms, 40);
@@ -13061,7 +13610,10 @@ fn v16_bpf_spent_backing_ledger_is_adopted_by_the_next_authority() {
         successor.pubkey().to_bytes(),
         "#453: the spent ledger must be adopted by the new authority"
     );
-    assert_eq!(adopted.total_principal_atoms, 50, "the new deposit is booked");
+    assert_eq!(
+        adopted.total_principal_atoms, 50,
+        "the new deposit is booked"
+    );
 
     // Adoption RE-SEEDS. Inheriting the predecessor's withdrawal history would
     // import their numbers into the successor's accounting, and total_earnings
@@ -13091,7 +13643,10 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
     env.withdraw_backing_bucket_to_admin_token_with_cu(dest, 1, 40);
     let partial =
         state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
-    assert_eq!(partial.total_principal_atoms, 60, "value remains on the ledger");
+    assert_eq!(
+        partial.total_principal_atoms, 60,
+        "value remains on the ledger"
+    );
 
     let successor = Keypair::new();
     env.svm.expire_blockhash();
@@ -13145,4 +13700,157 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
         state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
     assert_eq!(after.total_principal_atoms, 60);
     assert_eq!(after.authority, env.admin.pubkey().to_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// E-LSA-W regression — the per-domain backing/insurance custody gate
+// `live_domain_withdraw_health_or_shutdown_view` must test the WITHDRAW-TARGET
+// asset's own K/F settlement cohort asset-locally, NOT the market-wide
+// `loss_stale_active` header byte. The engine documents that byte as a summary
+// of only the LAST-TOUCHED asset (percolator src/v16.rs:14740-14743) and pins it
+// to `1` on an on-clock asset with an open cohort in Kani harness
+// `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+// (percolator tests/proofs_v16.rs:9424) — so the engine byte CONFORMS and the fix
+// is in this consumer. See verify/fixes/E-LSA-W.md.
+// ---------------------------------------------------------------------------
+
+const ELSA_BACKING_DOMAIN: u16 = 1; // asset 0 (domain / 2 == 0), short side
+const ELSA_TOPUP: u128 = 150;
+const ELSA_WITHDRAW: u128 = 50;
+
+// A default Live market with the withdraw-target asset's (asset 0) backing bucket
+// funded, so that an ALLOWED gate leads to a real successful withdrawal and an Err
+// therefore means the gate itself refused — not a funding/authority failure.
+fn elsa_env_with_funded_backing() -> V16CuEnv {
+    let mut env = V16CuEnv::new();
+    env.top_up_backing_bucket(ELSA_BACKING_DOMAIN, ELSA_TOPUP, 100);
+    env
+}
+
+#[test]
+fn v16_bpf_elsa_market_wide_loss_stale_does_not_block_clean_target_withdraw() {
+    // Scenario (a): the market-wide `loss_stale_active` byte is set (as an unrelated
+    // asset's open K/F cohort would set it), but the WITHDRAW-TARGET asset (asset 0)
+    // is clean and on the clock. Before the fix the market-wide byte froze this clean
+    // withdrawal with Custom(21); after the fix the gate reads only asset 0's own cohort.
+    let mut env = elsa_env_with_funded_backing();
+    env.mutate_market(|_cfg, group| {
+        group.current_slot = 5;
+        group.loss_stale_active = true; // set market-wide by SOME asset's cohort
+        let a0 = &mut group.assets[0];
+        a0.slot_last = 5; // on the clock
+        a0.stale_account_count_long = 0; // target asset's OWN cohort is clear
+        a0.stale_account_count_short = 0;
+        a0.oi_eff_long_q = 0; // no exposed target/effective lag
+        a0.oi_eff_short_q = 0;
+    });
+    // Prove the state we depend on actually persisted through write_market -> BPF read.
+    let (_, g) = env.market_state();
+    assert!(
+        g.loss_stale_active,
+        "market-wide loss_stale_active must be set"
+    );
+    assert_eq!(g.assets[0].stale_account_count_long, 0);
+    assert_eq!(g.assets[0].stale_account_count_short, 0);
+    assert_eq!(g.assets[0].slot_last, 5);
+    assert_eq!(g.current_slot, 5);
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let res = env.try_withdraw_backing_bucket_to_admin_token_with_cu(
+        dest,
+        ELSA_BACKING_DOMAIN,
+        ELSA_WITHDRAW,
+    );
+    assert!(
+        res.is_ok(),
+        "a clean, on-clock withdraw-target asset must not be frozen by the market-wide \
+         loss_stale_active byte (finding E-LSA); got: {res:?}"
+    );
+}
+
+#[test]
+fn v16_bpf_elsa_clock_lagged_target_asset_is_still_refused() {
+    // Scenario (b): the WITHDRAW-TARGET asset itself lags the clock and holds a
+    // position — genuinely loss-stale. That is caught asset-locally by
+    // `asset_local_loss_stale_view` (unchanged by the fix), so it must stay refused
+    // with Custom(21) both before and after — even with the market-wide byte cleared,
+    // which isolates the asset-local check as the reason.
+    let mut env = elsa_env_with_funded_backing();
+    env.mutate_market(|_cfg, group| {
+        group.current_slot = 6;
+        group.loss_stale_active = false;
+        let a0 = &mut group.assets[0];
+        a0.slot_last = 5; // lags the clock
+        a0.stale_account_count_long = 0;
+        a0.stale_account_count_short = 0;
+        a0.stored_pos_count_long = 1; // a live position -> has_position_or_loss_state
+        a0.oi_eff_long_q = 0; // keep the exposed target/effective-lag check inert
+        a0.oi_eff_short_q = 0;
+    });
+    let (_, g) = env.market_state();
+    assert!(!g.loss_stale_active);
+    assert_eq!(g.assets[0].slot_last, 5);
+    assert_eq!(g.current_slot, 6);
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let res = env.try_withdraw_backing_bucket_to_admin_token_with_cu(
+        dest,
+        ELSA_BACKING_DOMAIN,
+        ELSA_WITHDRAW,
+    );
+    let msg =
+        res.expect_err("a clock-lagged withdraw-target asset with a position must be refused");
+    assert!(
+        msg.contains("Custom(21)"),
+        "expected EngineLockActive Custom(21), got: {msg}"
+    );
+}
+
+#[test]
+fn v16_bpf_elsa_open_cohort_on_target_asset_is_refused_narrow_not_delete() {
+    // Scenario (b'): the WITHDRAW-TARGET asset carries an OPEN K/F settlement cohort
+    // while ON the clock, and the market-wide byte is CLEAR (as it is when a different,
+    // clean asset was the last one touched). `asset_local_loss_stale_view` conjoins the
+    // clock lag and so does NOT catch this; only the new asset-local cohort disjunct
+    // does. This is the "narrow, do not delete" guarantee: a bare deletion of the
+    // market-wide disjunct would leave this genuinely-stale target unprotected — which,
+    // measured, is exactly base (W-19) behaviour here.
+    let mut env = elsa_env_with_funded_backing();
+    env.mutate_market(|_cfg, group| {
+        group.current_slot = 5;
+        group.loss_stale_active = false; // last-touched asset was clean
+        let a0 = &mut group.assets[0];
+        a0.slot_last = 5; // on the clock -> clock-lag clause is false
+        a0.stored_pos_count_long = 1; // respect the engine's stale <= stored shape
+        a0.stale_account_count_long = 1; // target asset's OWN open K/F cohort
+        a0.stale_account_count_short = 0;
+        a0.oi_eff_long_q = 0;
+        a0.oi_eff_short_q = 0;
+    });
+    let (_, g) = env.market_state();
+    assert!(
+        !g.loss_stale_active,
+        "market-wide byte is clear in this scenario"
+    );
+    assert_eq!(
+        g.assets[0].stale_account_count_long, 1,
+        "target asset must carry an open cohort"
+    );
+    assert_eq!(g.assets[0].slot_last, 5);
+    assert_eq!(g.current_slot, 5);
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let res = env.try_withdraw_backing_bucket_to_admin_token_with_cu(
+        dest,
+        ELSA_BACKING_DOMAIN,
+        ELSA_WITHDRAW,
+    );
+    let msg = res.expect_err(
+        "an on-clock withdraw-target asset with its own open K/F cohort must be refused \
+         asset-locally (narrow, not delete)",
+    );
+    assert!(
+        msg.contains("Custom(21)"),
+        "expected EngineLockActive Custom(21), got: {msg}"
+    );
 }

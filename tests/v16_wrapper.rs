@@ -5138,6 +5138,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: prediction_q,
         b_snap: 0,
@@ -5650,6 +5651,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: prediction_q,
         b_snap: 0,
@@ -5780,6 +5782,7 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: POS_SCALE,
         b_snap: 0,
@@ -7866,10 +7869,21 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
     assert!(zero.is_err());
 
     let topped_up = market.data.clone();
+    // E-LSA-W reconciliation: `loss_stale_active` is a market-wide HEADER BYTE the engine documents
+    // as a summary of only the LAST-TOUCHED asset (percolator src/v16.rs:14740-14743), and Kani
+    // harness proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment
+    // (percolator tests/proofs_v16.rs:9424) pins it to 1 on an on-clock asset with an open cohort.
+    // The per-asset custody gate `live_domain_withdraw_health_or_shutdown_view` therefore no longer
+    // reads that byte; it tests the WITHDRAW-TARGET asset's own K/F settlement cohort asset-locally.
+    // The invariant is UNCHANGED — a backing withdraw is refused while its asset is absorbing loss —
+    // and in this single-asset market (domain 1 -> asset 0) the asset's open K/F cohort is exactly
+    // that condition, so this case establishes it via asset-0's cohort counter instead of the raw
+    // byte (which, post-fix, an UNRELATED asset can set market-wide and must NOT freeze this asset —
+    // see v16_bpf_elsa_market_wide_loss_stale_does_not_block_clean_target_withdraw).
     let stress_cases: &[fn(&mut MarketGroupV16)] = &[
         |group| group.bankruptcy_hlock_active = true,
         |group| group.threshold_stress_active = true,
-        |group| group.loss_stale_active = true,
+        |group| group.assets[0].stale_account_count_long = 1,
         |group| group.recovery_reason = Some(PermissionlessRecoveryReasonV16::BelowProgressFloor),
     ];
     for set_stress in stress_cases {
@@ -21792,5 +21806,568 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
     assert_eq!(
         market.data, before,
         "#446: a blocked reduce must not mutate market state"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// W-19 regression — `constants::VERSION` 17 -> 18.
+//
+// These are the FIX-SIDE form of `verify/poc/F-01/poc_F-01.rs`
+// (`poc_f01_layout16_portfolio_is_refused_fail_closed_by_every_route`). That
+// PoC asserted, as its W-19 line, that the wrapper's OWN header gate does NOT
+// refuse a pre-layout-18 image:
+//
+//     assert_eq!(state::check_portfolio_kind(&portfolio.data), Ok(()),
+//                "W-19: VERSION is still 17, ...")
+//
+// With VERSION at 18 that line is `Err(Custom(1))` = `InvalidVersion`, and it
+// fires in `check_header` (`src/v16_program.rs:1546`) BEFORE the engine's
+// provenance check (`Custom(16)` = `EngineProvenanceMismatch`) can be reached.
+// `f01_w19_old_f01_assertion_must_now_fail` below pins that flip directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `V16_LAYOUT_DISCRIMINATOR` at the deployed engine `9483ee90` (`src/v16.rs:29`).
+const F01W19_PRE18_LAYOUT_DISCRIMINATOR: u16 = 16;
+/// wrapper `VERSION` at the deployed wrapper `e8acd708` and at `origin/main`
+/// `480e23a0` before this fix (`src/v16_program.rs:50`).
+const F01W19_PRE18_WRAPPER_VERSION: u16 = 17;
+/// `layout_discriminator` sits at +98 inside `ProvenanceHeaderV16Account`
+/// (32 market_group_id + 32 portfolio_account_id + 32 owner + 2 version), and the
+/// provenance header is the FIRST field of `PortfolioAccountV16Account`, which
+/// starts at `HEADER_LEN`. Neither offset moved 16 -> 18.
+const F01W19_DISC_OFF: usize = HEADER_LEN + 98;
+
+fn f01_w19_read_disc(data: &[u8]) -> u16 {
+    u16::from_le_bytes([data[F01W19_DISC_OFF], data[F01W19_DISC_OFF + 1]])
+}
+
+fn f01_w19_read_header_version(data: &[u8]) -> u16 {
+    u16::from_le_bytes([data[8], data[9]])
+}
+
+fn f01_w19_set_header_version(data: &mut [u8], version: u16) {
+    data[8..10].copy_from_slice(&version.to_le_bytes());
+}
+
+fn f01_w19_set_disc(data: &mut [u8], disc: u16) {
+    data[F01W19_DISC_OFF..F01W19_DISC_OFF + 2].copy_from_slice(&disc.to_le_bytes());
+}
+
+/// Exactly what the DEPLOYED wrapper+engine pair stamped: header VERSION 17,
+/// provenance layout discriminator 16.
+fn f01_w19_stamp_pre18(data: &mut [u8]) {
+    f01_w19_set_disc(data, F01W19_PRE18_LAYOUT_DISCRIMINATOR);
+    f01_w19_set_header_version(data, F01W19_PRE18_WRAPPER_VERSION);
+}
+
+/// A healthy, freshly-seeded portfolio under THIS build, plus its market.
+fn f01_w19_fixture() -> (TestAccount, TestAccount, TestAccount, TestAccount, Pubkey) {
+    let mut admin = signer();
+    // ClosePortfolio's closer must be writable (`expect_writable(closer)`).
+    let mut owner = signer().writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+    )
+    .unwrap();
+    let mut portfolio = portfolio_account_for_market_slots(2);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 10_000);
+    (admin, owner, market, portfolio, mint)
+}
+
+#[test]
+fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
+    assert_eq!(
+        percolator_prog::constants::VERSION,
+        18,
+        "W-19: src/v16_program.rs:50"
+    );
+    assert_eq!(
+        percolator::V16_LAYOUT_DISCRIMINATOR,
+        18,
+        "engine 2c38570a:src/v16.rs — the layout bump this VERSION tracks"
+    );
+
+    let (_admin, _owner, market, portfolio, _mint) = f01_w19_fixture();
+
+    // `write_header` is generic over KIND_*: one constant stamps every account
+    // the wrapper creates, which is why a PARTIAL re-seed hard-fails.
+    assert_eq!(
+        f01_w19_read_header_version(&market.data),
+        18,
+        "KIND_MARKET header stamped with the new VERSION"
+    );
+    assert_eq!(
+        f01_w19_read_header_version(&portfolio.data),
+        18,
+        "KIND_PORTFOLIO header stamped with the new VERSION"
+    );
+    assert_eq!(market.data[10], percolator_prog::constants::KIND_MARKET);
+    assert_eq!(
+        portfolio.data[10],
+        percolator_prog::constants::KIND_PORTFOLIO
+    );
+    assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
+    println!(
+        "[w19] fresh accounts: market version={} kind={} | portfolio version={} kind={} disc={}",
+        f01_w19_read_header_version(&market.data),
+        market.data[10],
+        f01_w19_read_header_version(&portfolio.data),
+        portfolio.data[10],
+        f01_w19_read_disc(&portfolio.data),
+    );
+
+    // The bump does not break the accounts this build seeds itself.
+    assert_eq!(state::check_portfolio_kind(&portfolio.data), Ok(()));
+}
+
+#[test]
+fn f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1() {
+    let (_admin, mut owner, mut market, mut portfolio, mint) = f01_w19_fixture();
+    let healthy = portfolio.data.clone();
+
+    // The on-chain shape: the old account after
+    // `ensure_portfolio_storage_for_market_slots` grew it 9347 -> 9539.
+    f01_w19_stamp_pre18(&mut portfolio.data);
+    assert_eq!(portfolio.data.len(), PORTFOLIO_ACCOUNT_LEN);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), 16);
+    assert_eq!(f01_w19_read_header_version(&portfolio.data), 17);
+    let stamped = portfolio.data.clone();
+
+    // ── THE FLIPPED LINE. Was `Ok(())` at VERSION 17 (verify/poc/F-01). ──
+    let own_check = state::check_portfolio_kind(&portfolio.data);
+    println!("[w19] check_portfolio_kind(disc=16, VERSION=17 image) -> {own_check:?}");
+    assert_eq!(
+        own_check,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+        "W-19: the wrapper's OWN gate (check_header :1546) now refuses the \
+         pre-layout-18 image with Custom(1) — it no longer falls through to the engine"
+    );
+
+    // Every mutating route inherits it, because
+    // `portfolio_view_mut_for_market_slots` (:3234) calls `check_header` first.
+    // `run_ix_no_rollback` does not restore on Err, so "no partial write" is real.
+    let market_before = market.data.clone();
+    let mut dest_token = user_token_account(owner.key, mint, 0);
+    let dest_before = dest_token.data.clone();
+    let mut vault_token = vault_token_account(&market, mint, 10_000);
+    let vault_before = vault_token.data.clone();
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let w = run_ix_no_rollback(
+        Instruction::Withdraw { amount: 1 },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio,
+            &mut dest_token,
+            &mut vault_token,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    println!("[w19] Withdraw on the pre-18 image -> {w:?}   (was Custom(16) at VERSION 17)");
+    assert_eq!(
+        w,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+        "the wrapper header gate now refuses BEFORE the engine's provenance check"
+    );
+    assert_eq!(market.data, market_before, "no partial write to the market");
+    assert_eq!(dest_token.data, dest_before, "no tokens moved to the owner");
+    assert_eq!(vault_token.data, vault_before, "no tokens left the vault");
+    assert_eq!(portfolio.data, stamped, "no partial write to the portfolio");
+
+    let c = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19] ClosePortfolio on the pre-18 image -> {c:?}   (was Custom(16) at VERSION 17)");
+    assert_eq!(
+        c,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+    );
+    assert_eq!(market.data, market_before);
+    assert_eq!(portfolio.data, stamped);
+
+    // NO NEW EXIT. `is_initialized` reads MAGIC only, so the re-init escape is
+    // still shut — the bump relabels the refusal, it does not relax anything.
+    let i = run_ix_no_rollback(
+        Instruction::InitPortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19] InitPortfolio (re-seed in place) on the pre-18 image -> {i:?}");
+    assert_eq!(
+        i,
+        Err(percolator_prog::error::PercolatorError::AlreadyInitialized.into()),
+        "VERSION 18 must not open an in-place re-seed"
+    );
+    assert_eq!(portfolio.data, stamped);
+
+    // And the healthy image under THIS build still withdraws.
+    portfolio.data = healthy;
+    let ok = run_ix_no_rollback(
+        Instruction::Withdraw { amount: 1 },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio,
+            &mut dest_token,
+            &mut vault_token,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    println!("[w19] Withdraw on a VERSION-18 image -> {ok:?}");
+    assert_eq!(
+        ok,
+        Ok(()),
+        "the bump must not break freshly-seeded accounts"
+    );
+}
+
+#[test]
+fn f01_w19_custom1_fires_before_the_engine_custom16() {
+    // The two halves are independent, so the ORDER is observable: craft an image
+    // that trips only ONE of the two gates and read which error comes back.
+    let (_admin, mut owner, mut market, mut portfolio, _mint) = f01_w19_fixture();
+    let healthy = portfolio.data.clone();
+
+    // (a) wrapper VERSION stale, engine layout CURRENT -> only the wrapper gate
+    //     can object, and it does. At VERSION 17 this image was fully accepted.
+    portfolio.data = healthy.clone();
+    f01_w19_set_header_version(&mut portfolio.data, F01W19_PRE18_WRAPPER_VERSION);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
+    let a = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19-order] (a) VERSION=17, disc=18 -> {a:?}   (wrapper gate only)");
+    assert_eq!(
+        a,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+    );
+
+    // (b) wrapper VERSION current, engine layout STALE -> the wrapper gate is
+    //     satisfied and the refusal is the ENGINE's provenance check, Custom(16).
+    portfolio.data = healthy.clone();
+    f01_w19_set_disc(&mut portfolio.data, F01W19_PRE18_LAYOUT_DISCRIMINATOR);
+    assert_eq!(f01_w19_read_header_version(&portfolio.data), 18);
+    assert_eq!(
+        state::check_portfolio_kind(&portfolio.data),
+        Ok(()),
+        "the wrapper gate reads MAGIC/VERSION/kind only — it cannot see the discriminator"
+    );
+    let b = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19-order] (b) VERSION=18, disc=16 -> {b:?}   (engine gate only)");
+    assert_eq!(
+        b,
+        Err(percolator_prog::error::PercolatorError::EngineProvenanceMismatch.into()),
+    );
+
+    // (c) BOTH stale — the real deployed image. Custom(1) wins, so the wrapper
+    //     gate is strictly first and the engine check is never reached.
+    portfolio.data = healthy;
+    f01_w19_stamp_pre18(&mut portfolio.data);
+    let c = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19-order] (c) VERSION=17, disc=16 -> {c:?}   (BOTH stale: Custom(1) wins)");
+    assert_eq!(
+        c,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+        "Custom(1) precedes Custom(16)"
+    );
+}
+
+/// `verify/poc/F-01/poc_F-01.rs`'s W-19 assertion, verbatim, as it stood at
+/// `origin/main` 480e23a0. It must now PANIC.
+#[test]
+#[should_panic(expected = "W-19: VERSION is still 17")]
+fn f01_w19_old_f01_assertion_must_now_fail() {
+    let (_admin, _owner, _market, mut portfolio, _mint) = f01_w19_fixture();
+    f01_w19_stamp_pre18(&mut portfolio.data);
+    let own_check = state::check_portfolio_kind(&portfolio.data);
+    println!("[w19-old] wrapper check_portfolio_kind(disc=16, VERSION=17 image) -> {own_check:?}");
+    assert_eq!(
+        own_check,
+        Ok(()),
+        "W-19: VERSION is still 17, so the wrapper's own gate does NOT refuse the old layout \
+         — the refusal below is the ENGINE's discriminator check, not wrapper policy. \
+         (Under the negative control, VERSION=18, this line is what flips.)"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// B-4 (wrapper impact W-14) — the batch path refused the both-sides-charged
+// state that engine #160 makes legitimate.
+//
+// Before: `handle_batch_execute_zero_copy` returned `EngineArithmeticOverflow`
+// whenever `outcome.fee_a > 0 && outcome.fee_b > 0`, citing the Kani harness
+// `proof_v16_taker_only_charges_exactly_one_side`. That harness does not exist
+// at the engine this wrapper builds against (`percolator 2c38570a`); #160
+// replaced it with
+// `proof_v16_taker_only_never_overcharges_and_maker_pays_only_shortfall`
+// (`2c38570a:tests/proofs_v16.rs:14466`) because the charge shape changed: the
+// taker is charged what it can pay and the SOLVENT MAKER is charged the
+// REMAINDER (`2c38570a:src/v16.rs:18172-18178`, `:18213`, `:18224-18227`), and
+// "BOTH return values can now be non-zero -- previously exactly one was"
+// (`:18229-18230`).
+//
+// A batch is several fills against a RUNNING capital, so a taker that covers
+// leg 0's fee in full and leg 1's only in part produces exactly that state on
+// one batch. The fixture below is `sync/artifacts/b4_batch_guard_probe_test.rs`
+// (the 2026-09-14 design probe) turned into a regression test.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Open two legs, then leave the taker with `fee_leg + 1` atoms of capital and
+/// send a two-leg strict reduction. Returns
+/// `(result, fee_leg, taker_capital_before, taker_capital_after, maker_capital_before,
+///   maker_capital_after)`.
+fn b4_mid_batch_shortfall_batch() -> (Result<(), ProgramError>, u128, u128, u128, u128, u128) {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                ..
+            } = ix
+            {
+                *max_portfolio_assets = 2;
+            }
+        }),
+    );
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut taker_owner = signer();
+    let mut maker_owner = signer();
+    let mut taker = portfolio_account();
+    let mut maker = portfolio_account();
+    init_portfolio(&mut taker_owner, &mut market, &mut taker);
+    init_portfolio(&mut maker_owner, &mut market, &mut maker);
+    deposit(&mut taker_owner, &mut market, &mut taker, 10_000_000);
+    deposit(&mut maker_owner, &mut market, &mut maker, 10_000_000);
+
+    // Open a position on each asset (taker long, maker short) with ample capital.
+    let size = 10 * POS_SCALE;
+    let open = |asset_index: u16| percolator_prog::ix::BatchTradeLeg {
+        asset_index,
+        size_q: size as i128,
+        exec_price: 100,
+        fee_bps: 1_000,
+    };
+    run_ix(
+        Instruction::BatchTradeNoCpi {
+            legs: vec![open(0), open(1)],
+        },
+        &mut [
+            &mut taker_owner,
+            &mut maker_owner,
+            &mut market,
+            &mut taker,
+            &mut maker,
+        ],
+    )
+    .expect("opening batch must execute");
+
+    // Arrange the taker's capital so ONE leg's fee is covered and the second is
+    // not: capital = fee_leg + 1 atom. The surgery mirrors a withdrawal so
+    // `c_tot` / `vault` stay consistent with Σ capital (`validate_shape`).
+    let fee_leg = taker_only_fee(size, 100, 1_000);
+    assert!(fee_leg > 1, "fixture needs a multi-atom fee");
+    let target_capital = fee_leg + 1;
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        let mut acct = state::read_portfolio(&taker.data).unwrap();
+        let drop = acct.capital - target_capital;
+        acct.capital = target_capital;
+        acct.health_cert.valid = false;
+        group.c_tot -= drop;
+        group.vault -= drop;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+        state::write_portfolio(&mut taker.data, &acct).unwrap();
+    }
+
+    let taker_before = state::read_portfolio(&taker.data).unwrap().capital;
+    let maker_before = state::read_portfolio(&maker.data).unwrap().capital;
+
+    // A two-leg STRICT REDUCTION (exempt from the final IM gate), so an
+    // under-margin taker may execute it. Leg 0: the taker pays `fee_leg` in
+    // full, leaving 1 atom. Leg 1: the taker can pay 1 atom of `fee_leg`, and
+    // the N1 fallback asks the solvent maker for the remainder.
+    let reduce = |asset_index: u16| percolator_prog::ix::BatchTradeLeg {
+        asset_index,
+        size_q: -(size as i128),
+        exec_price: 100,
+        fee_bps: 1_000,
+    };
+    let res = run_ix(
+        Instruction::BatchTradeNoCpi {
+            legs: vec![reduce(0), reduce(1)],
+        },
+        &mut [
+            &mut taker_owner,
+            &mut maker_owner,
+            &mut market,
+            &mut taker,
+            &mut maker,
+        ],
+    );
+    let taker_after = state::read_portfolio(&taker.data).unwrap().capital;
+    let maker_after = state::read_portfolio(&maker.data).unwrap().capital;
+    (
+        res,
+        fee_leg,
+        taker_before,
+        taker_after,
+        maker_before,
+        maker_after,
+    )
+}
+
+/// THE REGRESSION. A batch whose taker runs out of capital between two legs is
+/// charged on both sides by the engine and must now EXECUTE, with the maker
+/// paying exactly the taker's shortfall and nothing more.
+#[test]
+fn b4_batch_with_taker_shortfall_and_maker_remainder_executes() {
+    let (res, fee_leg, taker_before, taker_after, maker_before, maker_after) =
+        b4_mid_batch_shortfall_batch();
+    println!("[b4] fee_leg={fee_leg} (per leg, 2 legs) -> batch owes {}", 2 * fee_leg);
+    println!("[b4] two-leg reduction with a mid-batch taker shortfall -> {res:?}");
+    assert_eq!(
+        res,
+        Ok(()),
+        "engine #160 makes the both-sides-charged batch legitimate; the wrapper must execute it"
+    );
+
+    let taker_paid = taker_before - taker_after;
+    let maker_paid = maker_before - maker_after;
+    println!(
+        "[b4] taker capital {taker_before} -> {taker_after} (paid {taker_paid}); \
+maker capital {maker_before} -> {maker_after} (paid {maker_paid})"
+    );
+    assert_eq!(
+        taker_paid, taker_before,
+        "the taker pays every atom it has: fee_leg in full on leg 0, its last atom on leg 1"
+    );
+    assert_eq!(
+        taker_paid,
+        fee_leg + 1,
+        "which is exactly the capital the fixture left it"
+    );
+    assert_eq!(
+        maker_paid,
+        fee_leg - 1,
+        "the maker pays the REMAINDER (fee - taker_fee), not the whole leg fee"
+    );
+    assert_eq!(
+        taker_paid + maker_paid,
+        2 * fee_leg,
+        "fee_a + fee_b == the fee the batch owes: nothing over-collected, nothing lost"
+    );
+    assert!(
+        taker_paid > 0 && maker_paid > 0,
+        "both aggregates are nonzero -- the state the pre-B-4 guard refused"
+    );
+}
+
+/// The pre-fix guard's decision, asserted as it stood. `EngineArithmeticOverflow`
+/// on this legitimate state is what B-4 removes, so this assertion MUST FAIL now;
+/// on a revert of `src/v16_program.rs` it passes again and this test goes red.
+#[test]
+#[should_panic(expected = "PRE-B-4")]
+fn b4_old_guard_refusal_of_the_legitimate_state_no_longer_happens() {
+    let (res, _fee_leg, _tb, _ta, _mb, _ma) = b4_mid_batch_shortfall_batch();
+    println!("[b4-old] mid-batch-shortfall batch -> {res:?}");
+    assert_eq!(
+        res,
+        Err(percolator_prog::error::PercolatorError::EngineArithmeticOverflow.into()),
+        "PRE-B-4: the `taker_paid && maker_paid` guard refused the batch engine #160 legitimises"
+    );
+}
+
+/// The invariant that REPLACED the exclusivity guard, exercised directly. The
+/// handler calls this predicate at the guard's old position with the fee the
+/// batch owes, so an engine that over-collects is still refused — which is the
+/// half of the old guard's job that was real.
+#[test]
+fn b4_aggregate_bound_admits_every_legitimate_split_and_refuses_over_collection() {
+    use percolator_prog::processor::batch_fee_charge_within_owed as within;
+    let owed: u128 = 1_000;
+
+    // Legitimate shapes at 2c38570a.
+    assert!(within(owed, 0, owed), "taker pays the whole fee");
+    assert!(within(0, owed, owed), "N1: the taker paid nothing, the maker pays it all");
+    assert!(within(600, 400, owed), "#160: taker pays part, maker pays the REMAINDER");
+    assert!(within(999, 1, owed), "a one-atom shortfall handed to the maker");
+    assert!(
+        within(1, 0, owed),
+        "an uncollectible remainder is FORGIVEN, not over-collected (av:spec.md:61 #26); the \
+         stricter reconstructed_total == engine_total cross-check is what pins the sum exactly"
+    );
+    assert!(within(0, 0, 0), "a zero-fee batch");
+
+    // Over-collection — refused, which is what the guard site is for.
+    assert!(!within(owed, 1, owed), "one atom MORE than the batch owes");
+    assert!(!within(owed, owed, owed), "both sides charged the full fee (upstream's engine shape)");
+    assert!(!within(1, 0, 0), "a fee on a zero-fee batch");
+    assert!(!within(u128::MAX, 1, u128::MAX), "an aggregate pair that cannot even be summed");
+
+    // The consequence the item asks for, restated: under this bound a nonzero
+    // maker charge forces the taker to have fallen short of the total owed.
+    for (a, b) in [(600u128, 400u128), (0, 1_000), (999, 1)] {
+        assert!(within(a, b, owed));
+        if b > 0 {
+            assert!(a < owed, "maker charged => taker fell short: fee_a={a} < owed={owed}");
+        }
+    }
+}
+
+/// Anti-rot: the refusal that B-4 removes must not come back, and the invariant
+/// that replaced it must still be wired into the batch handler.
+#[test]
+fn b4_batch_guard_site_enumeration() {
+    let src = include_str!("../src/v16_program.rs");
+    let exclusivity: Vec<usize> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("taker_paid && maker_paid"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    let bound: Vec<usize> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("batch_fee_charge_within_owed(outcome.fee_a"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    println!("[b4] `taker_paid && maker_paid` refusals: {exclusivity:?}");
+    println!("[b4] `batch_fee_charge_within_owed` call sites: {bound:?}");
+    assert!(
+        exclusivity.is_empty(),
+        "the exclusivity refusal is gone: engine #160 makes the state legitimate"
+    );
+    assert_eq!(
+        bound.len(),
+        1,
+        "and the aggregate bound is called exactly once, at the guard's old position"
+    );
+    // The total-integrity cross-check B-4 keeps, byte-identical.
+    assert_eq!(
+        src.matches("if reconstructed_total != engine_total {").count(),
+        1,
+        "the reconstructed-total cross-check is untouched"
     );
 }
