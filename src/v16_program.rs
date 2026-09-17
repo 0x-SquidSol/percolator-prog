@@ -1780,7 +1780,7 @@ pub mod state {
     pub fn read_backing_domain_ledger(
         data: &[u8],
     ) -> Result<BackingDomainLedgerAccountV16, ProgramError> {
-        if data.len() < backing_domain_ledger_account_len() {
+        if data.len() != backing_domain_ledger_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         check_header(data, KIND_BACKING_DOMAIN_LEDGER)?;
@@ -1797,7 +1797,7 @@ pub mod state {
         data: &mut [u8],
         ledger: &BackingDomainLedgerAccountV16,
     ) -> Result<(), ProgramError> {
-        if data.len() < backing_domain_ledger_account_len() {
+        if data.len() != backing_domain_ledger_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         check_header(data, KIND_BACKING_DOMAIN_LEDGER)?;
@@ -1813,7 +1813,7 @@ pub mod state {
         data: &mut [u8],
         ledger: &BackingDomainLedgerAccountV16,
     ) -> Result<(), ProgramError> {
-        if data.len() < backing_domain_ledger_account_len() {
+        if data.len() != backing_domain_ledger_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         if is_initialized(data) {
@@ -1836,7 +1836,7 @@ pub mod state {
 
     #[inline]
     pub fn read_insurance_ledger(data: &[u8]) -> Result<InsuranceLedgerAccountV16, ProgramError> {
-        if data.len() < insurance_ledger_account_len() {
+        if data.len() != insurance_ledger_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         check_header(data, KIND_INSURANCE_LEDGER)?;
@@ -1853,7 +1853,7 @@ pub mod state {
         data: &mut [u8],
         ledger: &InsuranceLedgerAccountV16,
     ) -> Result<(), ProgramError> {
-        if data.len() < insurance_ledger_account_len() {
+        if data.len() != insurance_ledger_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         check_header(data, KIND_INSURANCE_LEDGER)?;
@@ -1869,7 +1869,7 @@ pub mod state {
         data: &mut [u8],
         ledger: &InsuranceLedgerAccountV16,
     ) -> Result<(), ProgramError> {
-        if data.len() < insurance_ledger_account_len() {
+        if data.len() != insurance_ledger_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         if is_initialized(data) {
@@ -11125,6 +11125,19 @@ pub mod processor {
         domain: u16,
         bucket: &percolator::BackingBucketV16,
     ) -> Result<(state::BackingDomainLedgerAccountV16, bool), ProgramError> {
+        // Fork adaptation of upstream caf1cc2a: `data.len() == 0` is the
+        // documented sentinel for the LP vault's SIBLING-domain ledger,
+        // which may never have been created (see the `sibling_ledger_ai`
+        // doc comment in `handle_deposit_to_lp_vault` and the doc comment
+        // on `lp_vault_domain_nav_atoms` — "an uninitialised ledger account
+        // contributes 0"). That is a genuinely absent account, not a
+        // malformed one, so it is exempted from the exact-length gate below
+        // and falls through to the all-zero fresh-ledger branch. Any account
+        // that DOES have storage (`data.len() != 0`) must still match the
+        // canonical wire length exactly — upstream's hardening.
+        if !data.is_empty() && data.len() != state::backing_domain_ledger_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
         if state::is_initialized(data) {
             let ledger = state::read_backing_domain_ledger(data)?;
             if ledger.market_group != market_group || ledger.domain != domain {
@@ -11246,6 +11259,8 @@ pub mod processor {
                 return Ok((stamped, true));
             }
             Ok((ledger, true))
+        } else if data.iter().any(|byte| *byte != 0) {
+            Err(ProgramError::InvalidAccountData)
         } else {
             Ok((
                 new_backing_domain_ledger(market_group, authority, domain, bucket)?,
@@ -11272,12 +11287,17 @@ pub mod processor {
         authority: [u8; 32],
         insurance_atoms: u128,
     ) -> Result<(state::InsuranceLedgerAccountV16, bool), ProgramError> {
+        if data.len() != state::insurance_ledger_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
         if state::is_initialized(data) {
             let ledger = state::read_insurance_ledger(data)?;
             if ledger.market_group != market_group || ledger.authority != authority {
                 return Err(PercolatorError::Unauthorized.into());
             }
             Ok((ledger, true))
+        } else if data.iter().any(|byte| *byte != 0) {
+            Err(ProgramError::InvalidAccountData)
         } else {
             Ok((
                 state::InsuranceLedgerAccountV16 {
