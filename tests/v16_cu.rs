@@ -3576,6 +3576,271 @@ fn v16_bpf_resolved_terminal_insurance_drains_dynamic_domain_after_positions_clo
     assert!(market_data.iter().all(|b| *b == 0));
 }
 
+/// ADOPT upstream `547847ed` "invalidate terminal scan prefix after backing
+/// expiry" + its neighbour test `d134c64d` (`inv_070_terminal_scan_recredit`),
+/// adapted to our fork's wrapper-owned cursor storage (Wave-1 S1a, GENERAL
+/// non-LP-vault case).
+///
+/// THE ASSERTION: the persisted terminal-slab-scan cursor
+/// (`AssetOracleProfileV16::terminal_slab_scan_progress`, carried on asset 0)
+/// must be INVALIDATED -- reset all the way to 0, forcing a full rescan from
+/// asset 0 -- when `CloseSlab`'s windowed scan processes a `BackingExpired`
+/// step, rather than resumed just past the asset whose bucket expired.
+/// Resuming above that point (the pre-547847ed upstream behavior this fork
+/// carried: `encode_terminal_slab_scan_progress(domain / 2, ..)`) would
+/// silently skip a LOWER-indexed asset forever, even though the just-expired
+/// bucket's released residual can retroactively make that lower asset's
+/// insurance newly recreditable (`first_terminal_claim_free_recredit_asset`,
+/// engine PR #258 / I2).
+///
+/// Two-asset market: asset 0 carries no backing at all (`Continue` on every
+/// scan step). Asset 1's LONG domain (domain 2) carries a `Fresh` backing
+/// bucket that has NOT yet lapsed on the first scan, so the scan parks on it
+/// via the `Wait` outcome (`kernel_terminal_slab_wait_continuation`) and
+/// persists cursor = 1 -- the only way to observe a nonzero cursor on a
+/// market this small, since `TERMINAL_SLAB_SCAN_ASSETS_PER_CALL` (256) is
+/// never exhausted by a 2-asset scan window. After warping past the bucket's
+/// `expiry_slot`, the SAME domain now lapses: the scan (still starting from
+/// the parked cursor = 1) hits `Expire` on domain 2 this time --
+/// `domain / 2 == 1`, i.e. IDENTICAL to the already-parked cursor, so a test
+/// that only checked "cursor changed" would pass on the buggy pre-fix
+/// resume-past-expiry formula too. This test instead asserts the cursor lands
+/// on the CORRECT post-fix value (0), which only the `547847ed` fix produces
+/// (the NEGATIVE CONTROL below independently confirms 1 is what the old
+/// `domain / 2` formula would have left instead).
+#[test]
+fn v16_bpf_terminal_scan_prefix_invalidated_after_backing_expiry() {
+    fn terminal_slab_scan_progress(env: &V16CuEnv) -> u128 {
+        let mut data = env.svm.get_account(&env.market).unwrap().data;
+        let (_, group) = state::market_view_mut(&mut data).unwrap();
+        let n = core::mem::size_of::<state::AssetOracleProfileV16>();
+        let profile: state::AssetOracleProfileV16 =
+            bytemuck::pod_read_unaligned(&group.markets[0].wrapper[..n]);
+        profile.terminal_slab_scan_progress
+    }
+
+    const DOMAIN: u16 = 2; // asset-1 long (domain = asset_index * 2 + side; side 0 = long)
+    const EXPIRY_SLOT: u64 = 50;
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.svm.warp_to_slot(1);
+    env.top_up_backing_bucket(DOMAIN, 100, EXPIRY_SLOT);
+    let (_, group) = env.market_state();
+    assert_eq!(
+        group.source_credit[DOMAIN as usize].fresh_reserved_backing_num,
+        100 * BOUND_SCALE,
+        "backing bucket topup must make source_fresh_backing_total_num nonzero"
+    );
+
+    env.resolve();
+    assert_eq!(terminal_slab_scan_progress(&env), 0, "fresh market, no scan run yet");
+
+    // First CloseSlab call: asset 0 -> Continue, asset 1 -> Wait (bucket Fresh,
+    // not yet lapsed at slot 1 < EXPIRY_SLOT). The scan makes progress (returns
+    // Ok without closing the market) and persists cursor = 1.
+    env.close_slab_with_cu();
+    let market_data = env.svm.get_account(&env.market).unwrap().data;
+    assert!(
+        !market_data.iter().all(|b| *b == 0),
+        "market must NOT be closed yet -- fresh backing is still live, unlapsed"
+    );
+    assert_eq!(
+        terminal_slab_scan_progress(&env),
+        1,
+        "scan parks on asset 1's not-yet-lapsed Wait and persists cursor = 1"
+    );
+
+    // Warp past the bucket's expiry. The scan (resuming at cursor = 1) now finds
+    // domain 2 lapsed and Expires it -- THE FIX under test: this must reset the
+    // cursor to 0 (full rescan), not to `domain / 2` (== 1, unchanged).
+    env.svm.warp_to_slot(EXPIRY_SLOT);
+    env.close_slab_with_cu();
+    let market_data = env.svm.get_account(&env.market).unwrap().data;
+    assert!(
+        !market_data.iter().all(|b| *b == 0),
+        "market must NOT be closed yet -- this call only processed the Expire step"
+    );
+    assert_eq!(
+        terminal_slab_scan_progress(&env),
+        0,
+        "FIX (adopt upstream 547847ed): BackingExpired must invalidate the ENTIRE \
+         prefix (cursor -> 0), not resume at domain / 2 (== 1 here) -- a nonzero \
+         resume would permanently skip re-checking asset 0 for newly-recreditable \
+         insurance that this expiry's released residual can create"
+    );
+
+    // Now that source_fresh_backing_total_num is back to 0 (the bucket expired,
+    // not merely a Wait), a third call completes the scan and actually closes
+    // the market -- confirms the fix does not regress terminal teardown. The
+    // expired bucket's 100 atoms were never liened against by any counterparty
+    // (no trading happened on this domain), so they are genuine unbudgeted
+    // terminal residue: `retire_terminal_unbudgeted_insurance_core_not_atomic`
+    // retires (burns) them, which needs the primary mint account (index 6, no
+    // secondary collateral configured) that `close_slab_with_cu`'s fixed 6-account
+    // list does not provide -- build the 7-account call directly instead.
+    //
+    // `V16CuEnv`'s mint is a placeholder (supply pinned at 0 by `make_mint_data`;
+    // token balances are seeded directly via `set_account`/`make_token_data`
+    // rather than real `MintTo`), so an actual SPL `Burn` of the 100-atom residue
+    // would underflow its supply. Bump the mint's tracked supply to match the
+    // vault's real balance first -- this only fixes the test harness's bookkeeping
+    // to match reality (the deployed mint's supply always reflects everything
+    // ever transferred into these test-seeded balances); it does not change
+    // anything the program under test does.
+    {
+        let mint_amount = env.token_amount(env.vault);
+        let mut mint_account = env.svm.get_account(&env.mint).unwrap();
+        let mut mint = Mint::unpack(&mint_account.data).unwrap();
+        mint.supply = mint_amount;
+        Mint::pack(mint, &mut mint_account.data).unwrap();
+        env.svm.set_account(env.mint, mint_account).unwrap();
+    }
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, env.admin.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::CloseSlab,
+        vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(env.mint, false),
+        ],
+        &[&env.admin],
+    )
+    .expect("close slab with mint for unbudgeted-residue burn");
+    let market_data = env.svm.get_account(&env.market).unwrap().data;
+    assert!(
+        market_data.iter().all(|b| *b == 0),
+        "third call completes the now-unblocked scan and closes the market"
+    );
+}
+
+/// Wave-1 S1a v2 griefing regression (Gate-2 REJECT, verifier `abe30333`).
+///
+/// THE HOLE: the terminal-slab scan's option-(b) `CloseSlab` gate (see the
+/// `OPTION-(B) SCOPE GATE` comment above `lp_vault_dead_share_floor_present`
+/// in `src/v16_program.rs`) permanently blocks `CloseSlab` for ANY funded
+/// domain whose `expiry_slot == LP_VAULT_BACKING_EXPIRY_SLOT` -- the sentinel
+/// (`u64::MAX / 2`) meaning "LP-vault-bound". That sentinel is meant to be
+/// reserved EXCLUSIVELY to the LP-vault-registry call sites
+/// (`handle_deposit_to_lp_vault` / rebalance / fee-crank-reclassify), which
+/// stamp it via `add_fresh_counterparty_backing_view` with a hardcoded
+/// constant -- never a caller-supplied argument.
+///
+/// Before this fix, `handle_top_up_backing_bucket` (tag 24) accepted the wire
+/// `expiry_slot` RAW, with only a lower-bound check (`> current_slot`). A
+/// domain's `backing_bucket_authority` -- a role separately delegatable from
+/// `marketauth` -- could set it to EXACTLY the sentinel on an ORDINARY
+/// top-up, on a market that never touched the LP-vault feature at all, and
+/// PERMANENTLY brick `CloseSlab` with `Custom(21)` (`EngineLockActive`) for
+/// that market. Both a self-inflicted foot-gun and a role-separation
+/// griefing vector; empirically PoC'd by the verifier on a plain market with
+/// zero LP-vault instructions.
+///
+/// THE FIX: `handle_top_up_backing_bucket` now rejects
+/// `expiry_slot == LP_VAULT_BACKING_EXPIRY_SLOT` with `InvalidInstruction`
+/// (`Custom(9)`) in BOTH the mode-0 preflight and the re-check/reuse branch
+/// that actually calls `deposit_fresh_counterparty_backing_not_atomic` --
+/// i.e. the sentinel is rejected at the top-up itself, long before it could
+/// ever reach `CloseSlab`.
+#[test]
+fn v16_bpf_topup_backing_bucket_rejects_lp_vault_sentinel_expiry() {
+    let mut env = V16CuEnv::new();
+    let sentinel = percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT;
+
+    let ledger = env.canonical_backing_domain_ledger_account(1);
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, env.admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let admin = env.admin.insecure_clone();
+    let market = env.market;
+    let vault = env.vault;
+
+    // POSITIVE CONTROL (the fix under test): the exact sentinel must be
+    // rejected at the top-up itself.
+    let err = env
+        .send(
+            ProgInstruction::TopUpBackingBucket {
+                domain: 1,
+                amount: 1_000,
+                expiry_slot: sentinel,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect_err(
+            "a plain market's TopUpBackingBucket must reject expiry_slot == \
+             LP_VAULT_BACKING_EXPIRY_SLOT -- that sentinel is reserved to the \
+             LP-vault-registry call sites, which stamp it directly and never \
+             through this caller-supplied-argument handler. Pre-fix this let a \
+             domain's backing_bucket_authority permanently brick CloseSlab \
+             (Custom(21)) on a market that never touched the LP-vault feature.",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::InvalidInstruction as u32),
+        "expected InvalidInstruction (Custom(9)); got {err}"
+    );
+    // No capital moved and no bucket was opened by the refused top-up.
+    let (_, g) = env.market_state();
+    assert_eq!(g.vault, 0, "a refused top-up must not move any tokens");
+    assert_eq!(
+        g.source_backing_buckets[1].status,
+        BackingBucketStatusV16::Empty,
+        "a refused top-up must not open the bucket"
+    );
+
+    // NEGATIVE CONTROL: only the EXACT sentinel is reserved. `sentinel - 1` is
+    // an ordinary (if enormous) expiry and must still succeed exactly as
+    // before this fix.
+    env.top_up_backing_bucket(1, 1_000, sentinel - 1);
+    let (_, g2) = env.market_state();
+    assert_eq!(
+        g2.source_backing_buckets[1].status,
+        BackingBucketStatusV16::Fresh,
+        "a top-up whose expiry_slot is one less than the sentinel must still succeed"
+    );
+    assert_eq!(
+        g2.source_backing_buckets[1].expiry_slot, sentinel - 1,
+        "the accepted expiry_slot must be stored unmodified"
+    );
+}
+
 #[test]
 fn v16_bpf_permissionless_asset_cannot_withdraw_unrelated_domain_insurance() {
     let mut env = V16CuEnv::new();
