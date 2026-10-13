@@ -41658,7 +41658,8 @@ pub mod processor {
     /// `active` positions now, `closed` of them closed exactly by the request set, `opened` new
     /// assets requested: over the cap iff `active - closed + opened > cap`. With `opened == 0`
     /// (every request is on a held asset: add, reduce, close, flip) it is never over the cap for
-    /// an account that is within it now.
+    /// an account that is within it now. Saturating: exact for every `cap < usize::MAX` (the only
+    /// caller passes `cap == WRAPPER_MAX_PORTFOLIO_ASSETS`).
     pub fn position_cap_exceeded(active: usize, closed: usize, opened: usize, cap: usize) -> bool {
         active.saturating_sub(closed).saturating_add(opened) > cap
     }
@@ -47169,7 +47170,10 @@ mod p1_position_cap_kani_proofs {
     }
 
     /// Exactness and totality: for every input the rule returns (no overflow, no panic), and
-    /// with `closed <= active` it refuses iff `active - closed + opened > cap` in the integers.
+    /// with `closed <= active` and `cap < usize::MAX` it refuses iff `active - closed + opened >
+    /// cap` in the integers. (First run, without the `cap < usize::MAX` assumption: FAILED, and
+    /// rightly — when the sum overflows `usize` it saturates to `usize::MAX`, which is not above a
+    /// cap of `usize::MAX`. Production calls the rule with `cap == 4` only.)
     #[kani::proof]
     #[kani::solver(cadical)]
     fn kani_p1_position_cap_rule_is_exact_and_total() {
@@ -47178,7 +47182,7 @@ mod p1_position_cap_kani_proofs {
         let opened: usize = kani::any();
         let cap: usize = kani::any();
         let refused = position_cap_exceeded(active, closed, opened, cap);
-        if closed <= active {
+        if closed <= active && cap < usize::MAX {
             let after = (active - closed) as u128 + opened as u128;
             assert_eq!(refused, after > cap as u128);
         }
