@@ -41657,8 +41657,8 @@ pub mod processor {
     ///
     /// `deltas` is this instruction's whole request set for `account`, as `(asset_index, signed
     /// size delta from this account's point of view)` — one element for a single trade, one per
-    /// leg for a batch (assets are distinct: the batch pre-pass refuses duplicates before this
-    /// runs). The trade is refused with `over_cap` when the number of assets the account would
+    /// leg for a batch (a repeated asset is counted once; the batch pre-pass refuses the
+    /// duplicate afterwards with its own code). The trade is refused with `over_cap` when the number of assets the account would
     /// hold a position on afterwards exceeds `config.max_portfolio_assets`:
     ///
     ///   after = active legs now
@@ -41695,29 +41695,28 @@ pub mod processor {
         }
         let mut closed = 0usize;
         let mut opened = 0usize;
-        for &(asset_index, delta_q) in deltas {
-            let mut held = None;
+        for (i, &(asset_index, delta_q)) in deltas.iter().enumerate() {
+            // An asset named twice is counted once: the duplicate-asset rule of the batch
+            // pre-pass (Custom 9) owns that refusal, not the cap.
+            if deltas[..i].iter().any(|&(earlier, _)| earlier == asset_index) {
+                continue;
+            }
+            let mut held = false;
             for pod in &account.header.legs {
                 let leg = pod.try_to_runtime().map_err(map_v16_error)?;
                 if leg.active && leg.asset_index as usize == asset_index {
-                    held = Some(match leg.side {
-                        SideV16::Long => leg.basis_pos_q.unsigned_abs() as i128,
-                        SideV16::Short => -(leg.basis_pos_q.unsigned_abs() as i128),
-                    });
+                    held = true;
                     break;
                 }
             }
-            match held {
-                Some(current_q) => {
-                    if current_q.checked_add(delta_q) == Some(0) {
-                        closed += 1;
-                    }
+            if held {
+                // Same position read (and the same exact-close test) as the admission snapshot.
+                let current_q = signed_position_for_asset_view(group, account, asset_index)?;
+                if current_q.checked_add(delta_q) == Some(0) {
+                    closed += 1;
                 }
-                None => {
-                    if delta_q != 0 {
-                        opened += 1;
-                    }
-                }
+            } else if delta_q != 0 {
+                opened += 1;
             }
         }
         if active.saturating_sub(closed).saturating_add(opened) > cap {
@@ -41756,7 +41755,8 @@ pub mod processor {
     /// P-1: both sides of a batch. Each leg carries its SIGNED size from account_a's point of
     /// view (batches never reorder), so account_b moves against every leg. Runs on the raw legs,
     /// ahead of the batch pre-pass: a batch with a duplicate asset or a zero size is refused by
-    /// that pre-pass whatever this returns (a duplicate new asset can only over-count here).
+    /// that pre-pass whatever this returns (a repeated asset is counted once here, so the
+    /// duplicate rule keeps its own code).
     #[inline(never)]
     fn ensure_batch_position_cap_view(
         group: &state::MarketViewMutV16<'_>,
