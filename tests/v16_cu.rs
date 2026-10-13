@@ -26841,7 +26841,8 @@ fn v22_init_market_refuses_every_leg_count_above_the_cap() {
 }
 
 /// S10-X1: a leg above a market's cap is refused by the real TradeNoCpi and TradeCpi instructions
-/// on BPF with `HiddenLeg` (Custom 17), market and both portfolios byte-identical. Built on a
+/// on BPF with `PositionCapReached` (Custom 126; QA item P-1 — it was the engine's `HiddenLeg`,
+/// Custom 17, before the wrapper named the cap), market and both portfolios byte-identical. Built on a
 /// system-created market capped at 2 legs with a third asset slot appended (slots can exceed the
 /// cap; legs cannot). (BatchTradeCpi above the cap is covered at engine level only.)
 #[test]
@@ -26877,11 +26878,11 @@ fn v22_leg_above_cap_is_refused_by_trade_instructions() {
     let e = env
         .try_trade_asset_with_cu(2, &long_owner, long_account, &short_owner, short_account, (1_000 * POS_SCALE) as i128, 100, 0)
         .expect_err("TradeNoCpi leg above the cap must be refused");
-    assert!(e.contains("Custom(17)"), "TradeNoCpi: expected HiddenLeg (Custom 17), got {e}");
+    assert!(e.contains("Custom(126)"), "TradeNoCpi: expected PositionCapReached (Custom 126), got {e}");
     assert_eq!(snap(&env), before, "TradeNoCpi: refused trade left state changed");
     let e = ecu_send_trade_cpi(&mut env, matcher_program, &long_owner, long_account, short_account, ctx, delegate, 2, (1_000 * POS_SCALE) as i128)
         .expect_err("TradeCpi leg above the cap must be refused");
-    assert!(e.contains("Custom(17)"), "TradeCpi: expected HiddenLeg (Custom 17), got {e}");
+    assert!(e.contains("Custom(126)"), "TradeCpi: expected PositionCapReached (Custom 126), got {e}");
     assert_eq!(snap(&env), before, "TradeCpi: refused trade left state changed");
     assert_eq!(x1g_legs(&env, long_account), 2);
 }
@@ -27303,7 +27304,284 @@ fn v22_batch_above_cap_is_refused_on_bpf() {
     let r = send(&mut env, &[2]);
     println!("X1HCAP 1-leg batch on a third asset with 2 legs held: {}", match &r { Ok(cu) => format!("OK {cu}"), Err(e) => e.chars().take(120).collect() });
     let e = r.expect_err("the leg above the cap must be refused on the batch route");
-    assert!(e.contains("Custom(17)"), "expected HiddenLeg (Custom 17), got {e}");
+    assert!(e.contains("Custom(126)"), "expected PositionCapReached (Custom 126; P-1, was HiddenLeg 17), got {e}");
     assert!(snap(&env) == before, "refused batch left state changed");
     assert_eq!(x1g_legs(&env, a), 2);
+}
+
+// =============================================================================================
+// v2.2 QA item P-1: the per-portfolio position cap has its own error code and is checked first.
+//
+// Before: a trade that would open a position on one asset more than the market's cap
+// (`max_portfolio_assets`, at most WRAPPER_MAX_PORTFOLIO_ASSETS = 4) was refused with the generic
+// `InvalidInstruction` (Custom 9) by the source-domain admission gate
+// (`SourceDomainAdmissionSnapshot::push_reserved`), or with the engine's `HiddenLeg` (Custom 17)
+// on a market whose cap is below the wrapper's. Now: `PositionCapReached` (Custom 126) when it is
+// account_a over the cap, `CounterpartyPositionCapReached` (Custom 127) when it is account_b,
+// ahead of every fee / floor / margin check of the fill. The SET of refused trades is unchanged.
+//
+// Negative control: run these against the unpatched RC binary with
+// `P1_WRAPPER_SO=<wrapper 6c078a0e .so>`; every test below fails there (Custom 9 instead of 126/127).
+// =============================================================================================
+
+const P1_POSITION_CAP: u32 = percolator_prog::error::PercolatorError::PositionCapReached as u32;
+const P1_COUNTERPARTY_POSITION_CAP: u32 =
+    percolator_prog::error::PercolatorError::CounterpartyPositionCapReached as u32;
+/// One lot of the fixtures below: 1,000 units at price 100 = 100,000 notional, 10,000 initial margin.
+const P1_LOT: i128 = (1_000 * POS_SCALE) as i128;
+
+/// A market capped at `LEG_CAP` (4) positions per portfolio with one more asset slot appended
+/// (slots can exceed the cap; positions cannot), 10% initial margin, no fees.
+fn p1_env() -> V16CuEnv {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        max_portfolio_assets: LEG_CAP as u16,
+        maintenance_margin_bps: 1_000,
+        initial_margin_bps: 1_000,
+        max_price_move_bps_per_slot: 500,
+        ..V16CuMarketParams::default()
+    });
+    // Same append as `v16_bpf_source_domain_admission_reserves_latent_capacity_of_sibling_legs`:
+    // the harness pre-extends the injected market account (a LiteSVM realloc ceiling, not a
+    // program rule); `ActivateAsset` still runs every one of its checks and writes.
+    env.svm.warp_to_slot(1);
+    env.grow_market_capacity_for_test(LEG_CAP + 1);
+    env.activate_asset(LEG_CAP as u16, 1, 100);
+    env
+}
+
+fn p1_trade(env: &mut V16CuEnv, asset: u16, a_owner: &Keypair, a: Pubkey, b_owner: &Keypair, b: Pubkey, size_q: i128) -> Result<u64, String> {
+    env.svm.expire_blockhash();
+    env.try_trade_asset_with_cu(asset, a_owner, a, b_owner, b, size_q, 100, 0)
+}
+
+fn p1_batch(env: &mut V16CuEnv, a_owner: &Keypair, a: Pubkey, b_owner: &Keypair, b: Pubkey, legs: &[(u16, i128)]) -> Result<u64, String> {
+    env.svm.expire_blockhash();
+    let (a_id, _, a_pe) = env.portfolio_identity(a);
+    let (b_id, _, b_pe) = env.portfolio_identity(b);
+    let market = env.svm.get_account(&env.market).unwrap().data;
+    let legs = legs
+        .iter()
+        .map(|&(asset, size_q)| percolator_prog::ix::BatchTradeLeg {
+            market_id: state::read_market_trade_preflight(&market, asset as usize).unwrap().3,
+            asset_index: asset,
+            size_q,
+            exec_price: 100,
+            fee_bps: 0,
+        })
+        .collect();
+    env.send(
+        ProgInstruction::BatchTradeNoCpi { account_a_portfolio_id: a_id, account_a_position_epoch: a_pe, account_b_portfolio_id: b_id, account_b_position_epoch: b_pe, legs },
+        vec![AccountMeta::new(a_owner.pubkey(), true), AccountMeta::new(b_owner.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(a, false), AccountMeta::new(b, false)],
+        &[a_owner, b_owner],
+    )
+}
+
+/// Bring the assets and the given portfolios current (the >= 3-position pre-crank guard and the
+/// engine's loss-stale gate both want it before a risk-increasing fill). Each portfolio is
+/// cranked, then the earlier ones again: refreshing one account moves the risk epoch under the
+/// others (QA Q-7). A crank with nothing to do answers NonProgress (22); that is not an error here.
+fn p1_refresh(env: &mut V16CuEnv, portfolios: &[Pubkey]) {
+    let now_slot = env.svm.get_sysvar::<Clock>().slot;
+    let observations: Vec<CrankObservationHint> =
+        (0..=LEG_CAP as u16).map(|asset_index| CrankObservationHint { asset_index, oracle_accounts: 0 }).collect();
+    for round in 0..2 {
+        for &portfolio in portfolios {
+            env.svm.expire_blockhash();
+            let r = env.send(
+                ProgInstruction::PermissionlessCrank { now_slot, observations: if round == 0 { observations.clone() } else { vec![] } },
+                vec![AccountMeta::new(env.payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(portfolio, false)],
+                &[],
+            );
+            if let Err(e) = r {
+                assert!(e.contains("Custom(22)"), "refresh crank: {e}");
+            }
+        }
+    }
+}
+
+fn p1_expect_code(r: Result<u64, String>, code: u32, what: &str) {
+    let e = match r {
+        Ok(cu) => panic!("{what}: must be refused with Custom({code}), but it landed ({cu} CU)"),
+        Err(e) => e,
+    };
+    assert!(e.contains(&format!("Custom({code})")), "{what}: expected Custom({code}), got {e}");
+}
+
+fn p1_snap(env: &V16CuEnv, keys: &[Pubkey]) -> Vec<Account> {
+    std::iter::once(env.market).chain(keys.iter().copied()).map(|k| env.svm.get_account(&k).unwrap()).collect()
+}
+
+/// The 5th position is refused with the named code on TradeNoCpi AND on the matcher route
+/// (TradeCpi), state byte-identical; adding to, reducing and closing a held position still work
+/// at the cap, and closing one position frees the slot for a new asset.
+#[test]
+fn v22_p1_fifth_position_is_refused_with_the_position_cap_code() {
+    let mut env = p1_env();
+    let cap = LEG_CAP as u16;
+    let matcher_program = Pubkey::new_unique();
+    env.svm.add_program(matcher_program, &std::fs::read(matcher_program_path()).expect("read matcher BPF"));
+    let (long_owner, short_owner) = (Keypair::new(), Keypair::new());
+    let long = env.create_portfolio(&long_owner);
+    let short = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long, 500_000_000);
+    env.deposit(&short_owner, short, 500_000_000);
+    let (ctx, delegate, _) = env.init_matcher_context(&short_owner, matcher_program, short);
+    for asset in 0..cap {
+        p1_trade(&mut env, asset, &long_owner, long, &short_owner, short, P1_LOT)
+            .unwrap_or_else(|e| panic!("position {asset} within the cap must open: {e}"));
+    }
+    assert_eq!(x1g_legs(&env, long), cap as u32);
+    assert_eq!(x1g_legs(&env, short), cap as u32);
+
+    let before = p1_snap(&env, &[long, short]);
+    p1_expect_code(p1_trade(&mut env, cap, &long_owner, long, &short_owner, short, P1_LOT), P1_POSITION_CAP, "TradeNoCpi 5th position");
+    assert_eq!(p1_snap(&env, &[long, short]), before, "TradeNoCpi: the refused trade left state changed");
+    p1_expect_code(
+        ecu_send_trade_cpi(&mut env, matcher_program, &long_owner, long, short, ctx, delegate, cap, P1_LOT),
+        P1_POSITION_CAP,
+        "TradeCpi 5th position",
+    );
+    assert_eq!(p1_snap(&env, &[long, short]), before, "TradeCpi: the refused trade left state changed");
+
+    // Positive controls at the cap: a held position can be added to, reduced and closed.
+    p1_refresh(&mut env, &[long, short]);
+    p1_trade(&mut env, 1, &long_owner, long, &short_owner, short, P1_LOT).expect("adding to a held position at the cap");
+    p1_trade(&mut env, 1, &long_owner, long, &short_owner, short, -P1_LOT).expect("reducing a held position at the cap");
+    p1_trade(&mut env, 0, &long_owner, long, &short_owner, short, -P1_LOT).expect("closing a held position at the cap");
+    assert_eq!(x1g_legs(&env, long), cap as u32 - 1);
+    // The freed slot takes the new asset; the cap then binds again on the asset just closed.
+    p1_trade(&mut env, cap, &long_owner, long, &short_owner, short, P1_LOT).expect("a new asset after closing one position");
+    assert_eq!(x1g_legs(&env, long), cap as u32);
+    p1_expect_code(p1_trade(&mut env, 0, &long_owner, long, &short_owner, short, P1_LOT), P1_POSITION_CAP, "5th position after refilling the cap");
+}
+
+/// The side that is over the cap is named: account_a -> 126, account_b -> 127.
+#[test]
+fn v22_p1_counterparty_over_the_cap_gets_its_own_code() {
+    let mut env = p1_env();
+    let cap = LEG_CAP as u16;
+    let (seed_owner, lp_owner, fresh_owner) = (Keypair::new(), Keypair::new(), Keypair::new());
+    let seed = env.create_portfolio(&seed_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    let fresh = env.create_portfolio(&fresh_owner);
+    for (owner, account) in [(&seed_owner, seed), (&lp_owner, lp), (&fresh_owner, fresh)] {
+        env.deposit(owner, account, 500_000_000);
+    }
+    for asset in 0..cap {
+        p1_trade(&mut env, asset, &seed_owner, seed, &lp_owner, lp, P1_LOT).expect("seed the LP's positions");
+    }
+    assert_eq!(x1g_legs(&env, lp), cap as u32);
+    assert_eq!(x1g_legs(&env, fresh), 0);
+
+    let before = p1_snap(&env, &[fresh, lp]);
+    // The fresh account (no positions) is account_a; the LP at the cap is account_b.
+    p1_expect_code(p1_trade(&mut env, cap, &fresh_owner, fresh, &lp_owner, lp, P1_LOT), P1_COUNTERPARTY_POSITION_CAP, "account_b at the cap");
+    // Same fill with the signers swapped: the LP at the cap is now account_a.
+    p1_expect_code(p1_trade(&mut env, cap, &lp_owner, lp, &fresh_owner, fresh, -P1_LOT), P1_POSITION_CAP, "account_a at the cap");
+    assert_eq!(p1_snap(&env, &[fresh, lp]), before, "the refused trades left state changed");
+    // Not over-eager: the fresh account still opens on an asset the LP already holds.
+    p1_refresh(&mut env, &[lp, fresh]);
+    p1_trade(&mut env, 0, &fresh_owner, fresh, &lp_owner, lp, P1_LOT).expect("an asset the LP already holds");
+}
+
+/// Q-6: the cap is answered before the margin check, so an account at the cap is never told to
+/// deposit for an order no deposit can make land. The margin check itself is still alive and
+/// still named (control: one position below the cap, the same shortfall answers 49, and a deposit
+/// cures it).
+#[test]
+fn v22_p1_position_cap_is_answered_before_the_margin_check() {
+    const IM_PER_LOT: u128 = 10_000;
+    let cap = LEG_CAP as u16;
+    let margin = PercolatorError::EngineInsufficientInitialMargin as u32;
+
+    // At the cap, with margin for exactly the 4 held positions and not for a 5th.
+    let mut env = p1_env();
+    let (taker_owner, lp_owner) = (Keypair::new(), Keypair::new());
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, IM_PER_LOT * cap as u128 + IM_PER_LOT / 2);
+    env.deposit(&lp_owner, lp, 500_000_000);
+    for asset in 0..cap {
+        p1_trade(&mut env, asset, &taker_owner, taker, &lp_owner, lp, P1_LOT).expect("open up to the cap");
+    }
+    // The LP holds `cap` positions too, so use a fresh counterparty: only the taker is over the cap.
+    let other_owner = Keypair::new();
+    let other = env.create_portfolio(&other_owner);
+    env.deposit(&other_owner, other, 500_000_000);
+    p1_expect_code(p1_trade(&mut env, cap, &taker_owner, taker, &other_owner, other, P1_LOT), P1_POSITION_CAP, "under-margined 5th position");
+    env.deposit(&taker_owner, taker, 500_000_000);
+    p1_expect_code(p1_trade(&mut env, cap, &taker_owner, taker, &other_owner, other, P1_LOT), P1_POSITION_CAP, "fully-margined 5th position");
+
+    // A market whose cap (2) is below the wrapper's: there the unpatched program answered the
+    // under-margined order 49 (the engine's margin check ran ahead of its leg-shape check) and the
+    // same order 17 once margined - the "deposit, then be refused anyway" order QA reported.
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        system_created_market: true,
+        max_portfolio_assets: 2,
+        maintenance_margin_bps: 1_000,
+        initial_margin_bps: 1_000,
+        max_price_move_bps_per_slot: 500,
+        ..V16CuMarketParams::default()
+    });
+    let admin = env.admin.pubkey();
+    env.try_activate_asset_with_authorities(2, 5, 100, admin, admin, admin, admin).expect("append asset 2");
+    let (taker_owner, lp_owner) = (Keypair::new(), Keypair::new());
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, IM_PER_LOT * 2 + IM_PER_LOT / 2);
+    env.deposit(&lp_owner, lp, 500_000_000);
+    for asset in 0..2u16 {
+        p1_trade(&mut env, asset, &taker_owner, taker, &lp_owner, lp, P1_LOT).expect("open up to the cap of 2");
+    }
+    p1_expect_code(p1_trade(&mut env, 2, &taker_owner, taker, &lp_owner, lp, P1_LOT), P1_POSITION_CAP, "cap-2 market, under-margined 3rd position");
+    env.deposit(&taker_owner, taker, 500_000_000);
+    p1_expect_code(p1_trade(&mut env, 2, &taker_owner, taker, &lp_owner, lp, P1_LOT), P1_POSITION_CAP, "cap-2 market, fully-margined 3rd position");
+
+    // Control, one position below the cap: the same shortfall is a margin refusal, and curable.
+    let mut env = p1_env();
+    let (taker_owner, lp_owner) = (Keypair::new(), Keypair::new());
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, IM_PER_LOT * (cap as u128 - 1) + IM_PER_LOT / 2);
+    env.deposit(&lp_owner, lp, 500_000_000);
+    for asset in 0..cap - 1 {
+        p1_trade(&mut env, asset, &taker_owner, taker, &lp_owner, lp, P1_LOT).expect("open up to one below the cap");
+    }
+    p1_expect_code(p1_trade(&mut env, cap - 1, &taker_owner, taker, &lp_owner, lp, P1_LOT), margin, "under-margined 4th position");
+    env.deposit(&taker_owner, taker, 500_000_000);
+    p1_refresh(&mut env, &[taker, lp]);
+    p1_trade(&mut env, cap - 1, &taker_owner, taker, &lp_owner, lp, P1_LOT).expect("the 4th position lands after the deposit");
+}
+
+/// Batch route (BatchTradeNoCpi; BatchTradeCpi shares `handle_batch_execute_zero_copy`): the cap
+/// is judged on the batch's NET effect. Five opens from flat are refused with the named code; at
+/// the cap, a batch that closes one position and opens another lands; a batch that keeps every
+/// held position and opens a new asset is refused.
+#[test]
+fn v22_p1_batch_over_the_position_cap_is_refused_with_the_position_cap_code() {
+    let mut env = p1_env();
+    let cap = LEG_CAP as u16;
+    let (a_owner, b_owner) = (Keypair::new(), Keypair::new());
+    let a = env.create_portfolio(&a_owner);
+    let b = env.create_portfolio(&b_owner);
+    env.deposit(&a_owner, a, 500_000_000);
+    env.deposit(&b_owner, b, 500_000_000);
+
+    let before = p1_snap(&env, &[a, b]);
+    let five: Vec<(u16, i128)> = (0..=cap).map(|asset| (asset, P1_LOT)).collect();
+    p1_expect_code(p1_batch(&mut env, &a_owner, a, &b_owner, b, &five), P1_POSITION_CAP, "5 opens from flat");
+    assert_eq!(p1_snap(&env, &[a, b]), before, "the refused batch left state changed");
+
+    let four: Vec<(u16, i128)> = (0..cap).map(|asset| (asset, P1_LOT)).collect();
+    p1_batch(&mut env, &a_owner, a, &b_owner, b, &four).expect("a batch that fills the cap exactly");
+    assert_eq!(x1g_legs(&env, a), cap as u32);
+
+    // Net +0: close asset 0, open the asset above the cap.
+    p1_batch(&mut env, &a_owner, a, &b_owner, b, &[(0, -P1_LOT), (cap, P1_LOT)]).expect("close one, open one, at the cap");
+    assert_eq!(x1g_legs(&env, a), cap as u32);
+
+    // Net +1: add to a held asset and open the one just closed.
+    let before = p1_snap(&env, &[a, b]);
+    p1_expect_code(p1_batch(&mut env, &a_owner, a, &b_owner, b, &[(1, P1_LOT), (0, P1_LOT)]), P1_POSITION_CAP, "add to one and open a 5th");
+    assert_eq!(p1_snap(&env, &[a, b]), before, "the refused batch left state changed");
 }

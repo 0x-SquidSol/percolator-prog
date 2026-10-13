@@ -1836,7 +1836,25 @@ VaultLpMultiAssetMarket,
         /// removal-only tag 117. Custom(125). Operator: propose (tag 120), wait 216,000 slots,
         /// then commit (tag 121); removals alone may use tag 117 immediately.
         G9AllowlistTimelock = 125,
+        // ── v2.2 QA item P-1: named position-cap refusal ────────────────────
+        // Explicit discriminants; appended after G9AllowlistTimelock (125). Do NOT renumber.
+        /// The trade would leave `account_a` (the taker on the matcher route; the first signer on
+        /// NoCpi) with more open positions than the market's per-portfolio cap
+        /// (`config.max_portfolio_assets`, at most `WRAPPER_MAX_PORTFOLIO_ASSETS` = 4). Adding to,
+        /// reducing or closing a held position is never refused by this rule; no deposit can cure
+        /// it — close a position first. Custom(126). Before this code the same trade was refused
+        /// with the generic Custom(9) by the source-domain admission gate (or by the engine's
+        /// leg-shape check on a market whose cap is below the wrapper's), so the SET of refused
+        /// trades is unchanged; only the code and the order (now ahead of every fee, margin and
+        /// floor check of the fill) differ. SDK agent: add `PositionCapReached = 126`.
+        PositionCapReached = 126,
+        /// Same rule, but it is `account_b` (the LP on the matcher route; the second signer on
+        /// NoCpi) that would exceed the per-portfolio position cap. Custom(127). SDK agent: add
+        /// `CounterpartyPositionCapReached = 127`.
+        CounterpartyPositionCapReached = 127,
     }
+    const _: () = assert!(PercolatorError::PositionCapReached as u32 == 126);
+    const _: () = assert!(PercolatorError::CounterpartyPositionCapReached as u32 == 127);
     const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
     const _: () = assert!(PercolatorError::ExitRequiresLossCurrent as u32 == 118);
     const _: () = assert!(PercolatorError::LotConfigInvalid as u32 == 119);
@@ -16337,6 +16355,15 @@ pub mod processor {
             } else {
                 size_q.unsigned_abs()
             };
+            // P-1: the position cap, with its own code, before every fee / floor / margin check
+            // of this fill (a trade over the cap can never succeed, whatever is deposited).
+            ensure_single_trade_position_cap_view(
+                &group,
+                &account_a,
+                &account_b,
+                asset_index as usize,
+                size_q,
+            )?;
             // w1-s3: current signed position on the traded asset, needed below to decide
             // whether this trade's delta can newly touch a source domain.
             let account_a_position =
@@ -16926,6 +16953,9 @@ pub mod processor {
             expect_portfolio_view_account_key(&account_b, account_b_ai.key)?;
             expect_portfolio_view_owner(&account_a, account_a_owner_key)?;
             expect_portfolio_view_owner(&account_b, account_b_owner_key)?;
+            // P-1: the position cap, with its own code, before the pre-pass (same placement as
+            // the single-trade executor: ahead of every fee / floor / margin check).
+            ensure_batch_position_cap_view(&group, &account_a, &account_b, legs)?;
 
             // Pre-pass: per leg, read its oracle profile, pin the fee basis to the asset mark, and
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
@@ -41620,6 +41650,136 @@ pub mod processor {
             position_b_before,
             roles,
             Some((a_eff, b_eff)),
+        )
+    }
+
+    /// v2.2 QA item P-1: the per-portfolio position cap, named and checked first.
+    ///
+    /// `deltas` is this instruction's whole request set for `account`, as `(asset_index, signed
+    /// size delta from this account's point of view)` — one element for a single trade, one per
+    /// leg for a batch (assets are distinct: the batch pre-pass refuses duplicates before this
+    /// runs). The trade is refused with `over_cap` when the number of assets the account would
+    /// hold a position on afterwards exceeds `config.max_portfolio_assets`:
+    ///
+    ///   after = active legs now
+    ///         - legs this request set closes exactly (position + delta == 0)
+    ///         + requested assets the account has no active leg on.
+    ///
+    /// This refuses nothing that was admitted before. A request set with `after > cap` needs
+    /// `2 * after` source domains (both domains of every surviving leg are reserved by
+    /// `reserved_source_domains_snapshot_for_trade_view`, both domains of every new asset by
+    /// `ensure_trade_delta_source_domain_capacity_view`), which is over
+    /// `WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS = 2 * WRAPPER_MAX_PORTFOLIO_ASSETS` whenever the
+    /// market's cap is the wrapper's, so the admission gate already answered Custom(9); on a
+    /// market whose cap is lower the engine refused the same trade (a leg may not sit in a slot
+    /// at or above `max_portfolio_assets`: `HiddenLeg`, Custom(17)). A leg the engine keeps as a
+    /// pending obligation after an exact close is counted as released here, which can only make
+    /// this check MORE permissive than the gates behind it, never less. Those gates are
+    /// unchanged and still run.
+    ///
+    /// Cost: one popcount on the common path (`active + requested <= cap`); the leg walk only
+    /// runs when the account is close enough to the cap for the answer to depend on it.
+    #[inline(never)]
+    fn ensure_position_cap_view(
+        group: &state::MarketViewMutV16<'_>,
+        account: &percolator::PortfolioV16ViewMut<'_>,
+        deltas: &[(usize, i128)],
+        over_cap: PercolatorError,
+    ) -> ProgramResult {
+        let cap = group.header.config.max_portfolio_assets.get() as usize;
+        let active = percolator::active_bitmap_count_ones(
+            account.header.active_bitmap.map(percolator::V16PodU64::get),
+        ) as usize;
+        if active.saturating_add(deltas.len()) <= cap {
+            return Ok(());
+        }
+        let mut closed = 0usize;
+        let mut opened = 0usize;
+        for &(asset_index, delta_q) in deltas {
+            let mut held = None;
+            for pod in &account.header.legs {
+                let leg = pod.try_to_runtime().map_err(map_v16_error)?;
+                if leg.active && leg.asset_index as usize == asset_index {
+                    held = Some(match leg.side {
+                        SideV16::Long => leg.basis_pos_q.unsigned_abs() as i128,
+                        SideV16::Short => -(leg.basis_pos_q.unsigned_abs() as i128),
+                    });
+                    break;
+                }
+            }
+            match held {
+                Some(current_q) => {
+                    if current_q.checked_add(delta_q) == Some(0) {
+                        closed += 1;
+                    }
+                }
+                None => {
+                    if delta_q != 0 {
+                        opened += 1;
+                    }
+                }
+            }
+        }
+        if active.saturating_sub(closed).saturating_add(opened) > cap {
+            return Err(over_cap.into());
+        }
+        Ok(())
+    }
+
+    /// P-1: both sides of a single trade (its own frame; the executor sits at the SBF frame
+    /// limit). `size_q` is the caller's signed size: account_a moves by it, account_b against it.
+    #[inline(never)]
+    fn ensure_single_trade_position_cap_view(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        size_q: i128,
+    ) -> ProgramResult {
+        let against = size_q
+            .checked_neg()
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        ensure_position_cap_view(
+            group,
+            account_a,
+            &[(asset_index, size_q)],
+            PercolatorError::PositionCapReached,
+        )?;
+        ensure_position_cap_view(
+            group,
+            account_b,
+            &[(asset_index, against)],
+            PercolatorError::CounterpartyPositionCapReached,
+        )
+    }
+
+    /// P-1: both sides of a batch. Each leg carries its SIGNED size from account_a's point of
+    /// view (batches never reorder), so account_b moves against every leg. Runs on the raw legs,
+    /// ahead of the batch pre-pass: a batch with a duplicate asset or a zero size is refused by
+    /// that pre-pass whatever this returns (a duplicate new asset can only over-count here).
+    #[inline(never)]
+    fn ensure_batch_position_cap_view(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        legs: &[ix::BatchTradeLeg],
+    ) -> ProgramResult {
+        let mut deltas: Vec<(usize, i128)> = Vec::with_capacity(legs.len());
+        for leg in legs {
+            deltas.push((leg.asset_index as usize, leg.size_q));
+        }
+        ensure_position_cap_view(group, account_a, &deltas, PercolatorError::PositionCapReached)?;
+        for delta in deltas.iter_mut() {
+            delta.1 = delta
+                .1
+                .checked_neg()
+                .ok_or(PercolatorError::InvalidInstruction)?;
+        }
+        ensure_position_cap_view(
+            group,
+            account_b,
+            &deltas,
+            PercolatorError::CounterpartyPositionCapReached,
         )
     }
 
