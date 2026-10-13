@@ -1840,13 +1840,14 @@ VaultLpMultiAssetMarket,
         // Explicit discriminants; appended after G9AllowlistTimelock (125). Do NOT renumber.
         /// The trade would leave `account_a` (the taker on the matcher route; the first signer on
         /// NoCpi) with more open positions than the market's per-portfolio cap
-        /// (`config.max_portfolio_assets`, at most `WRAPPER_MAX_PORTFOLIO_ASSETS` = 4). Adding to,
-        /// reducing or closing a held position is never refused by this rule; no deposit can cure
-        /// it — close a position first. Custom(126). Before this code the same trade was refused
-        /// with the generic Custom(9) by the source-domain admission gate (or by the engine's
-        /// leg-shape check on a market whose cap is below the wrapper's), so the SET of refused
-        /// trades is unchanged; only the code and the order (now ahead of every fee, margin and
-        /// floor check of the fill) differ. SDK agent: add `PositionCapReached = 126`.
+        /// (`config.max_portfolio_assets`). Raised ONLY on a market whose cap is the wrapper's
+        /// (`WRAPPER_MAX_PORTFOLIO_ASSETS` = 4). Adding to, reducing, closing or flipping a held
+        /// position is never refused by this rule; no deposit can cure it — close a position
+        /// first. Custom(126). On such a market the same trade was refused before with the generic
+        /// Custom(9) by the source-domain admission gate, so the SET of refused trades is
+        /// unchanged; only the code and the order (now ahead of every fee, margin and floor check
+        /// of the fill) differ. On a market whose cap is below 4 this code is never raised and the
+        /// engine's answers are unchanged (49 / 17 / 14). SDK agent: add `PositionCapReached = 126`.
         PositionCapReached = 126,
         /// Same rule, but it is `account_b` (the LP on the matcher route; the second signer on
         /// NoCpi) that would exceed the per-portfolio position cap. Custom(127). SDK agent: add
@@ -41653,32 +41654,51 @@ pub mod processor {
         )
     }
 
-    /// v2.2 QA item P-1: the per-portfolio position cap, named and checked first.
+    /// v2.2 QA item P-1, the counting rule on its own (pure; Kani: `kani_p1_position_cap_*`).
+    /// `active` positions now, `closed` of them closed exactly by the request set, `opened` new
+    /// assets requested: over the cap iff `active - closed + opened > cap`. With `opened == 0`
+    /// (every request is on a held asset: add, reduce, close, flip) it is never over the cap for
+    /// an account that is within it now.
+    pub fn position_cap_exceeded(active: usize, closed: usize, opened: usize, cap: usize) -> bool {
+        active.saturating_sub(closed).saturating_add(opened) > cap
+    }
+
+    /// v2.2 QA item P-1: the per-portfolio position cap, named and checked first — ONLY on a
+    /// market whose cap is the wrapper's (`max_portfolio_assets == WRAPPER_MAX_PORTFOLIO_ASSETS`).
     ///
     /// `deltas` is this instruction's whole request set for `account`, as `(asset_index, signed
     /// size delta from this account's point of view)` — one element for a single trade, one per
     /// leg for a batch (a repeated asset is counted once; the batch pre-pass refuses the
-    /// duplicate afterwards with its own code). The trade is refused with `over_cap` when the number of assets the account would
-    /// hold a position on afterwards exceeds `config.max_portfolio_assets`:
+    /// duplicate afterwards with its own code). The trade is refused with `over_cap` when the
+    /// number of assets the account would hold a position on afterwards exceeds the cap:
     ///
     ///   after = active legs now
-    ///         - legs this request set closes exactly (position + delta == 0)
+    ///         - legs this request set closes exactly (raw position + delta == 0)
     ///         + requested assets the account has no active leg on.
     ///
-    /// This refuses nothing that was admitted before. A request set with `after > cap` needs
-    /// `2 * after` source domains (both domains of every surviving leg are reserved by
-    /// `reserved_source_domains_snapshot_for_trade_view`, both domains of every new asset by
-    /// `ensure_trade_delta_source_domain_capacity_view`), which is over
-    /// `WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS = 2 * WRAPPER_MAX_PORTFOLIO_ASSETS` whenever the
-    /// market's cap is the wrapper's, so the admission gate already answered Custom(9); on a
-    /// market whose cap is lower the engine refused the same trade (a leg may not sit in a slot
-    /// at or above `max_portfolio_assets`: `HiddenLeg`, Custom(17)). A leg the engine keeps as a
-    /// pending obligation after an exact close is counted as released here, which can only make
-    /// this check MORE permissive than the gates behind it, never less. Those gates are
-    /// unchanged and still run.
+    /// The precise guarantee (security review 2026-10-13, F-1):
     ///
-    /// Cost: one popcount on the common path (`active + requested <= cap`); the leg walk only
-    /// runs when the account is close enough to the cap for the answer to depend on it.
+    /// * Cap == wrapper cap (4): this refuses nothing that was admitted before. A request set
+    ///   with `after > cap` needs `2 * after` source domains — both domains of every surviving
+    ///   leg are reserved by `reserved_source_domains_snapshot_for_trade_view`, both domains of
+    ///   every new asset by `ensure_trade_delta_source_domain_capacity_view`, over the SAME legs
+    ///   and with the SAME raw-position exact-close test — which is over
+    ///   `WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS = 2 * WRAPPER_MAX_PORTFOLIO_ASSETS`, so the admission
+    ///   gate already answered Custom(9). Only the code (9 -> 126 / 127) and its place in the
+    ///   order change. That gate is unchanged and still runs.
+    /// * Cap below the wrapper's (1, 2, 3): this check does NOTHING and the behaviour is exactly
+    ///   the RC's. There the cap is enforced by the engine alone, AFTER its own pre-trade refresh
+    ///   and on ADL-effective quantity; a count taken here, before that refresh and on raw basis,
+    ///   would refuse trades the engine admits (a stale reset leg the refresh clears; an
+    ///   ADL-shrunk leg closed by its effective size next to an open in one batch). So on those
+    ///   markets an over-cap open still answers the engine's codes (49 if under-margined, else
+    ///   `HiddenLeg` 17; 14 for a batch longer than the cap), not 126.
+    ///
+    /// A leg the engine keeps as a pending obligation after an exact close is counted as
+    /// released, which can only make this check more permissive than the gate behind it.
+    ///
+    /// Cost: one compare and one popcount on the common path; one walk of the ACTIVE legs
+    /// (bitmap-gated) only for an account close enough to the cap for the answer to depend on it.
     #[inline(never)]
     fn ensure_position_cap_view(
         group: &state::MarketViewMutV16<'_>,
@@ -41687,39 +41707,70 @@ pub mod processor {
         over_cap: PercolatorError,
     ) -> ProgramResult {
         let cap = group.header.config.max_portfolio_assets.get() as usize;
-        let active = percolator::active_bitmap_count_ones(
-            account.header.active_bitmap.map(percolator::V16PodU64::get),
-        ) as usize;
+        if cap != constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize {
+            return Ok(());
+        }
+        let bitmap = account.header.active_bitmap.map(percolator::V16PodU64::get);
+        let active = percolator::active_bitmap_count_ones(bitmap) as usize;
         if active.saturating_add(deltas.len()) <= cap {
             return Ok(());
         }
-        let mut closed = 0usize;
+        // One walk of the active legs: which requested assets are held, and which of those the
+        // request closes exactly. `held` / `closes` are bitmasks over `deltas` (a batch carries at
+        // most 16 legs on the wire; anything longer is refused by the pre-pass / engine, and the
+        // mask simply stops at 64).
+        //
+        // Compute (security review F-2): the leg's four fields are read straight from the
+        // zero-copy record, NOT through the 22-field `try_to_runtime` decode (about 2,200 CU a
+        // leg; 8 legs on the exit path of two accounts at the cap). Only slots whose bitmap bit is
+        // set are looked at, and the bitmap is what `active` was counted from. A record the
+        // engine would reject (bit and `active` byte disagreeing, a bad side byte) is still
+        // rejected by the engine's own decode later in this same instruction; here a bad side
+        // byte just reads as "not an exact close".
+        let mut held: u64 = 0;
+        let mut closes: u64 = 0;
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            if percolator::active_bitmap_get(bitmap, slot) {
+                let leg = &account.header.legs[slot];
+                let leg_asset = leg.asset_index.get() as usize;
+                // First request naming this asset (a repeated asset is counted once: the
+                // duplicate-asset rule of the batch pre-pass, Custom 9, owns that refusal).
+                if let Some(i) = deltas.iter().take(64).position(|&(asset, _)| asset == leg_asset) {
+                    if held & (1u64 << i) == 0 {
+                        held |= 1u64 << i;
+                        // Same raw position and the same exact-close test as the admission
+                        // snapshot (`signed_position_for_asset_view`: Long positive, Short
+                        // negative; a leg of another market generation reads 0, so it is held
+                        // and never a close). A raw-basis READ for that test, not a size clamp.
+                        let same_generation = group
+                            .markets
+                            .get(leg_asset)
+                            .is_some_and(|m| m.engine.asset.market_id.get() == leg.market_id.get());
+                        let abs_q = leg.basis_pos_q.get().unsigned_abs() as i128;
+                        let current_q = match (same_generation, leg.side) {
+                            (true, 0) => abs_q,
+                            (true, 1) => abs_q.checked_neg().unwrap_or(0),
+                            _ => 0,
+                        };
+                        if current_q.checked_add(deltas[i].1) == Some(0) {
+                            closes |= 1u64 << i;
+                        }
+                    }
+                }
+            }
+            slot += 1;
+        }
         let mut opened = 0usize;
         for (i, &(asset_index, delta_q)) in deltas.iter().enumerate() {
-            // An asset named twice is counted once: the duplicate-asset rule of the batch
-            // pre-pass (Custom 9) owns that refusal, not the cap.
-            if deltas[..i].iter().any(|&(earlier, _)| earlier == asset_index) {
+            if delta_q == 0 || deltas[..i].iter().any(|&(earlier, _)| earlier == asset_index) {
                 continue;
             }
-            let mut held = false;
-            for pod in &account.header.legs {
-                let leg = pod.try_to_runtime().map_err(map_v16_error)?;
-                if leg.active && leg.asset_index as usize == asset_index {
-                    held = true;
-                    break;
-                }
-            }
-            if held {
-                // Same position read (and the same exact-close test) as the admission snapshot.
-                let current_q = signed_position_for_asset_view(group, account, asset_index)?;
-                if current_q.checked_add(delta_q) == Some(0) {
-                    closed += 1;
-                }
-            } else if delta_q != 0 {
+            if i >= 64 || held & (1u64 << i) == 0 {
                 opened += 1;
             }
         }
-        if active.saturating_sub(closed).saturating_add(opened) > cap {
+        if position_cap_exceeded(active, closes.count_ones() as usize, opened, cap) {
             return Err(over_cap.into());
         }
         Ok(())
@@ -47092,4 +47143,52 @@ mod p1_kani_proofs {
         kani::cover!(a == Some(false) && b == Some(true), "monotone step across the cap");
     }
 
+}
+
+
+/// v2.2 QA item P-1: the position-cap counting rule (`processor::position_cap_exceeded`).
+/// Run: `cargo kani --tests --features devnet -Z function-contracts -Z stubbing --exact --harness <name>`.
+/// A verdict counts only with every cover SATISFIED.
+#[cfg(kani)]
+mod p1_position_cap_kani_proofs {
+    use crate::processor::position_cap_exceeded;
+
+    /// A request set that opens no new asset (add / reduce / close / flip on held assets) is
+    /// never refused for an account that is within the cap now — whatever it closes.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn kani_p1_position_cap_never_refuses_without_an_open() {
+        let active: usize = kani::any();
+        let closed: usize = kani::any();
+        let cap: usize = kani::any();
+        kani::assume(active <= cap);
+        assert!(!position_cap_exceeded(active, closed, 0, cap));
+        kani::cover!(active == cap && cap == 4 && closed == 0, "at the cap, nothing closed");
+        kani::cover!(active == cap && cap == 4 && closed == 1, "at the cap, one closed");
+        kani::cover!(closed > active, "closed above active saturates, still not refused");
+    }
+
+    /// Exactness and totality: for every input the rule returns (no overflow, no panic), and
+    /// with `closed <= active` it refuses iff `active - closed + opened > cap` in the integers.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn kani_p1_position_cap_rule_is_exact_and_total() {
+        let active: usize = kani::any();
+        let closed: usize = kani::any();
+        let opened: usize = kani::any();
+        let cap: usize = kani::any();
+        let refused = position_cap_exceeded(active, closed, opened, cap);
+        if closed <= active {
+            let after = (active - closed) as u128 + opened as u128;
+            assert_eq!(refused, after > cap as u128);
+        }
+        // Monotone: one more close never turns an admitted request into a refused one.
+        if !refused && closed < usize::MAX {
+            assert!(!position_cap_exceeded(active, closed + 1, opened, cap));
+        }
+        kani::cover!(refused && active == 4 && closed == 0 && opened == 1 && cap == 4, "5th position refused");
+        kani::cover!(!refused && active == 4 && closed == 1 && opened == 1 && cap == 4, "close one, open one admitted");
+        kani::cover!(!refused && active == 3 && opened == 1 && cap == 4, "4th position admitted");
+        kani::cover!(opened == usize::MAX && active == usize::MAX, "saturating add reached");
+    }
 }

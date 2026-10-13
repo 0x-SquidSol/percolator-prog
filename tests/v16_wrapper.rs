@@ -25968,6 +25968,16 @@ fn cw02_basis_clamp_site_enumeration_is_reads_only() {
     assert_eq!(effective.len(), 1, "exactly one raw-basis read inside raw_and_effective_signed_position_for_asset_view");
     assert!(effective[0].1.contains("let raw_abs = leg.basis_pos_q.unsigned_abs();"), "it feeds adl_effective_abs_q");
     assert!(src.contains("risk_limits_v17::adl_effective_abs_q(raw_abs, leg.a_basis, current_a)"), "raw_abs is the conversion input");
+    // v2.2 QA item P-1 (security review F-2, 2026-10-13): `ensure_position_cap_view` reads the raw
+    // basis ONCE, straight from the zero-copy leg record (`basis_pos_q.get().unsigned_abs()`, a
+    // different spelling from the decoded-leg reads counted above), for the same exact-close test
+    // the admission snapshot makes. A READ, not a size clamp; pinned here: exactly one inside that
+    // function. (The spelling already existed once elsewhere in the RC, outside this enumeration.)
+    let pod_hits: Vec<usize> = src.lines().enumerate().filter(|(_, l)| l.contains("basis_pos_q.get().unsigned_abs()")).map(|(i, _)| i + 1).collect();
+    let cap_fn_start = src.lines().position(|l| l.contains("fn ensure_position_cap_view(")).expect("position cap fn") + 1;
+    let cap_fn_end = src.lines().enumerate().skip(cap_fn_start).find(|(_, l)| l.starts_with("    fn ") || l.starts_with("    pub fn ")).map(|(i, _)| i + 1).unwrap();
+    let in_cap_fn = pod_hits.iter().filter(|&&line| line > cap_fn_start && line < cap_fn_end).count();
+    assert_eq!(in_cap_fn, 1, "exactly one zero-copy raw-basis read inside ensure_position_cap_view");
     assert_eq!(
         hits.len(),
         2,

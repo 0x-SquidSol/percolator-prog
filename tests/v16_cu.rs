@@ -26841,8 +26841,9 @@ fn v22_init_market_refuses_every_leg_count_above_the_cap() {
 }
 
 /// S10-X1: a leg above a market's cap is refused by the real TradeNoCpi and TradeCpi instructions
-/// on BPF with `PositionCapReached` (Custom 126; QA item P-1 — it was the engine's `HiddenLeg`,
-/// Custom 17, before the wrapper named the cap), market and both portfolios byte-identical. Built on a
+/// on BPF with `HiddenLeg` (Custom 17), market and both portfolios byte-identical. (QA item P-1
+/// names the refusal 126 only on a market whose cap is the wrapper's 4; below that the engine's
+/// answer is deliberately unchanged — security review 2026-10-13, F-1.) Built on a
 /// system-created market capped at 2 legs with a third asset slot appended (slots can exceed the
 /// cap; legs cannot). (BatchTradeCpi above the cap is covered at engine level only.)
 #[test]
@@ -26878,11 +26879,11 @@ fn v22_leg_above_cap_is_refused_by_trade_instructions() {
     let e = env
         .try_trade_asset_with_cu(2, &long_owner, long_account, &short_owner, short_account, (1_000 * POS_SCALE) as i128, 100, 0)
         .expect_err("TradeNoCpi leg above the cap must be refused");
-    assert!(e.contains("Custom(126)"), "TradeNoCpi: expected PositionCapReached (Custom 126), got {e}");
+    assert!(e.contains("Custom(17)"), "TradeNoCpi: expected HiddenLeg (Custom 17), got {e}");
     assert_eq!(snap(&env), before, "TradeNoCpi: refused trade left state changed");
     let e = ecu_send_trade_cpi(&mut env, matcher_program, &long_owner, long_account, short_account, ctx, delegate, 2, (1_000 * POS_SCALE) as i128)
         .expect_err("TradeCpi leg above the cap must be refused");
-    assert!(e.contains("Custom(126)"), "TradeCpi: expected PositionCapReached (Custom 126), got {e}");
+    assert!(e.contains("Custom(17)"), "TradeCpi: expected HiddenLeg (Custom 17), got {e}");
     assert_eq!(snap(&env), before, "TradeCpi: refused trade left state changed");
     assert_eq!(x1g_legs(&env, long_account), 2);
 }
@@ -27304,7 +27305,7 @@ fn v22_batch_above_cap_is_refused_on_bpf() {
     let r = send(&mut env, &[2]);
     println!("X1HCAP 1-leg batch on a third asset with 2 legs held: {}", match &r { Ok(cu) => format!("OK {cu}"), Err(e) => e.chars().take(120).collect() });
     let e = r.expect_err("the leg above the cap must be refused on the batch route");
-    assert!(e.contains("Custom(126)"), "expected PositionCapReached (Custom 126; P-1, was HiddenLeg 17), got {e}");
+    assert!(e.contains("Custom(17)"), "expected HiddenLeg (Custom 17), got {e}");
     assert!(snap(&env) == before, "refused batch left state changed");
     assert_eq!(x1g_legs(&env, a), 2);
 }
@@ -27315,13 +27316,16 @@ fn v22_batch_above_cap_is_refused_on_bpf() {
 // Before: a trade that would open a position on one asset more than the market's cap
 // (`max_portfolio_assets`, at most WRAPPER_MAX_PORTFOLIO_ASSETS = 4) was refused with the generic
 // `InvalidInstruction` (Custom 9) by the source-domain admission gate
-// (`SourceDomainAdmissionSnapshot::push_reserved`), or with the engine's `HiddenLeg` (Custom 17)
-// on a market whose cap is below the wrapper's. Now: `PositionCapReached` (Custom 126) when it is
-// account_a over the cap, `CounterpartyPositionCapReached` (Custom 127) when it is account_b,
-// ahead of every fee / floor / margin check of the fill. The SET of refused trades is unchanged.
+// (`SourceDomainAdmissionSnapshot::push_reserved`). Now, on a market whose cap IS the wrapper's 4:
+// `PositionCapReached` (Custom 126) when it is account_a over the cap,
+// `CounterpartyPositionCapReached` (Custom 127) when it is account_b, ahead of every fee / floor /
+// margin check of the fill; the SET of refused trades is unchanged. On a market whose cap is below
+// 4 nothing changes at all (security review F-1): the engine still answers 49 / 17 / 14 there, and
+// `v22_p1_markets_below_the_wrapper_cap_are_unchanged` pins that on both binaries.
 //
 // Negative control: run these against the unpatched RC binary with
-// `P1_WRAPPER_SO=<wrapper 6c078a0e .so>`; every test below fails there (Custom 9 instead of 126/127).
+// `P1_WRAPPER_SO=<wrapper 6c078a0e .so>`; the cap-4 tests fail there (Custom 9 instead of 126/127),
+// the below-cap test and the BatchTradeCpi wire-limit pin pass on both.
 // =============================================================================================
 
 const P1_POSITION_CAP: u32 = percolator_prog::error::PercolatorError::PositionCapReached as u32;
@@ -27484,8 +27488,8 @@ fn v22_p1_counterparty_over_the_cap_gets_its_own_code() {
     p1_trade(&mut env, 0, &fresh_owner, fresh, &lp_owner, lp, P1_LOT).expect("an asset the LP already holds");
 }
 
-/// Q-6: the cap is answered before the margin check, so an account at the cap is never told to
-/// deposit for an order no deposit can make land. The margin check itself is still alive and
+/// Q-6 (cap-4 market): the cap is answered before the margin check, so an account at the cap is never
+/// told to deposit for an order no deposit can make land. The margin check itself is still alive and
 /// still named (control: one position below the cap, the same shortfall answers 49, and a deposit
 /// cures it).
 #[test]
@@ -27511,31 +27515,6 @@ fn v22_p1_position_cap_is_answered_before_the_margin_check() {
     p1_expect_code(p1_trade(&mut env, cap, &taker_owner, taker, &other_owner, other, P1_LOT), P1_POSITION_CAP, "under-margined 5th position");
     env.deposit(&taker_owner, taker, 500_000_000);
     p1_expect_code(p1_trade(&mut env, cap, &taker_owner, taker, &other_owner, other, P1_LOT), P1_POSITION_CAP, "fully-margined 5th position");
-
-    // A market whose cap (2) is below the wrapper's: there the unpatched program answered the
-    // under-margined order 49 (the engine's margin check ran ahead of its leg-shape check) and the
-    // same order 17 once margined - the "deposit, then be refused anyway" order QA reported.
-    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
-        system_created_market: true,
-        max_portfolio_assets: 2,
-        maintenance_margin_bps: 1_000,
-        initial_margin_bps: 1_000,
-        max_price_move_bps_per_slot: 500,
-        ..V16CuMarketParams::default()
-    });
-    let admin = env.admin.pubkey();
-    env.try_activate_asset_with_authorities(2, 5, 100, admin, admin, admin, admin).expect("append asset 2");
-    let (taker_owner, lp_owner) = (Keypair::new(), Keypair::new());
-    let taker = env.create_portfolio(&taker_owner);
-    let lp = env.create_portfolio(&lp_owner);
-    env.deposit(&taker_owner, taker, IM_PER_LOT * 2 + IM_PER_LOT / 2);
-    env.deposit(&lp_owner, lp, 500_000_000);
-    for asset in 0..2u16 {
-        p1_trade(&mut env, asset, &taker_owner, taker, &lp_owner, lp, P1_LOT).expect("open up to the cap of 2");
-    }
-    p1_expect_code(p1_trade(&mut env, 2, &taker_owner, taker, &lp_owner, lp, P1_LOT), P1_POSITION_CAP, "cap-2 market, under-margined 3rd position");
-    env.deposit(&taker_owner, taker, 500_000_000);
-    p1_expect_code(p1_trade(&mut env, 2, &taker_owner, taker, &lp_owner, lp, P1_LOT), P1_POSITION_CAP, "cap-2 market, fully-margined 3rd position");
 
     // Control, one position below the cap: the same shortfall is a margin refusal, and curable.
     let mut env = p1_env();
@@ -27584,4 +27563,225 @@ fn v22_p1_batch_over_the_position_cap_is_refused_with_the_position_cap_code() {
     let before = p1_snap(&env, &[a, b]);
     p1_expect_code(p1_batch(&mut env, &a_owner, a, &b_owner, b, &[(1, P1_LOT), (0, P1_LOT)]), P1_POSITION_CAP, "add to one and open a 5th");
     assert_eq!(p1_snap(&env, &[a, b]), before, "the refused batch left state changed");
+}
+
+/// Security review F-1: on a market whose cap is BELOW the wrapper's the early check does nothing,
+/// so every answer is the unpatched program's. Cap-2 market with a third asset appended: an
+/// under-margined 3rd position answers 49 and the same order 17 once margined (the engine's own
+/// order, unchanged — the Q-6 ordering is NOT fixed on such markets, by decision); a 3-leg batch
+/// from flat answers 14. This test passes on the RC binary and on the patched binary alike.
+#[test]
+fn v22_p1_markets_below_the_wrapper_cap_are_unchanged() {
+    const IM_PER_LOT: u128 = 10_000;
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        system_created_market: true,
+        max_portfolio_assets: 2,
+        maintenance_margin_bps: 1_000,
+        initial_margin_bps: 1_000,
+        max_price_move_bps_per_slot: 500,
+        ..V16CuMarketParams::default()
+    });
+    let admin = env.admin.pubkey();
+    env.try_activate_asset_with_authorities(2, 5, 100, admin, admin, admin, admin).expect("append asset 2");
+    let (taker_owner, lp_owner) = (Keypair::new(), Keypair::new());
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, IM_PER_LOT * 2 + IM_PER_LOT / 2);
+    env.deposit(&lp_owner, lp, 500_000_000);
+    let three: Vec<(u16, i128)> = (0..3u16).map(|asset| (asset, P1_LOT)).collect();
+    p1_expect_code(p1_batch(&mut env, &taker_owner, taker, &lp_owner, lp, &three), PercolatorError::EngineInvalidConfig as u32, "cap-2 market, 3-leg batch from flat");
+    for asset in 0..2u16 {
+        p1_trade(&mut env, asset, &taker_owner, taker, &lp_owner, lp, P1_LOT).expect("open up to the cap of 2");
+    }
+    p1_expect_code(
+        p1_trade(&mut env, 2, &taker_owner, taker, &lp_owner, lp, P1_LOT),
+        PercolatorError::EngineInsufficientInitialMargin as u32,
+        "cap-2 market, under-margined 3rd position",
+    );
+    env.deposit(&taker_owner, taker, 500_000_000);
+    p1_expect_code(p1_trade(&mut env, 2, &taker_owner, taker, &lp_owner, lp, P1_LOT), PercolatorError::EngineHiddenLeg as u32, "cap-2 market, fully-margined 3rd position");
+}
+
+/// Send a BatchTradeCpi (taker = account_a, matcher LP = account_b).
+#[allow(clippy::too_many_arguments)]
+fn p1_batch_cpi(env: &mut V16CuEnv, matcher_program: Pubkey, taker: &Keypair, taker_account: Pubkey, lp_account: Pubkey, ctx: Pubkey, delegate: Pubkey, legs: &[(u16, i128)]) -> Result<u64, String> {
+    env.svm.expire_blockhash();
+    let (a_id, _, a_pe) = env.portfolio_identity(taker_account);
+    let (b_id, b_seq, b_pe) = env.portfolio_identity(lp_account);
+    let market = env.svm.get_account(&env.market).unwrap().data;
+    let legs = legs
+        .iter()
+        .map(|&(asset, size_q)| percolator_prog::ix::BatchTradeCpiLeg {
+            asset_index: asset,
+            market_id: state::read_market_trade_preflight(&market, asset as usize).unwrap().3,
+            size_q,
+            fee_bps: 0,
+            limit_price: 0,
+        })
+        .collect();
+    env.send(
+        ProgInstruction::BatchTradeCpi {
+            account_a_portfolio_id: a_id,
+            account_a_position_epoch: a_pe,
+            account_b_portfolio_id: b_id,
+            account_b_position_epoch: b_pe,
+            account_b_matcher_sequence: b_seq,
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
+            legs,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ],
+        &[taker],
+    )
+}
+
+/// The review's "not tested" list, at the cap on a cap-4 market: 127 on the matcher route, a flip,
+/// a partial reduce inside a batch, a partial reduce next to an open in one batch, and the
+/// BatchTradeCpi wire-size limit (5 legs: still 9, refused before the matcher is called).
+#[test]
+fn v22_p1_at_the_cap_flip_reduce_and_matcher_route() {
+    let mut env = p1_env();
+    let cap = LEG_CAP as u16;
+    let matcher_program = Pubkey::new_unique();
+    env.svm.add_program(matcher_program, &std::fs::read(matcher_program_path()).expect("read matcher BPF"));
+    let (long_owner, short_owner, fresh_owner) = (Keypair::new(), Keypair::new(), Keypair::new());
+    let long = env.create_portfolio(&long_owner);
+    let short = env.create_portfolio(&short_owner);
+    let fresh = env.create_portfolio(&fresh_owner);
+    for (owner, account) in [(&long_owner, long), (&short_owner, short), (&fresh_owner, fresh)] {
+        env.deposit(owner, account, 500_000_000);
+    }
+    let (ctx, delegate, _) = env.init_matcher_context(&short_owner, matcher_program, short);
+    for asset in 0..cap {
+        p1_trade(&mut env, asset, &long_owner, long, &short_owner, short, 2 * P1_LOT).expect("open up to the cap");
+    }
+    assert_eq!(x1g_legs(&env, short), cap as u32);
+
+    // 127 on the matcher route: a fresh taker, the matcher LP at its cap, a new asset.
+    let before = p1_snap(&env, &[fresh, short, ctx]);
+    p1_expect_code(
+        ecu_send_trade_cpi(&mut env, matcher_program, &fresh_owner, fresh, short, ctx, delegate, cap, P1_LOT),
+        P1_COUNTERPARTY_POSITION_CAP,
+        "TradeCpi against an LP at its cap",
+    );
+    assert_eq!(p1_snap(&env, &[fresh, short, ctx]), before, "the refused TradeCpi left state changed");
+
+    // BatchTradeCpi with 5 legs: the wire-size limit (MATCHER_BATCH_MAX_LEGS = 4) answers 9
+    // before the matcher is called, on the RC and on the patch alike. Pinned, not renamed.
+    let five: Vec<(u16, i128)> = (0..=cap).map(|asset| (asset, P1_LOT)).collect();
+    p1_expect_code(
+        p1_batch_cpi(&mut env, matcher_program, &fresh_owner, fresh, short, ctx, delegate, &five),
+        PercolatorError::InvalidInstruction as u32,
+        "5-leg BatchTradeCpi (wire-size limit)",
+    );
+    assert_eq!(p1_snap(&env, &[fresh, short, ctx]), before, "the refused BatchTradeCpi left state changed");
+
+    // At the cap, on held assets: a partial reduce inside a batch lands ...
+    p1_refresh(&mut env, &[long, short]);
+    p1_batch(&mut env, &long_owner, long, &short_owner, short, &[(0, -P1_LOT), (1, -P1_LOT)]).expect("partial reduces in a batch at the cap");
+    assert_eq!(x1g_legs(&env, long), cap as u32);
+    // ... a partial reduce next to a NEW asset is over the cap (the reduce frees nothing) ...
+    let before = p1_snap(&env, &[long, short]);
+    p1_expect_code(p1_batch(&mut env, &long_owner, long, &short_owner, short, &[(2, -P1_LOT), (cap, P1_LOT)]), P1_POSITION_CAP, "partial reduce plus a 5th position");
+    assert_eq!(p1_snap(&env, &[long, short]), before, "the refused batch left state changed");
+    // ... and a flip (long one lot -> short one lot) lands: the position count does not change.
+    p1_refresh(&mut env, &[long, short]);
+    p1_trade(&mut env, 0, &long_owner, long, &short_owner, short, -2 * P1_LOT).expect("a flip at the cap");
+    assert_eq!(x1g_legs(&env, long), cap as u32);
+    assert_eq!(x1g_legs(&env, short), cap as u32);
+}
+
+/// Security review F-2: compute of the P-5 shape — 4 positions on BOTH sides, a TradeCpi on a held
+/// asset inside ONE transaction `[crank LP, crank taker, crank LP, TradeCpi]`, for an add and for
+/// a full close. A crank that has nothing to do answers NonProgress (22) and is dropped, as the
+/// client does. Prints `P1CU <case> <units> ixs=<n>`; run with `P1_WRAPPER_SO=<RC .so>` for the
+/// baseline. The transaction limit is 1,400,000.
+#[test]
+fn v22_p1_compute_of_the_three_crank_trade_at_the_cap() {
+    for (case, size_q) in [("add", P1_LOT), ("close", -P1_LOT)] {
+        let mut env = p1_env();
+        let cap = LEG_CAP as u16;
+        let matcher_program = Pubkey::new_unique();
+        env.svm.add_program(matcher_program, &std::fs::read(matcher_program_path()).expect("read matcher BPF"));
+        let (long_owner, short_owner) = (Keypair::new(), Keypair::new());
+        let long = env.create_portfolio(&long_owner);
+        let short = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long, 500_000_000);
+        env.deposit(&short_owner, short, 500_000_000);
+        let (ctx, delegate, _) = env.init_matcher_context(&short_owner, matcher_program, short);
+        for asset in 0..cap {
+            p1_trade(&mut env, asset, &long_owner, long, &short_owner, short, P1_LOT).expect("open up to the cap");
+        }
+        // Traded asset = the LAST leg slot (the longest walk).
+        let asset = cap - 1;
+        env.svm.expire_blockhash();
+        let now_slot = env.svm.get_sysvar::<Clock>().slot;
+        let observations: Vec<CrankObservationHint> = (0..=cap).map(|asset_index| CrankObservationHint { asset_index, oracle_accounts: 0 }).collect();
+        let crank = |env: &V16CuEnv, portfolio: Pubkey, observations: Vec<CrankObservationHint>| Instruction {
+            program_id: env.program_id,
+            accounts: vec![AccountMeta::new(env.payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(portfolio, false)],
+            data: ProgInstruction::PermissionlessCrank { now_slot, observations }.encode(),
+        };
+        let (a_id, _, a_pe) = env.portfolio_identity(long);
+        let (b_id, b_seq, b_pe) = env.portfolio_identity(short);
+        let market_id = state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, asset as usize).unwrap().3;
+        let trade = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(long_owner.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(long, false),
+                AccountMeta::new(short, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            data: ProgInstruction::TradeCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_pe,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_pe,
+                market_id,
+                account_b_matcher_sequence: b_seq,
+                asset_index: asset,
+                size_q,
+                fee_bps: 0,
+                limit_price: 0,
+                backing_fee_cap_bps: 10_000,
+            }
+            .encode(),
+        };
+        let mut ixs = vec![crank(&env, short, observations), crank(&env, long, vec![]), crank(&env, short, vec![]), trade];
+        let units = loop {
+            env.svm.expire_blockhash();
+            let mut all = vec![heap_ix(), cu_ix()];
+            all.extend(ixs.iter().cloned());
+            let tx = Transaction::new_signed_with_payer(&all, Some(&env.payer.pubkey()), &[&env.payer, &long_owner], env.svm.latest_blockhash());
+            match env.svm.send_transaction(tx) {
+                Ok(meta) => break meta.compute_units_consumed,
+                Err(e) => {
+                    let err = format!("{:?}", e.err);
+                    // Drop a crank refused NonProgress (22): instruction index minus the two budget ixs.
+                    let dropped = (0..ixs.len() - 1).find(|i| err.contains(&format!("InstructionError({}, Custom(22))", i + 2)));
+                    match dropped {
+                        Some(i) => {
+                            ixs.remove(i);
+                        }
+                        None => panic!("P-5 shape ({case}): {err}"),
+                    }
+                }
+            }
+        };
+        println!("P1CU {case} {units} ixs={}", ixs.len());
+        assert!(units <= 1_400_000, "{case}: {units} CU is over the transaction limit");
+        assert_eq!(x1g_legs(&env, long), if size_q < 0 { cap as u32 - 1 } else { cap as u32 });
+    }
 }
