@@ -1238,7 +1238,9 @@ fn c_mode2_flash_liquidity_is_rate_limited() {
         "every reader uses min(fresh, rate-limited)"
     );
     // held into the next epoch: one doubling
-    let next = (env.slot / 9_000 + 1) * 9_000;
+    // D-L2: past the rise window (stamp * 64 + 63 + 9,000)
+    let st = u32::from_le_bytes(env.growth().depth_rise_slot64_le) as u64;
+    let next = st * 64 + 63 + 9_000;
     env.warp(next - env.slot);
     env.push(2, 0, &dex).expect("inflated 3");
     env.warp(1);

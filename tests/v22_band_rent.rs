@@ -2733,10 +2733,15 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     env.depth_twice(5 * DEPTH_T1); // ends at s0 + 8,999
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().ceil_x100, 300, "inside the epoch: no climb");
-    env.warp(1);
+    // R2-M1 / D-L2: the venue depth is still the tier-0 first reading (T1 - 1) here; it may
+    // double only 9,000 slots after that rise. At that slot (past the ceiling's epoch too) the
+    // depth reaches tier 1 and the ceiling takes one step.
+    let w = env.next_rise_slot();
+    env.warp(w - 1 - env.slot);
     env.depth_twice(5 * DEPTH_T1);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     let g = env.growth();
+    assert!(g.depth_last_good_e6 >= DEPTH_T1, "depth tier 1 after one window");
     assert_eq!((g.ceil_x100, g.ceil_slot), (400, env.clock_slot()), "one step at the boundary");
     env.settle_rent(lp.account, lp.account).expect("tag 106 again, same slot");
     assert_eq!(env.growth().ceil_x100, 400, "one step per epoch, not per call");
@@ -2920,17 +2925,24 @@ impl Env {
         )
     }
 
-    /// One ratchet epoch: warp to `ceil_slot + 9,000` AND into the next depth epoch (R2-M1: the
-    /// usable depth can rise once per `slot / 9,000` epoch), a fresh attested pair at `depth`,
-    /// then the tag-106 ratchet site. Returns the stored ceiling.
+    /// One ratchet epoch: warp to `ceil_slot + 9,000` AND past the depth's rise window (R2-M1 /
+    /// D-L2: the usable depth can rise once per 9,000 slots since its last rise), a fresh
+    /// attested pair at `depth`, then the tag-106 ratchet site. Returns the stored ceiling.
     fn epoch_step(&mut self, lp: &Lp, depth: u64) -> u16 {
         let e = percolator_prog::growth_v19::RATCHET_EPOCH_SLOTS;
-        let due = core::cmp::max(self.growth().ceil_slot + e, (self.clock_slot() / e + 1) * e);
+        let due = core::cmp::max(self.growth().ceil_slot + e, self.next_rise_slot());
         let to = due.saturating_sub(self.slot + 1).max(1);
         self.warp(to);
         self.depth_twice(depth);
         self.settle_rent(lp.account, lp.account).expect("tag 106: ratchet site");
         self.growth().ceil_x100
+    }
+
+    /// D-L2: the first slot at which the rate-limited depth may rise again (the stored 64-slot
+    /// stamp's latest slot + 9,000), never before the current slot.
+    fn next_rise_slot(&self) -> u64 {
+        let st = u32::from_le_bytes(self.growth().depth_rise_slot64_le) as u64;
+        core::cmp::max(st * 64 + 63 + percolator_prog::growth_v19::RATCHET_EPOCH_SLOTS, self.clock_slot() + 1)
     }
 
     /// R2-M1: epoch steps at `depth` until the stored ceiling reaches `target` (each step: hold,
@@ -3015,12 +3027,12 @@ fn r2_sticky_cap_stale_first_push_of_pair_and_decay_to_zero() {
     // the next epoch: one rise, to min(2,000, max(2 x 600, T1/16 = $1,562.49...))
     let g0 = env.growth();
     let seed = percolator_prog::growth_v19::DEPTH_TIER1_E6 - 1;
-    let next = (env.clock_slot() / 9_000 + 1) * 9_000;
+    let next = env.next_rise_slot();
     env.warp(next - env.slot);
     env.depth_twice(2_000 * USD_E6);
     let g = env.growth();
     let (want, _) = percolator_prog::growth_v19::depth_rate_limited(
-        true, g0.depth_last_good_e6, u32::from_le_bytes(g0.depth_rise_epoch_le), 2_000 * USD_E6, next, seed,
+        true, g0.depth_last_good_e6, u32::from_le_bytes(g0.depth_rise_slot64_le), 2_000 * USD_E6, next, seed,
     );
     assert_eq!(want, seed / 16, "the bootstrap floor binds here");
     assert_eq!(g.depth_last_good_e6, want);
@@ -3284,7 +3296,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         env.settle_rent(lp.account, lp.account).expect("tag 106");
         assert_eq!(env.growth().rent_n_cap_q, 1, "same epoch: the rate-limited depth stays 0");
         // the next epoch: back to min($600, T1/16), i.e. $600 at κ 0.5 -> 300 units
-        let next = (env.clock_slot() / 9_000 + 1) * 9_000;
+        let next = env.next_rise_slot();
         env.warp(next - env.slot);
         env.depth_twice(600 * USD_E6);
         env.crank_current(taker.1);
@@ -3335,7 +3347,7 @@ fn r2m1_flash_liquidity_is_rate_limited() {
     assert_eq!(g.rent_n_cap_q, cap_of(real), "the κ cap did not move");
     assert_eq!(g.ceil_x100, 500);
     // held into the next epoch: ONE doubling, not 25,000x
-    let next = (env.clock_slot() / 9_000 + 1) * 9_000;
+    let next = env.next_rise_slot();
     env.warp(next - env.slot);
     env.depth_twice(inflated);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
@@ -3435,4 +3447,67 @@ fn r2l2_thresholds_scale_with_collateral_decimals() {
     let mut g = state::read_asset_growth(&acc.data, 0, env.engine_imr).unwrap().unwrap();
     g.collateral_decimals_p1 = 20;
     assert!(state::write_asset_growth(&mut acc.data, 0, &g, env.engine_imr).is_err(), "decimals 19 refused");
+}
+
+/// Security review D-L2 (the reviewer's straddle): a whale holds the inflated reading for three
+/// samples straddling a calendar boundary `k * 9,000` (slots k*9,000 - 2, -1, k*9,000). Round 2
+/// (gate on `slot / 9,000`) doubled at the second sample AND again at the third -- 4x one slot
+/// apart. Now a rise needs >= 9,000 slots since the last one: exactly one doubling in that
+/// window, and the next doubling only 9,000 slots after it.
+#[test]
+fn d_l2_boundary_straddle_gets_one_doubling() {
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let real = 7_000 * USD_E6;
+    let inflated = 50_000_000 * USD_E6;
+    env.warp(1);
+    env.depth_twice(real);
+    assert_eq!(env.growth().depth_last_good_e6, real);
+    // past the first window, end right before a calendar boundary
+    let w = env.next_rise_slot();
+    let k = (w / 9_000 + 1) * 9_000;
+    env.warp(k - 3 - env.slot);
+    env.push_depth(PRICE, 1, real).expect("honest, k*9000 - 3");
+    env.warp(1);
+    env.push_depth(PRICE, 1, inflated).expect("inflated, k*9000 - 2");
+    env.warp(1);
+    env.push_depth(PRICE, 1, inflated).expect("inflated, k*9000 - 1: the pair -> one doubling");
+    assert_eq!(env.growth().depth_last_good_e6, 2 * real);
+    env.warp(1);
+    assert_eq!(env.clock_slot() % 9_000, 0, "a new calendar epoch");
+    env.push_depth(PRICE, 1, inflated).expect("inflated, k*9000");
+    assert_eq!(env.growth().depth_last_good_e6, 2 * real, "D-L2: no second doubling one slot later");
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 2 * real / 2 / 10, "κ cap 2x honest, not 4x");
+    // 9,000 slots after the rise: the next doubling
+    let rise = env.clock_slot() - 1;
+    env.warp(rise + 9_000 + 64 - env.slot);
+    env.push_depth(PRICE, 1, inflated).expect("one window later");
+    assert_eq!(env.growth().depth_last_good_e6, 4 * real);
+}
+
+/// Security review D-L1: growth markets refuse collateral with more than 12 decimals at
+/// InitMarket (GrowthInvalidConfig, 94): at >= 14 decimals the thresholds and the depths both
+/// saturated u64 and met (tier 3 from ~18 tokens). 12 decimals is accepted; 13 and 18 refused.
+#[test]
+fn d_l1_collateral_decimals_above_12_refused() {
+    for (dec, ok) in [(12u8, true), (13, false), (18, false)] {
+        MINT_DECIMALS.with(|d| d.set(dec));
+        let mut p = phase4(BAND_BPS, RENT_MAX);
+        p.band_min_leg_notional = 10u64.saturating_pow(dec as u32 + 1);
+        L_LAUNCH.with(|l| l.set(500));
+        let r = Env::try_new(Cfg { slots: 1, phase4: Some(p), r_gap: 0 });
+        L_LAUNCH.with(|l| l.set(1_000));
+        MINT_DECIMALS.with(|d| d.set(6));
+        match (ok, r) {
+            (true, Ok(env)) => {
+                let g = env.growth();
+                assert_eq!(g.collateral_decimals_p1, 13);
+                assert_eq!(g.tier_thresholds_e6()[2], 500_000 * 1_000_000_000_000, "no saturation at 12");
+            }
+            (false, Err(e)) => assert!(e.contains(&code(PercolatorError::GrowthInvalidConfig)), "{dec}: {e}"),
+            (ok, r) => panic!("decimals {dec}: expected ok={ok}, got {:?}", r.map(|_| ())),
+        }
+    }
 }

@@ -7680,10 +7680,12 @@ pub mod state {
         pub tier_threshold_usd: [u32; 3], // 96..108
         /// R2.1 §2: per-tier max leverage x100 (L1, L2, L3; 0 = default min(5x/10x/20x, L_tier)).
         pub tier_leverage_x100: [u16; 3], // 108..114
-        /// Security review R2-M1: the ratchet epoch (`slot / 9,000`, u32 LE) of the last rise
-        /// of the rate-limited `depth_last_good_e6` (`growth_v19::depth_rate_limited`). A byte
-        /// array: a u32 at 114 would not be 4-aligned (Pod, no padding).
-        pub depth_rise_epoch_le: [u8; 4], // 114..118
+        /// Security review R2-M1 + D-L2: the slot of the last rise of the rate-limited
+        /// `depth_last_good_e6`, in 64-slot units (`slot / 64`, u32 LE; wraps after 2.75e11
+        /// slots, saturates instead). A rise needs >= 9,000 slots since it
+        /// (`growth_v19::depth_rise_window_open`). A byte array: a u32 at 114 would not be
+        /// 4-aligned (Pod, no padding).
+        pub depth_rise_slot64_le: [u8; 4], // 114..118
         pub _reserved1: [u8; 2], // 118..120
     }
     const _: () =
@@ -7706,7 +7708,7 @@ pub mod state {
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_last_good_slot) == 88);
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, tier_threshold_usd) == 96);
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, tier_leverage_x100) == 108);
-    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_rise_epoch_le) == 114);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_rise_slot64_le) == 114);
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, _reserved1) == 118);
 
     impl AssetGrowthV19 {
@@ -7722,7 +7724,7 @@ pub mod state {
                 depth_source: self.depth_source,
                 depth_last_good_e6: self.depth_last_good_e6,
                 depth_last_good_slot: self.depth_last_good_slot,
-                depth_rise_epoch: u32::from_le_bytes(self.depth_rise_epoch_le),
+                depth_rise_slot64: u32::from_le_bytes(self.depth_rise_slot64_le),
             }
         }
 
@@ -7735,7 +7737,7 @@ pub mod state {
                 depth_source: self.depth_source,
                 last_good_e6: self.depth_last_good_e6,
                 last_good_slot: self.depth_last_good_slot,
-                rise_epoch: u32::from_le_bytes(self.depth_rise_epoch_le),
+                rise_slot64: u32::from_le_bytes(self.depth_rise_slot64_le),
             }
         }
 
@@ -7746,7 +7748,7 @@ pub mod state {
             self.depth_source = d.depth_source;
             self.depth_last_good_e6 = d.last_good_e6;
             self.depth_last_good_slot = d.last_good_slot;
-            self.depth_rise_epoch_le = d.rise_epoch.to_le_bytes();
+            self.depth_rise_slot64_le = d.rise_slot64.to_le_bytes();
         }
 
         /// R2.1 + R2-L2: the resolved thresholds in collateral ATOMS (whole tokens x
@@ -7777,7 +7779,7 @@ pub mod state {
             self.depth_source = f.depth_source;
             self.depth_last_good_e6 = f.depth_last_good_e6;
             self.depth_last_good_slot = f.depth_last_good_slot;
-            self.depth_rise_epoch_le = f.depth_rise_epoch.to_le_bytes();
+            self.depth_rise_slot64_le = f.depth_rise_slot64.to_le_bytes();
         }
     }
 
@@ -16393,6 +16395,12 @@ pub mod processor {
             }
             r_gap_bps
         };
+        // Security review D-L1: the tier thresholds are whole collateral tokens scaled by
+        // 10^decimals; above 12 decimals they (and the depths they are compared with) saturate
+        // u64 and meet. Such a collateral cannot carry a growth market.
+        if collateral_decimals > growth_v19::MAX_COLLATERAL_DECIMALS {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
         let l_tier_x100 = growth_v19::leverage_x100_for_imr_bps(initial_margin_bps)
             .ok_or(PercolatorError::GrowthInvalidConfig)?;
         if l_launch_x100 < growth_v19::LEVERAGE_X100_ONE || l_launch_x100 > l_tier_x100 {
@@ -16417,9 +16425,7 @@ pub mod processor {
             // explicitly (0 would read as the 500 bps growth-1 default), so the hot trade path
             // needs no rent lookup (`util_fee_max_effective_bps` returns the stored dial).
             util_fee_max_bps: if rent_on { growth_v19::RENT_ENTRY_FLOOR_BPS } else { 0 },
-            collateral_decimals_p1: collateral_decimals
-                .min(growth_v19::MAX_COLLATERAL_DECIMALS)
-                .saturating_add(1),
+            collateral_decimals_p1: collateral_decimals + 1,
             ..Default::default()
         };
         let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -28240,7 +28246,10 @@ pub mod processor {
         // 64 halvings). Switching depth pushes off (KEEPER_PUSH_DEPTH / the on-chain DEX flag),
         // or a keeper stuck on the 35 B fallback, is therefore a "pause opens on every clamp
         // market" action. Closes and reductions are never affected. There is no UA lever to
-        // clear DEPTH_EVER.
+        // clear DEPTH_EVER. In practice the cap reaches 0 after about log2(last_good) + 1
+        // halvings, i.e. ~31 h at $2k (64 halvings is only the hard bound). And since R2-L1 a 0
+        // cap means MAXIMUM rent on every open position of the market, so stopping pushes is
+        // also a "max rent on every clamp market" action.
         let seed = g.depth_seed_e6();
         g.set_depth_state(growth_v19::depth_push_update(
             g.depth_state(),
@@ -48952,7 +48961,7 @@ mod g8_kani_proofs {
                 | if prev_real { DEPTH_PREV_REAL } else { 0 },
             last_good_e6: lg as u64,
             last_good_slot: lgs as u64,
-            rise_epoch: re,
+            rise_slot64: re,
         };
         let seed: u32 = kani::any();
         let o = depth_push_update(st, new_src, n, now, seed as u64);
@@ -48970,10 +48979,10 @@ mod g8_kani_proofs {
         if let Some(f) = fr {
             assert!(depth_ever(o.depth_source));
             // R2-M1: the rate-limited value of the fresh reading, stamped with the sample slot
-            assert_eq!((o.last_good_e6, o.rise_epoch), depth_rate_limited(ever, lg as u64, re, f, o.depth_slot, seed as u64));
+            assert_eq!((o.last_good_e6, o.rise_slot64), depth_rate_limited(ever, lg as u64, re, f, o.depth_slot, seed as u64));
             assert_eq!(o.last_good_slot, o.depth_slot);
         } else {
-            assert_eq!((o.last_good_e6, o.last_good_slot, o.rise_epoch), (lg as u64, lgs as u64, re));
+            assert_eq!((o.last_good_e6, o.last_good_slot, o.rise_slot64), (lg as u64, lgs as u64, re));
             assert_eq!(depth_ever(o.depth_source), ever);
         }
         if !(s != 0 && now <= s) && n == 0 {
@@ -49171,40 +49180,48 @@ mod g8_kani_proofs {
         kani::cover!(depth == Some(0), "a sticky 0 is ignored off-band");
     }
 
-    /// Security review R2-M1: the depth every reader uses (`usable_depth_e6` = min(fresh,
-    /// rate-limited last_good)) RISES at most 2x per epoch (one doubling, or to the T1/16
-    /// bootstrap floor out of ~0) and only in a later epoch than its last rise; it FALLS to the
-    /// reading at once; a market's FIRST reading is below T1, so its venue tier is 0.
-    /// Mutants: `2^e` for e quiet epochs (one huge jump after a quiet period); jump straight to
-    /// the seed when below it; no epoch gate (a second rise in the same epoch); the first reading
-    /// unclamped; `last_good = r` on a rise (the round-2 rule).
+    /// Security review R2-M1 + D-L2: the depth every reader uses (`usable_depth_e6` =
+    /// min(fresh, rate-limited last_good)) RISES at most 2x (one doubling, or to the T1/16
+    /// bootstrap floor out of ~0) and only when at least 9,000 slots have passed since the
+    /// ACTUAL slot of its last rise -- whatever that slot was inside its 64-slot stamp and
+    /// whatever the calendar-epoch boundaries; it FALLS to the reading at once; a market's FIRST
+    /// reading is below T1, so its venue tier is 0.
+    /// Mutants: `2^e` for e quiet windows; jump straight to the seed when below it; no window
+    /// (a second rise at once); the round-2 calendar-epoch gate `slot / 9,000 > rise / 9,000`
+    /// (two doublings one slot apart across a boundary -- caught: the actual rise slot is a free
+    /// input in its stamp); the stamp's lower bound `stamp * 64` instead of `stamp * 64 + 63`;
+    /// the first reading unclamped; `last_good = r` on a rise (the round-2 rule).
     #[kani::proof]
     #[kani::unwind(4)]
     fn kani_r2m1_depth_rises_at_most_2x_per_epoch() {
         let ever: bool = kani::any();
         let lg: u32 = kani::any();
-        let re: u16 = kani::any();
+        let prev_rise: u32 = kani::any();
         let r: u32 = kani::any();
-        let slot: u32 = kani::any();
+        let dt: u16 = kani::any();
         let t1_tokens: u32 = kani::any();
         // a validated table: T1 below the default T2 (and T3), so "below T1" is tier 0
         kani::assume(t1_tokens >= TIER_THRESHOLD_FLOOR_USD[0] && t1_tokens < TIER_THRESHOLD_DEFAULT_USD[1]);
         let th = tier_thresholds([t1_tokens, 0, 0], 6);
         let seed = th[0] - 1;
-        let (lg, re, r, slot) = (lg as u64, re as u32, r as u64 * 1_000, slot as u64 * 64);
-        let (out, re2) = depth_rate_limited(ever, lg, re, r, slot, seed);
+        // the ACTUAL slot of the previous rise, its stored stamp, and a later sample slot
+        let prev_rise = prev_rise as u64;
+        let stamp = depth_rise_stamp(prev_rise);
+        let slot = prev_rise + dt as u64;
+        let (lg, r) = (lg as u64, r as u64 * 1_000);
+        let (out, stamp2) = depth_rate_limited(ever, lg, stamp, r, slot, seed);
         assert!(out <= r, "never above the reading");
         if !ever {
             assert!(out < th[0], "first reading below T1");
             assert_eq!(venue_tier(out, DEPTH_SOURCE_DEX, th, 3), 0, "first reading: tier 0");
         } else if r <= lg {
-            assert_eq!((out, re2), (r, re), "down at once");
+            assert_eq!((out, stamp2), (r, stamp), "down at once");
         } else if out > lg {
-            assert!(depth_epoch(slot) > re, "rises only in a later epoch");
+            assert!(slot >= prev_rise + RATCHET_EPOCH_SLOTS, "a rise only >= 9,000 slots after the last one");
             assert!(out <= core::cmp::max(lg.saturating_mul(2), seed / DEPTH_BOOTSTRAP_DIV), "<= 2x");
-            assert_eq!(re2, depth_epoch(slot));
+            assert_eq!(stamp2, depth_rise_stamp(slot));
         } else {
-            assert_eq!((out, re2), (lg, re));
+            assert_eq!((out, stamp2), (lg, stamp));
         }
         // the usable depth is min(fresh, last_good): never above either
         let fresh: Option<u32> = kani::any();
@@ -49213,7 +49230,11 @@ mod g8_kani_proofs {
         assert!(u.is_none_or(|x| x <= out && fresh.is_some_and(|f| x <= f)));
         kani::cover!(!ever && r > seed && out == seed, "first reading clamped to the tier-0 level");
         kani::cover!(ever && r > lg && lg > seed && out == lg * 2, "one doubling");
-        kani::cover!(ever && r > lg && depth_epoch(slot) <= re && out == lg, "second rise in an epoch refused");
+        kani::cover!(ever && r > lg && (dt as u64) < RATCHET_EPOCH_SLOTS && out == lg, "a rise inside the window refused");
+        kani::cover!(
+            ever && r > lg && slot / RATCHET_EPOCH_SLOTS > prev_rise / RATCHET_EPOCH_SLOTS && (dt as u64) < RATCHET_EPOCH_SLOTS && out == lg,
+            "boundary straddle: a new calendar epoch, still refused"
+        );
         kani::cover!(ever && lg == 0 && r > 0 && out == core::cmp::min(r, seed / DEPTH_BOOTSTRAP_DIV), "bootstrap out of 0");
         kani::cover!(ever && r < lg && out == r, "falls at once");
     }

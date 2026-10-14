@@ -146,7 +146,7 @@ proptest! {
     #[test]
     fn depth_writer(d in any::<u64>(), s in any::<u64>(), p in any::<u64>(), src_lo in 0u8..=2, prev_real in any::<bool>(), ever in any::<bool>(), lg in any::<u64>(), lgs in any::<u64>(), new_src in 0u8..=4, nd in any::<u64>(), now in any::<u64>()) {
         let srcb = src_lo | if ever { DEPTH_EVER } else { 0 } | if prev_real { DEPTH_PREV_REAL } else { 0 };
-        let st = DepthState { depth_e6: d, depth_slot: s, depth_prev_e6: p, depth_source: srcb, last_good_e6: lg, last_good_slot: lgs, rise_epoch: 0 };
+        let st = DepthState { depth_e6: d, depth_slot: s, depth_prev_e6: p, depth_source: srcb, last_good_e6: lg, last_good_slot: lgs, rise_slot64: 0 };
         let o = depth_push_update(st, new_src, nd, now, u64::MAX);
         if s != 0 && now <= s { prop_assert!(o.depth_e6 <= d); prop_assert_eq!(o.depth_prev_e6, p); prop_assert_eq!(o.depth_slot, s); }
         if depth_ever(srcb) { prop_assert!(depth_ever(o.depth_source)); }
@@ -156,7 +156,7 @@ proptest! {
                 prop_assert!(depth_ever(o.depth_source));
                 // R2-M1: last good is the RATE-LIMITED fresh reading
                 let (exp, er) = depth_rate_limited(depth_ever(srcb), lg, 0, f, o.depth_slot, u64::MAX);
-                prop_assert_eq!((o.last_good_e6, o.rise_epoch), (exp, er));
+                prop_assert_eq!((o.last_good_e6, o.rise_slot64), (exp, er));
                 prop_assert!(o.last_good_e6 <= f && f <= o.depth_e6);
             }
             None => {
@@ -187,10 +187,11 @@ proptest! {
         if ever && out > lg {
             // a rise: one doubling (or the bootstrap floor out of ~0), in a later epoch only
             prop_assert!(out <= lg.saturating_mul(2).max(seed / DEPTH_BOOTSTRAP_DIV));
-            prop_assert!(depth_epoch(slot) > re);
-            prop_assert_eq!(re2, depth_epoch(slot));
+            prop_assert!(depth_rise_window_open(re, slot), "only once the window is open");
+            prop_assert!(slot >= re as u64 * DEPTH_RISE_STAMP_SLOTS + 9_000, ">= 9,000 slots after any slot of the stamp's start");
+            prop_assert_eq!(re2, depth_rise_stamp(slot));
         }
-        if ever && depth_epoch(slot) <= re { prop_assert!(out <= lg, "no second rise in the same epoch"); }
+        if ever && !depth_rise_window_open(re, slot) { prop_assert!(out <= lg, "no second rise inside the window"); }
     }
 
     /// R2-M1 (sequence, the reviewer's flash-liquidity shape): a market whose real depth is
@@ -204,14 +205,15 @@ proptest! {
         let big = real.saturating_mul(big_mul);
         let (mut lg, mut re, mut ever) = (0u64, 0u32, false);
         let mut slot = 1_000u64;
-        let start_epoch = depth_epoch(slot);
+        let start_slot = slot;
         for &spike in &picks {
             let r = if spike { big } else { real };
             let (a, b) = depth_rate_limited(ever, lg, re, r, slot, seed);
             lg = a; re = b; ever = true;
             slot += gap;
         }
-        let epochs = depth_epoch(slot - gap) - start_epoch;
+        // D-L2: rises need >= 9,000 slots between them: at most span / 9,000 after the first
+        let epochs = ((slot - gap - start_slot) / 9_000) as u32;
         let bound = seed.saturating_mul(1u64.checked_shl(epochs.min(63)).unwrap_or(u64::MAX).max(1)).max(seed);
         prop_assert!(lg <= bound.max(seed), "lg {lg} bound {bound} epochs {epochs}");
         // an honest reading takes it down at once

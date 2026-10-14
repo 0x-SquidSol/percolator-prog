@@ -941,8 +941,8 @@ pub struct GraduationFields {
     /// R2.1 (W-M1): the last fresh effective depth and its slot (the sticky cap's input).
     pub depth_last_good_e6: u64,
     pub depth_last_good_slot: u64,
-    /// R2-M1: the rise epoch of the rate-limited depth.
-    pub depth_rise_epoch: u32,
+    /// R2-M1 / D-L2: the last-rise stamp (`slot / 64`) of the rate-limited depth.
+    pub depth_rise_slot64: u32,
 }
 
 /// Security review I-1 (security-review-v21-combination §8): a restarted asset, a reused slot,
@@ -968,7 +968,7 @@ pub fn graduation_reset(l_launch_x100: u16, l_tier_x100: u16, now_slot: u64) -> 
         depth_source: 0,
         depth_last_good_e6: 0,
         depth_last_good_slot: 0,
-        depth_rise_epoch: 0,
+        depth_rise_slot64: 0,
     }
 }
 
@@ -1119,23 +1119,40 @@ pub struct DepthState {
     pub depth_source: u8,
     pub last_good_e6: u64,
     pub last_good_slot: u64,
-    /// Security review R2-M1: the ratchet epoch (`slot / 9,000`) of the last RISE of
-    /// `last_good_e6` (bytes 114..118 of the record).
-    pub rise_epoch: u32,
+    /// Security review R2-M1 + D-L2: the slot of the last RISE of `last_good_e6`, in units of
+    /// `DEPTH_RISE_STAMP_SLOTS` (64) slots (`slot / 64`, bytes 114..118 of the record).
+    pub rise_slot64: u32,
 }
 
-/// R2-M1: the ratchet epoch of a slot (`slot / 9,000`, saturating at `u32::MAX`).
-pub fn depth_epoch(slot: u64) -> u32 {
-    u32::try_from(slot / DEPTH_STICKY_EPOCH_SLOTS).unwrap_or(u32::MAX)
+/// D-L2: the unit of the stored last-rise stamp. A u32 of 64-slot units wraps after 2^32 * 64 =
+/// 2.75e11 slots (~3,500 years at 400 ms); `depth_rise_stamp` saturates instead of wrapping, and
+/// a saturated stamp never opens the window again (fails closed).
+pub const DEPTH_RISE_STAMP_SLOTS: u64 = 64;
+
+/// D-L2: the stored stamp of a rise at `slot` (`slot / 64`, saturating at `u32::MAX`).
+pub fn depth_rise_stamp(slot: u64) -> u32 {
+    u32::try_from(slot / DEPTH_RISE_STAMP_SLOTS).unwrap_or(u32::MAX)
+}
+
+/// D-L2: whether a new rise is allowed at `slot`: at least `RATCHET_EPOCH_SLOTS` (9,000) slots
+/// after the LAST RISE, measured against the latest slot the stamp can stand for
+/// (`stamp * 64 + 63`), so the window is never shorter than 9,000 slots whatever the rounding,
+/// and independent of calendar-epoch boundaries (round 2 gated on `slot / 9,000`: samples
+/// straddling a boundary got two doublings one slot apart). Saturating.
+pub fn depth_rise_window_open(rise_slot64: u32, slot: u64) -> bool {
+    let last = (rise_slot64 as u64)
+        .saturating_mul(DEPTH_RISE_STAMP_SLOTS)
+        .saturating_add(DEPTH_RISE_STAMP_SLOTS - 1);
+    rise_slot64 != u32::MAX && slot >= last.saturating_add(DEPTH_STICKY_EPOCH_SLOTS)
 }
 
 /// Security review R2-M1 ("up slowly, down at once" for the depth itself). The rate-limited
 /// depth `last_good` after a FRESH reading `r` (sample slot `slot`). `seed_e6` = the market's
-/// T1 in atoms minus 1 (the highest tier-0 depth). Returns `(last_good, rise_epoch)`:
+/// T1 in atoms minus 1 (the highest tier-0 depth). Returns `(last_good, rise_slot64)`:
 /// * the market's FIRST fresh reading (`DEPTH_EVER` not yet set): `min(r, seed)`, a rise -> it
 ///   starts at tier 0 whatever the pool shows;
 /// * `r <= last_good`: `r` at once (down at once; a real 0 included); the rise clock is kept;
-/// * `r > last_good`, in a LATER epoch than the last rise:
+/// * `r > last_good`, at least 9,000 slots after the last rise (`depth_rise_window_open`, D-L2):
 ///   `min(r, max(2 * last_good, seed / 16))`, a rise -- at most one doubling per epoch (the
 ///   `seed / 16` bootstrap floor only lets a market climb out of a real 0);
 /// * otherwise (a second rise in the same epoch): unchanged.
@@ -1153,25 +1170,25 @@ pub fn depth_epoch(slot: u64) -> u32 {
 pub fn depth_rate_limited(
     ever: bool,
     last_good_e6: u64,
-    rise_epoch: u32,
+    rise_slot64: u32,
     r: u64,
     slot: u64,
     seed_e6: u64,
 ) -> (u64, u32) {
-    let e = depth_epoch(slot);
+    let e = depth_rise_stamp(slot);
     if !ever {
         return (if r < seed_e6 { r } else { seed_e6 }, e);
     }
     if r <= last_good_e6 {
-        return (r, rise_epoch);
+        return (r, rise_slot64);
     }
-    if e > rise_epoch {
+    if depth_rise_window_open(rise_slot64, slot) {
         let doubled = last_good_e6.saturating_mul(2);
         let floor = seed_e6 / DEPTH_BOOTSTRAP_DIV;
         let up = if doubled > floor { doubled } else { floor };
         return (if r < up { r } else { up }, e);
     }
-    (last_good_e6, rise_epoch)
+    (last_good_e6, rise_slot64)
 }
 
 /// The depth every reader uses (tiers and the κ cap): `min(fresh reading, rate-limited
@@ -1241,17 +1258,17 @@ pub fn depth_push_update(
         depth_source: src | prev_real | (st.depth_source & DEPTH_EVER),
         last_good_e6: st.last_good_e6,
         last_good_slot: st.last_good_slot,
-        rise_epoch: st.rise_epoch,
+        rise_slot64: st.rise_slot64,
     };
     if let Some(f) = fresh_depth_e6(d, prev, slot, out.depth_source, now_slot) {
         // R2-M1: last_good is the RATE-LIMITED depth (rises <= 2x per epoch, falls at once).
-        let (lg, re) = depth_rate_limited(depth_ever(st.depth_source), st.last_good_e6, st.rise_epoch, f, slot, seed_e6);
+        let (lg, re) = depth_rate_limited(depth_ever(st.depth_source), st.last_good_e6, st.rise_slot64, f, slot, seed_e6);
         out.depth_source |= DEPTH_EVER;
         out.last_good_e6 = lg;
         // The sticky decay clock: the slot of the last FRESH sample (not the last rise, not
         // the moment the reading went stale): the first halving is 9,000 slots after it.
         out.last_good_slot = slot;
-        out.rise_epoch = re;
+        out.rise_slot64 = re;
     }
     out
 }
@@ -1302,11 +1319,18 @@ pub fn collateral_decimals_of(stored_p1: u8) -> u8 {
     }
 }
 
-/// Largest collateral decimals the record accepts (SPL mints are <= 18 in practice; the validator
-/// bounds byte 46 at 18 + 1).
-pub const MAX_COLLATERAL_DECIMALS: u8 = 18;
+/// Security review D-L1: the largest collateral decimals a GROWTH market accepts (InitMarket
+/// refuses more with `GrowthInvalidConfig`; the validator bounds byte 46 at 12 + 1). At 12
+/// decimals the default thresholds (<= 500,000 tokens = 5e17 atoms) never saturate u64 (const
+/// assert below). An explicit threshold near `u32::MAX` tokens can still saturate; a saturated
+/// threshold is never met (`depth_tier_for`). At >= 14 decimals round 2's defaults saturated and
+/// met saturated depths (tier 3 from ~18 tokens).
+pub const MAX_COLLATERAL_DECIMALS: u8 = 12;
+const _: () = assert!(
+    (TIER_THRESHOLD_DEFAULT_USD[2] as u128) * 1_000_000_000_000 < u64::MAX as u128
+);
 
-/// `10^decimals` as u64 (saturating; decimals <= 18 never saturates).
+/// `10^decimals` as u64 (saturating; decimals are bounded at `MAX_COLLATERAL_DECIMALS` = 12).
 pub fn whole_token_atoms(decimals: u8) -> u64 {
     10u64.saturating_pow(u32::from(decimals.min(MAX_COLLATERAL_DECIMALS)))
 }
@@ -1332,15 +1356,18 @@ pub fn tier_thresholds(stored_tokens: [u32; 3], collateral_decimals: u8) -> [u64
 }
 
 /// The raw tier of a depth against thresholds: 0 below T1 (and always 0 for a depth of 0), 1
-/// from T1, 2 from T2, 3 from T3.
+/// from T1, 2 from T2, 3 from T3. D-L1 (belt and braces): a SATURATED threshold (`u64::MAX`) is
+/// never met -- depths saturate at `u64::MAX` too (book depth, DEX valuation, a u64 attestation),
+/// and a saturated depth meeting a saturated threshold failed open.
 pub fn depth_tier_for(depth_e6: u64, thresholds_e6: [u64; 3]) -> u8 {
+    let met = |t: u64| t != u64::MAX && depth_e6 >= t;
     if depth_e6 == 0 {
         0
-    } else if depth_e6 >= thresholds_e6[2] {
+    } else if met(thresholds_e6[2]) {
         3
-    } else if depth_e6 >= thresholds_e6[1] {
+    } else if met(thresholds_e6[1]) {
         2
-    } else if depth_e6 >= thresholds_e6[0] {
+    } else if met(thresholds_e6[0]) {
         1
     } else {
         0
@@ -2598,7 +2625,7 @@ mod tests {
         assert_eq!(st.last_good_e6, seed, "first reading: tier-0 level");
         let mut prev = st.last_good_e6;
         for k in 1..=6u64 {
-            let s = 9_000 * (k + 1);
+            let s = 9_000 + 9_100 * k; // D-L2: >= 9,000 slots after the previous rise
             st = depth_push_update(st, a, inflated, s, seed);
             st = depth_push_update(st, a, inflated, s + 1, seed);
             assert_eq!(st.last_good_e6, prev * 2, "epoch {k}: exactly one doubling");
@@ -2617,12 +2644,26 @@ mod tests {
         let p2 = depth_push_update(p1, a, inflated, 9_000 * 9 + 2, seed);
         assert_eq!(p2.last_good_e6, seed / DEPTH_BOOTSTRAP_DIV, "out of a real 0: the bootstrap floor");
         // a thin market cannot jump to the tier-0 ceiling: $2k doubles to $4k one epoch later
-        let (t, _) = depth_rate_limited(true, real, 0, inflated, 9_000, seed);
+        let (t, _) = depth_rate_limited(true, real, 0, inflated, 63 + 9_000, seed);
         assert_eq!(t, 2 * real);
         // MUTANT (the proposed 2^e for e quiet epochs): a steady market accepts one huge jump
         let mutant = |lg: u64, e: u32| lg.saturating_mul(1u64 << e.min(63));
         assert!(mutant(seed, 20) >= th[2], "2^e: tier 3 from one push after 20 quiet epochs");
         let (one, _) = depth_rate_limited(true, seed, 0, inflated, 9_000 * 21, seed);
+        // D-L2 straddle: a rise at slot 8,999 (stamp 140), then 8,999 -> 9,000 crosses a calendar
+        // boundary; round 2 doubled again there. Now the window opens at 140 * 64 + 63 + 9,000.
+        let (a1, s1) = depth_rate_limited(true, seed, 0, inflated, 63 + 9_000, seed);
+        assert_eq!(a1, 2 * seed);
+        let (a2, _) = depth_rate_limited(true, a1, s1, inflated, 63 + 9_001, seed);
+        assert_eq!(a2, a1, "one slot later: no second doubling");
+        let calendar_mutant = |re_slot: u64, slot: u64| slot / 9_000 > re_slot / 9_000;
+        assert!(calendar_mutant(8_999, 9_000), "the round-2 gate would allow it");
+        assert!(!depth_rise_window_open(depth_rise_stamp(8_999), 9_000));
+        assert!(depth_rise_window_open(depth_rise_stamp(8_999), 8_999 / 64 * 64 + 63 + 9_000));
+        // D-L1 belt and braces: a saturated threshold is never met
+        assert_eq!(depth_tier_for(u64::MAX, [u64::MAX; 3]), 0);
+        assert_eq!(depth_tier_for(u64::MAX, [1, 2, u64::MAX]), 2);
+        assert_eq!(tier_thresholds([0; 3], 12)[2], 500_000 * 1_000_000_000_000);
         assert_eq!(one, seed * 2, "here: one doubling only");
         // 6 and 9 decimals (R2-L2): thresholds are whole collateral tokens
         assert_eq!(tier_thresholds([0; 3], 9)[0], 25_000 * 1_000_000_000);
@@ -2662,8 +2703,11 @@ mod tests {
         // R2-M1: the rate-limited depth does not rise again in the epoch of its last rise
         assert_eq!(p2.last_good_e6, 0);
         assert_eq!(usable_depth_e6(fresh(p2, 104), p2.last_good_e6), Some(0));
-        let p3 = depth_push_update(p2, a, 4 * t1, 9_000, t1 - 1);
-        assert_eq!(p3.last_good_e6, (t1 - 1) / DEPTH_BOOTSTRAP_DIV, "next epoch: the bootstrap floor");
+        // D-L2: the window is 9,000 slots after the last rise (slot 101, stamp 1 -> 64..127)
+        let p3 = depth_push_update(p2, a, 4 * t1, 127 + 9_000 - 1, t1 - 1);
+        assert_eq!(p3.last_good_e6, 0, "one slot before the window: no rise");
+        let p3 = depth_push_update(p2, a, 4 * t1, 127 + 9_000, t1 - 1);
+        assert_eq!(p3.last_good_e6, (t1 - 1) / DEPTH_BOOTSTRAP_DIV, "window open: the bootstrap floor");
         // contrast: absent samples (35 B / mode 0) are NOT zero readings -> sticky last good
         let ab = depth_push_update(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
         assert_eq!(fresh(ab, 102), None);
