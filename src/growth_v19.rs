@@ -993,10 +993,13 @@ pub const DEPTH_EVER: u8 = 0x80;
 /// push, mode 0, never). With the source bits (which say the same of the CURRENT sample) it lets
 /// a real reading of 0 be told apart from "absent" in both slots of the min-of-two.
 pub const DEPTH_PREV_REAL: u8 = 0x04;
-/// PushAuthMark 44 B `depth_mode`: 0 = none (the depth must be 0), 1 = keeper-attested. Any
-/// other value is refused with `DepthInputInvalid` (128) by the decoder of this build.
+/// PushAuthMark 44 B `depth_mode`: 0 = none (the depth must be 0), 1 = keeper-attested, 2 =
+/// on-chain DEX (the depth on the wire must be 0; the program computes it from the pool pinned
+/// by tag 123). Any other value is refused with `DepthInputInvalid` (128); see
+/// `depth_src_v22::decode_depth_mode`.
 pub const DEPTH_MODE_NONE: u8 = 0;
 pub const DEPTH_MODE_ATTESTED: u8 = 1;
+pub const DEPTH_MODE_DEX: u8 = crate::depth_src_v22::DEPTH_MODE_DEX;
 /// One whole USD of 6-decimal collateral.
 pub const USD_ATOMS: u64 = 1_000_000;
 /// R2.1 §2 per-market tier thresholds (whole USD of ±2% depth): the defaults a stored 0 means,

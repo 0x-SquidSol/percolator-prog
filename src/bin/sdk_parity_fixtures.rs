@@ -186,6 +186,8 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::CommitG9FeedAllowlist => "CommitG9FeedAllowlist",
         // prog#542, tag 122.
         Instruction::InitLpShareMetadata { .. } => "InitLpShareMetadata",
+        // v2.2 growth round 2 (R2.1 item 4), tag 123.
+        Instruction::SetDepthSource { .. } => "SetDepthSource",
     }
 }
 
