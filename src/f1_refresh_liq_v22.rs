@@ -29,6 +29,22 @@
 // 1.4M). A batched keeper transaction that overruns fails with no program code and is shrunk by the
 // keeper's simulate-first rule (`sweep.ts`); nothing lands partially.
 
+/// Static compute bound (no syscall, see the note above): the follow-on runs only for account
+/// shapes whose refresh + follow-on + fill event was measured inside the 10% rule (1,260,000) with
+/// the +66k stranded-backing hook on top. Measured on BPF (`tests/v16_cu.rs` x1h 2n-domain reversal
+/// with pending funding, real liens on every domain and a real ADL event on every asset):
+/// refresh + follow-on = 603,984 / 820,357 / 1,127,389 at 1 / 2 / 3 legs, and 1,386,624 at 4 legs
+/// (over budget; found after the 18:19 deploy). So: at most 3 active legs, and at most 2 occupied
+/// source domains per leg (the measured envelope). Larger shapes keep the legacy behaviour: the
+/// refresh certifies, a second crank liquidates (each crank inside the budget on its own).
+pub const F1_MAX_FOLLOW_ON_LEGS: u8 = 3;
+
+/// The account shape keeps refresh + follow-on inside the measured budget.
+#[inline]
+pub fn shape_within_budget(active_legs: u8, occupied_source_domains: u8) -> bool {
+    active_legs <= F1_MAX_FOLLOW_ON_LEGS && (occupied_source_domains as u16) <= 2 * (active_legs as u16)
+}
+
 /// Minimum progress (hysteresis): below maintenance, the follow-on runs only when the shortfall
 /// `requirement - equity` is at least this many bps OF THE REQUIREMENT (or equity is <= 0). An
 /// account that a liquidation restored exactly to its requirement and that funding then drags a
@@ -93,6 +109,10 @@ pub struct F1Inputs {
     /// and no pending domain-loss barrier sits on either side of its asset (the engine's
     /// liquidation would refuse otherwise, which would fail the whole instruction).
     pub legs_reducible: bool,
+    /// Active legs of the account after the refresh.
+    pub active_legs: u8,
+    /// Occupied source-credit domains of the account (`is_occupied`).
+    pub occupied_source_domains: u8,
 }
 
 /// Strictly below maintenance: `equity < maintenance_req`, compared without overflow.
@@ -131,6 +151,7 @@ pub fn follow_on_eligible(i: &F1Inputs) -> bool {
         && !i.band_on
         && !i.vault_lp
         && i.legs_reducible
+        && shape_within_budget(i.active_legs, i.occupied_source_domains)
 }
 
 /// The decision: one liquidation step iff the account is eligible, the engine classifies it
@@ -198,6 +219,7 @@ mod f1_kani_proofs {
             assert!(i.live && i.first_step_certified_refresh && !i.band_on && !i.vault_lp);
             assert!(!i.b_stale && !i.pending_close && !i.expired_close && !i.recovery_eligible && !i.resolved_winner);
             assert!(i.legs_reducible && i.steps_taken == 0);
+            assert!(i.active_legs <= F1_MAX_FOLLOW_ON_LEGS && (i.occupied_source_domains as u16) <= 2 * i.active_legs as u16, "follow-on outside the measured compute envelope");
         }
         kani::cover!(want, "below and eligible: attempted");
         kani::cover!(below && i.engine_liquidatable && i.certified_liq_deficit != 0 && !follow_on_eligible(&i),
@@ -205,6 +227,9 @@ mod f1_kani_proofs {
         kani::cover!(below && follow_on_eligible(&i) && !i.engine_liquidatable, "engine disagrees: not attempted");
         kani::cover!(i.band_on && below && i.engine_liquidatable, "band market: never");
         kani::cover!(!i.legs_reducible && below && i.engine_liquidatable && i.certified_liq_deficit != 0, "a leg not reducible: never");
+        kani::cover!(i.active_legs == 4 && below && i.engine_liquidatable && !follow_on_liquidation(&i), "4 legs: legacy two-crank");
+        kani::cover!(i.active_legs == 3 && i.occupied_source_domains == 6 && want, "3 legs, 6 domains: follows on");
+        kani::cover!(i.active_legs == 3 && i.occupied_source_domains == 7 && !follow_on_liquidation(&i), "domains beyond 2 per leg: legacy");
         kani::cover!(follow_on_eligible(&i) && i.engine_liquidatable && i.certified_liq_deficit != 0
             && below_maintenance(i.certified_equity, i.certified_maintenance_req)
             && !shortfall_material(i.certified_equity, i.certified_maintenance_req), "dust shortfall: skipped");

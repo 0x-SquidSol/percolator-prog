@@ -29236,6 +29236,22 @@ pub mod processor {
         {
             return Ok(false);
         }
+        // The static compute bound, also before the market view (a large account outside the
+        // bound pays only these reads; its legacy second crank liquidates it).
+        let active_legs: u8 = percolator::active_bitmap_count_ones(
+            portfolio.header.active_bitmap.map(percolator::V16PodU64::get),
+        )
+        .min(u8::MAX as u32) as u8;
+        let occupied_source_domains: u8 = portfolio
+            .header
+            .source_domains
+            .iter()
+            .filter(|d| d.is_occupied())
+            .count()
+            .min(u8::MAX as usize) as u8;
+        if !crate::f1_refresh_liq_v22::shape_within_budget(active_legs, occupied_source_domains) {
+            return Ok(false);
+        }
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (_cfg, group) = state::market_view_mut(&mut market_data)?;
         if group.header.mode != 0 {
@@ -29297,6 +29313,8 @@ pub mod processor {
             band_on,
             vault_lp,
             legs_reducible,
+            active_legs,
+            occupied_source_domains,
         };
         Ok(crate::f1_refresh_liq_v22::follow_on_liquidation(&inputs))
     }
