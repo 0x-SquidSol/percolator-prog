@@ -308,7 +308,7 @@ fn a_valuation_real_numbers() {
     let v = ds::reserve_value_e6(ds::ValuePath::BaseAtMark, 171_449_177_380_421, 1_770_174_110_327, 12_000_000, 6, 4).unwrap();
     assert_eq!(v, 205_739_012_856);
     assert_eq!(ds::plus2pct_depth_e6(v), 2_027_034_782);
-    assert_eq!(growth_v19::venue_tier(2_027_034_782, growth_v19::DEPTH_SOURCE_DEX, growth_v19::tier_thresholds([0; 3]), 0), 0);
+    assert_eq!(growth_v19::venue_tier(2_027_034_782, growth_v19::DEPTH_SOURCE_DEX, growth_v19::tier_thresholds([0; 3], 6), 0), 0);
     let v = ds::reserve_value_e6(ds::ValuePath::QuoteIsCollateral, 269_144_043_864_280, 1_377_211_761_778, 0, 9, 0).unwrap();
     assert_eq!(ds::plus2pct_depth_e6(v), 13_568_919_694);
     // The same CHILLHOUSE reserve at lot_exp 0 (a per-TOKEN mark of 1,200 e6) gives the same value.
@@ -1199,4 +1199,54 @@ fn c_mode2_wrong_signer_is_refused_before_the_dex_accounts() {
     // CONTROL: right signer, right accounts
     let ok = env.dex_accounts(chill());
     env.push(2, 0, &ok).expect("control");
+}
+
+/// Security review R2-M1 on the DEX source (the reviewer's scenario): the pool's asset vault
+/// inflated 1,000x (STATE POKE of the token amount: balanced liquidity added) and held for two
+/// adjacent-slot mode-2 pushes. The rate-limited depth does not rise in the epoch of its last
+/// rise, rises at most 2x in the next epoch, and the honest pool takes it back down at once.
+/// Round 2 (no limiter) stored the inflated reading (tier 3 on a $500k+ read).
+#[test]
+fn c_mode2_flash_liquidity_is_rate_limited() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    env.set_source(chill()).expect("SetDepthSource");
+    let dex = env.dex_accounts(chill());
+    env.warp(1);
+    env.push(2, 0, &dex).expect("mode 2");
+    env.warp(1);
+    env.push(2, 0, &dex).expect("mode 2 pair");
+    let real = 2_027_034_782u64;
+    assert_eq!(env.growth().depth_last_good_e6, real);
+    let honest = env.svm.get_account(&pk(CHILL_BASE_VAULT)).unwrap();
+    let mut big = honest.clone();
+    let amt = u64::from_le_bytes(big.data[64..72].try_into().unwrap());
+    big.data[64..72].copy_from_slice(&(amt * 1_000).to_le_bytes());
+    env.svm.set_account(pk(CHILL_BASE_VAULT), big.clone()).unwrap();
+    env.warp(1);
+    env.push(2, 0, &dex).expect("inflated 1");
+    env.warp(1);
+    env.push(2, 0, &dex).expect("inflated 2");
+    let g = env.growth();
+    assert!(g.depth_e6 > 900 * real, "the pool reads ~1,000x");
+    assert_eq!(g.depth_last_good_e6, real, "same epoch: no rise");
+    assert_eq!(
+        growth_v19::usable_depth_e6(
+            growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot),
+            g.depth_last_good_e6
+        ),
+        Some(real),
+        "every reader uses min(fresh, rate-limited)"
+    );
+    // held into the next epoch: one doubling
+    let next = (env.slot / 9_000 + 1) * 9_000;
+    env.warp(next - env.slot);
+    env.push(2, 0, &dex).expect("inflated 3");
+    env.warp(1);
+    env.push(2, 0, &dex).expect("inflated 4");
+    assert_eq!(env.growth().depth_last_good_e6, 2 * real, "one doubling per epoch");
+    // the liquidity leaves: down at once
+    env.svm.set_account(pk(CHILL_BASE_VAULT), honest).unwrap();
+    env.warp(1);
+    env.push(2, 0, &dex).expect("honest 1");
+    assert_eq!(env.growth().depth_last_good_e6, real, "min(real, inflated) = real: down at once");
 }
