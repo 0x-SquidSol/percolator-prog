@@ -64,6 +64,10 @@ pub mod mainnet_ids;
 /// v2.2 (prog#542, 2026-10-07): the LP / Earn share mint's wallet-facing name (tag 122).
 pub mod lp_share_meta_v22;
 
+/// v2.2 growth round 2 (R2.1 item 4, 2026-10-14): the on-chain DEX depth source (tag 123,
+/// PushAuthMark depth mode 2, PDA kind 16). Pure parsers, pin check and depth math.
+pub mod depth_src_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -635,6 +639,14 @@ pub mod constants {
     pub const MPL_TOKEN_METADATA_PROGRAM_ID: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
     pub const KIND_G9_FEED_ALLOWLIST: u8 = 15;
+    /// v2.2 growth round 2 (R2.1 item 4): the on-chain DEX depth source pin `DepthSourceV22`
+    /// (`depth_src_v22`) at `["depth_src", market]`, header kind 16. Written only by tag 123
+    /// (`SetDepthSource`, upgrade authority); read by PushAuthMark depth mode 2.
+    pub const KIND_DEPTH_SOURCE: u8 = 16;
+    pub const TAG_SET_DEPTH_SOURCE: u8 = 123;
+    /// Tag 123 `op`: 0 = clear the pin (mode 2 refused afterwards), 1 = set / replace it.
+    pub const DEPTH_SOURCE_OP_CLEAR: u8 = 0;
+    pub const DEPTH_SOURCE_OP_SET: u8 = 1;
     pub const G9_FEEDS_SEED: &[u8] = b"g9_feeds";
     pub const G9_FEED_ALLOWLIST_VERSION: u8 = 1;
     pub const G9_FEED_ALLOWLIST_CAP: usize = 16;
@@ -676,7 +688,7 @@ pub mod constants {
         TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
         TAG_EVICT_AND_TRADE_CPI, TAG_PROPOSE_G9_FEED_ALLOWLIST, TAG_COMMIT_G9_FEED_ALLOWLIST,
-        TAG_INIT_LP_SHARE_METADATA, 204, 205, 206, 207,
+        TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, 205, 206, 207,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -1861,8 +1873,17 @@ VaultLpMultiAssetMarket,
         /// Keeper: send mode 1 with the attested ±2% depth, or the 35-byte form for no depth.
         /// SDK agent: add `DepthInputInvalid = 128`.
         DepthInputInvalid = 128,
+        // ── v2.2 growth round 2 (R2.1 item 4): on-chain DEX depth source ────────
+        /// The on-chain DEX depth source was refused: SetDepthSource (123) with a pool owned by
+        /// a program off the allow-list, vault / mint keys that are not the pool's own, a vault
+        /// that is not an initialized token account of its mint, a refused Token-2022 mint
+        /// extension, or a wrong PDA; or PushAuthMark depth mode 2 on a market with no (or a
+        /// cleared) pin, or whose accounts do not match the pin (any mismatch: nothing written).
+        /// Custom(129). SDK agent: add `DepthSourceInvalid = 129`.
+        DepthSourceInvalid = 129,
     }
     const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
+    const _: () = assert!(PercolatorError::DepthSourceInvalid as u32 == 129);
     const _: () = assert!(PercolatorError::PositionCapReached as u32 == 126);
     const _: () = assert!(PercolatorError::CounterpartyPositionCapReached as u32 == 127);
     const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
@@ -1880,7 +1901,7 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::InsuranceBackstopRefused as u32 == 116);
     /// v2.2 combined release: every error code of the Phase 2b / v2.2 block, pinned DISTINCT at
     /// compile time (rustc also rejects duplicate enum discriminants; this keeps the claim visible).
-    const V22_ERROR_CODES: [u32; 30] = [
+    const V22_ERROR_CODES: [u32; 31] = [
         PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32,
         PercolatorError::VaultLpAllocateRefused as u32,
         101, 102, 103,
@@ -1907,6 +1928,7 @@ VaultLpMultiAssetMarket,
         PercolatorError::PositionCapReached as u32,
         PercolatorError::CounterpartyPositionCapReached as u32,
         PercolatorError::DepthInputInvalid as u32,
+        PercolatorError::DepthSourceInvalid as u32,
     ];
     const fn all_distinct_u32(a: &[u32]) -> bool {
         let mut i = 0;
@@ -7403,6 +7425,62 @@ pub mod state {
         Ok(x)
     }
 
+    // ── v2.2 growth round 2 (R2.1 item 4): `DepthSourceV22` (kind 16, `["depth_src", market]`).
+    pub use crate::depth_src_v22::DepthSourceV22;
+
+    pub const fn depth_source_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<DepthSourceV22>()
+    }
+
+    pub fn derive_depth_source(
+        program_id: &solana_program::pubkey::Pubkey,
+        market: &solana_program::pubkey::Pubkey,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[crate::depth_src_v22::DEPTH_SOURCE_SEED, market.as_ref()],
+            program_id,
+        )
+    }
+
+    /// Reads a depth-source record: exact length, kind 16 header, structurally valid. Every
+    /// failure is `DepthSourceInvalid` (a wrong / corrupt / foreign-kind account is a wrong PDA).
+    pub fn read_depth_source(data: &[u8]) -> Result<DepthSourceV22, ProgramError> {
+        if data.len() != depth_source_account_len()
+            || check_header(data, crate::constants::KIND_DEPTH_SOURCE).is_err()
+        {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        let x: DepthSourceV22 = bytemuck::pod_read_unaligned(&data[HEADER_LEN..]);
+        if !crate::depth_src_v22::validate_depth_source(&x) {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        Ok(x)
+    }
+
+    /// Writes a depth-source record (validated first). `fresh`: the account was just created
+    /// (all-zero): the kind 16 header is written; otherwise the existing header must be kind 16.
+    pub fn write_depth_source(
+        data: &mut [u8],
+        x: &DepthSourceV22,
+        fresh: bool,
+    ) -> Result<(), ProgramError> {
+        if data.len() != depth_source_account_len()
+            || !crate::depth_src_v22::validate_depth_source(x)
+        {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        if fresh {
+            if is_initialized(data) {
+                return Err(PercolatorError::DepthSourceInvalid.into());
+            }
+            write_header(data, crate::constants::KIND_DEPTH_SOURCE)?;
+        } else if check_header(data, crate::constants::KIND_DEPTH_SOURCE).is_err() {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(x));
+        Ok(())
+    }
+
     pub fn read_g9_feed_allowlist(data: &[u8]) -> Result<G9FeedAllowlistV22, ProgramError> {
         if data.len() < g9_feed_allowlist_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
@@ -7657,8 +7735,9 @@ pub mod state {
         if g.version != crate::growth_v19::GROWTH_VERSION
             || g.flags != 0
             || g._reserved0 != [0u8; 3]
-            // G8 (§1.3): the depth bytes 44 and 56..80 carry data; only the two known sources.
-            || g.depth_source > crate::growth_v19::DEPTH_SOURCE_ATTESTED
+            // G8 (§1.3): the depth bytes 44 and 56..80 carry data; only the three known sources
+            // (none, keeper-attested, on-chain DEX: round 2 R2.1 item 4).
+            || g.depth_source > crate::growth_v19::DEPTH_SOURCE_DEX
             || g.rent_kink_bps as u128 > crate::growth_v19::BPS
             || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
             || g._reserved1 != [0u8; 24]
@@ -9101,6 +9180,14 @@ pub mod ix {
         /// `n == 0`: PERMISSIONLESS generic form. `n > 0`: marketauth only, ticker form (creates
         /// it, or upgrades an existing generic record once).
         InitLpShareMetadata { ticker_len: u8, ticker: [u8; 8] },
+        /// Tag 123 (v2.2 growth round 2, R2.1 item 4). UPGRADE AUTHORITY only. Pins (op 1) or
+        /// clears (op 0) the market's on-chain DEX depth source `DepthSourceV22`
+        /// (`["depth_src", market]`, kind 16). Wire `[123][op u8][asset_index u16][market_id u64]`
+        /// (12 B). Accounts: `[0]` upgrade authority (signer; writable when the PDA is created,
+        /// it pays the rent) · `[1]` program data · `[2]` market · `[3]` depth-source PDA (w) ·
+        /// `[4]` system program; op 1 also `[5]` pool · `[6]` base vault · `[7]` quote vault ·
+        /// `[8]` base mint · `[9]` quote mint ("base" = the market's asset).
+        SetDepthSource { op: u8, asset_index: u16, market_id: u64 },
     }
 
     impl Instruction {
@@ -9446,9 +9533,9 @@ pub mod ix {
                         // trailing-bytes check below with InvalidInstructionData).
                         let depth_mode = read_u8(&mut rest)?;
                         let depth_e6 = read_u64(&mut rest)?;
-                        if depth_mode > crate::growth_v19::DEPTH_MODE_ATTESTED
-                            || (depth_mode == crate::growth_v19::DEPTH_MODE_NONE && depth_e6 != 0)
-                        {
+                        // R2.1 item 4: mode 2 (on-chain DEX) carries depth_e6 == 0; the program
+                        // computes the depth from the pinned pool's accounts.
+                        if crate::depth_src_v22::decode_depth_mode(depth_mode, depth_e6).is_none() {
                             return Err(crate::error::PercolatorError::DepthInputInvalid.into());
                         }
                         Self::PushAuthMarkDepth {
@@ -9928,6 +10015,19 @@ pub mod ix {
                         *b = read_u8(&mut rest)?;
                     }
                     Self::InitLpShareMetadata { ticker_len, ticker }
+                }
+                crate::constants::TAG_SET_DEPTH_SOURCE => {
+                    let op = read_u8(&mut rest)?;
+                    if op != crate::constants::DEPTH_SOURCE_OP_CLEAR
+                        && op != crate::constants::DEPTH_SOURCE_OP_SET
+                    {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    Self::SetDepthSource {
+                        op,
+                        asset_index: read_u16(&mut rest)?,
+                        market_id: read_u64(&mut rest)?,
+                    }
                 }
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -11062,6 +11162,16 @@ pub mod ix {
                     out.push(crate::constants::TAG_INIT_LP_SHARE_METADATA);
                     out.push(ticker_len);
                     out.extend_from_slice(&ticker[..(ticker_len as usize).min(8)]);
+                }
+                Self::SetDepthSource {
+                    op,
+                    asset_index,
+                    market_id,
+                } => {
+                    out.push(crate::constants::TAG_SET_DEPTH_SOURCE);
+                    out.push(op);
+                    push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                 }
             }
             out
@@ -13033,6 +13143,7 @@ pub mod lag_policy {
             Instruction::ProposeG9FeedAllowlist { .. } => entry("ProposeG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config (timelocked proposal)"),
             Instruction::CommitG9FeedAllowlist => entry("CommitG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config (timelock commit)"),
             Instruction::InitLpShareMetadata { .. } => entry("InitLpShareMetadata", LagPolicy::MarkFree, "tag 122: writes the share mint's Metaplex name; reads no price, moves no value"),
+            Instruction::SetDepthSource { .. } => entry("SetDepthSource", LagPolicy::MarkFree, "tag 123: upgrade-authority pin of the DEX depth source; reads no price, moves no value"),
         }
     }
 }
@@ -15662,6 +15773,11 @@ pub mod processor {
             Instruction::SetG9FeedAllowlist { keys } => {
                 handle_set_g9_feed_allowlist(program_id, accounts, &keys)
             }
+            Instruction::SetDepthSource {
+                op,
+                asset_index,
+                market_id,
+            } => handle_set_depth_source(program_id, accounts, op, asset_index, market_id),
             Instruction::ProposeG9FeedAllowlist { entries } => {
                 handle_propose_g9_feed_allowlist(program_id, accounts, &entries)
             }
@@ -27832,6 +27948,9 @@ pub mod processor {
         };
         let (source, depth_e6) = match depth {
             Some((growth_v19::DEPTH_MODE_ATTESTED, d)) => (growth_v19::DEPTH_SOURCE_ATTESTED, d),
+            // Mode 2: `d` here is the depth the PROGRAM computed from the pinned pool
+            // (`handle_push_auth_mark` replaced the wire's 0 after the pin check).
+            Some((growth_v19::DEPTH_MODE_DEX, d)) => (growth_v19::DEPTH_SOURCE_DEX, d),
             Some((growth_v19::DEPTH_MODE_NONE, 0)) | None => (growth_v19::DEPTH_SOURCE_NONE, 0),
             // The decoder admits nothing else; refuse rather than store an unknown source.
             Some(_) => return Err(PercolatorError::DepthInputInvalid.into()),
@@ -27844,6 +27963,7 @@ pub mod processor {
             g.depth_slot,
             depth_e6,
             authenticated_slot,
+            source,
         );
         g.depth_e6 = d;
         g.depth_prev_e6 = prev;
@@ -27877,8 +27997,129 @@ pub mod processor {
         state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)
     }
 
+    /// R2.1 item 4: what PushAuthMark mode 2 read from the pinned pool, after the pin check.
+    #[derive(Clone, Copy)]
+    struct DexDepthReading {
+        /// Trading reserves (`depth_src_v22::pool_reserves`) of the market's asset side and the
+        /// other side, in atoms.
+        base_atoms: u64,
+        quote_atoms: u64,
+        base_decimals: u8,
+        quote_mint: [u8; 32],
+    }
+
+    /// PushAuthMark depth mode 2, part 1 (nothing written): the four trailing accounts
+    /// `[2] depth_src · [3] pool · [4] base_vault · [5] quote_vault` (after the existing
+    /// `[0] authority · [1] market`). Verifies the PDA (program-owned, kind 16, valid, active,
+    /// address = `["depth_src", market, bump]`), then the pure all-or-nothing
+    /// `depth_src_v22::pin_matches` (market / asset / generation, pool owner on the allow-list
+    /// AND the pinned program, pool key, vault keys == pinned == the pool's own fields, mints,
+    /// token programs), then the pool's trading reserves. Any failure: `DepthSourceInvalid`.
+    #[inline(never)]
+    fn dex_depth_reading<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        market_key: &Pubkey,
+        asset_index: u16,
+        market_id: u64,
+    ) -> Result<DexDepthReading, ProgramError> {
+        use crate::depth_src_v22 as ds;
+        let bad = || ProgramError::from(PercolatorError::DepthSourceInvalid);
+        let src_ai = accounts.get(2).ok_or_else(bad)?;
+        let pool_ai = accounts.get(3).ok_or_else(bad)?;
+        let bv_ai = accounts.get(4).ok_or_else(bad)?;
+        let qv_ai = accounts.get(5).ok_or_else(bad)?;
+        if src_ai.owner != program_id {
+            return Err(bad());
+        }
+        let pin = state::read_depth_source(&src_ai.try_borrow_data()?)?;
+        let pda = Pubkey::create_program_address(
+            &[ds::DEPTH_SOURCE_SEED, market_key.as_ref(), &[pin.bump]],
+            program_id,
+        )
+        .map_err(|_| bad())?;
+        if *src_ai.key != pda || !pin.is_active() {
+            return Err(bad());
+        }
+        let pool_owner = pool_ai.owner.to_bytes();
+        let kind = ds::amm_kind_for_program(&pool_owner).ok_or_else(bad)?;
+        let pool_data = pool_ai.try_borrow_data()?;
+        let sides = ds::parse_pool(kind, &pool_data).ok_or_else(bad)?;
+        let base_vault = ds::parse_token_account(&bv_ai.owner.to_bytes(), &bv_ai.try_borrow_data()?)
+            .ok_or_else(bad)?;
+        let quote_vault = ds::parse_token_account(&qv_ai.owner.to_bytes(), &qv_ai.try_borrow_data()?)
+            .ok_or_else(bad)?;
+        let view = ds::PushView {
+            market: market_key.to_bytes(),
+            asset_index,
+            market_id,
+            pool_key: pool_ai.key.to_bytes(),
+            pool_owner,
+            sides,
+            base_vault_key: bv_ai.key.to_bytes(),
+            quote_vault_key: qv_ai.key.to_bytes(),
+            base_vault_program: bv_ai.owner.to_bytes(),
+            quote_vault_program: qv_ai.owner.to_bytes(),
+            base_vault,
+            quote_vault,
+        };
+        if !ds::pin_matches(&pin, &view) {
+            return Err(bad());
+        }
+        let (b, q) = pin.sides();
+        let mut amounts = [0u64; 2];
+        amounts[b] = base_vault.amount;
+        amounts[q] = quote_vault.amount;
+        let reserves = ds::pool_reserves(kind, &pool_data, amounts).ok_or_else(bad)?;
+        Ok(DexDepthReading {
+            base_atoms: reserves[b],
+            quote_atoms: reserves[q],
+            base_decimals: pin.base_decimals,
+            quote_mint: pin.quote_mint,
+        })
+    }
+
+    /// PushAuthMark depth mode 2, part 2: the reserve valued in collateral atoms
+    /// (`depth_src_v22::reserve_value_e6`: the quote reserve when the quote mint is the market's
+    /// primary collateral mint, else the asset reserve at the per-lot mark) and its exact +2%
+    /// depth. The mark is `min(mark before this push, this push's mark)` (the pre-push mark when
+    /// none is stored yet), so one high push cannot inflate the depth it carries.
+    #[inline(never)]
+    fn dex_depth_e6(
+        r: &DexDepthReading,
+        collateral_mint: &[u8; 32],
+        mark_before_e6: u64,
+        mark_e6: u64,
+        lot_exp: u8,
+    ) -> Result<u64, ProgramError> {
+        use crate::depth_src_v22 as ds;
+        let mark = if mark_before_e6 == 0 {
+            mark_e6
+        } else {
+            core::cmp::min(mark_before_e6, mark_e6)
+        };
+        let path = if r.quote_mint == *collateral_mint {
+            ds::ValuePath::QuoteIsCollateral
+        } else {
+            ds::ValuePath::BaseAtMark
+        };
+        let value = ds::reserve_value_e6(path, r.base_atoms, r.quote_atoms, mark, r.base_decimals, lot_exp)
+            .ok_or(PercolatorError::DepthSourceInvalid)?;
+        let depth = ds::plus2pct_depth_e6(value);
+        solana_program::log::sol_log(&alloc::format!(
+            "g8_dex_depth path={} base={} quote={} mark={} lot_exp={} value={} depth={}",
+            path as u8, r.base_atoms, r.quote_atoms, mark, lot_exp, value, depth
+        ));
+        Ok(depth)
+    }
+
     /// `depth`: `None` for the 35-byte form (zeroes the stored depth), `Some((mode, depth_e6))`
-    /// for the 44-byte form (decoder-validated: mode 0 with depth 0, or mode 1).
+    /// for the 44-byte form (decoder-validated: mode 0 with depth 0, mode 1, or mode 2 with
+    /// depth 0). Mode 2 (R2.1 item 4) appends `[2] depth_src · [3] pool · [4] base_vault ·
+    /// [5] quote_vault`; the program computes the depth from them (`dex_depth_reading`,
+    /// `dex_depth_e6`) BEFORE anything is written. One asset per instruction (tag 63 has no
+    /// batched form): several pushes in one transaction are several instructions, each with its
+    /// own four accounts.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn handle_push_auth_mark<'a>(
@@ -27901,6 +28142,20 @@ pub mod processor {
         }
         let asset_index_usize = asset_index as usize;
         let authenticated_slot = authenticated_slot_or_fallback(now_slot);
+        // R2.1 item 4, mode 2: read and verify the pinned pool before the market is borrowed.
+        let dex = match depth {
+            Some((growth_v19::DEPTH_MODE_DEX, 0)) => Some(dex_depth_reading(
+                program_id,
+                accounts,
+                market_ai.key,
+                asset_index,
+                expected_market_id,
+            )?),
+            Some((growth_v19::DEPTH_MODE_DEX, _)) => {
+                return Err(PercolatorError::DepthInputInvalid.into());
+            }
+            _ => None,
+        };
         let cfg_after = {
             let mut data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
@@ -27923,6 +28178,20 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineStale.into());
             }
+            // Mode 2: the program's own depth replaces the wire's 0 (computed before any write).
+            let depth = match dex {
+                Some(r) => Some((
+                    growth_v19::DEPTH_MODE_DEX,
+                    dex_depth_e6(
+                        &r,
+                        &cfg.collateral_mint,
+                        profile.mark_ewma_e6,
+                        mark_e6,
+                        state::profile_lot_exp(&profile),
+                    )?,
+                )),
+                None => depth,
+            };
             advance_control_sequence_view(
                 &mut group,
                 asset_index_usize,
@@ -37395,6 +37664,215 @@ pub mod processor {
             entries.len(),
             now,
             now.saturating_add(crate::constants::G9_ALLOWLIST_TIMELOCK_SLOTS)
+        ));
+        Ok(())
+    }
+
+    // ── v2.2 growth round 2 (R2.1 item 4): SetDepthSource (tag 123) ───────────────────────
+
+    /// The market's primary collateral mint, after checking that `asset_index` is a live asset
+    /// of generation `market_id`. Reads only (the market is not written by tag 123).
+    #[inline(never)]
+    fn depth_source_market_collateral(
+        market_ai: &AccountInfo<'_>,
+        asset_index: u16,
+        market_id: u64,
+    ) -> Result<[u8; 32], ProgramError> {
+        let mut data = market_ai.try_borrow_mut_data()?;
+        let (cfg, group) = state::market_view_mut(&mut data)?;
+        require_asset_generation_view(&group, asset_index as usize, market_id)?;
+        Ok(cfg.collateral_mint)
+    }
+
+    /// Tag 123 op 1: builds the pin from `[5] pool · [6] base vault · [7] quote vault ·
+    /// [8] base mint · [9] quote mint` and refuses (`DepthSourceInvalid`) unless: the pool's
+    /// owner is on the allow-list and the pool parses as that AMM; both vaults are initialized
+    /// SPL Token / Token-2022 accounts OF the given mints, owned by the same token program as
+    /// their mint; both mints parse (Token-2022: metadata / group extensions only, decimals
+    /// <= 18); the (vault, mint) pairs are exactly the pool's own two sides (either
+    /// orientation; "base" = the market's asset); the asset mint is not the market's collateral
+    /// mint; the record validates; the push-time `pin_matches` already holds for these very
+    /// accounts; and the pool's trading reserves are readable (e.g. a Raydium pool with swaps
+    /// disabled is refused).
+    #[inline(never)]
+    fn depth_source_build_pin<'a>(
+        accounts: &'a [AccountInfo<'a>],
+        market_key: &Pubkey,
+        asset_index: u16,
+        market_id: u64,
+        bump: u8,
+        collateral_mint: &[u8; 32],
+    ) -> Result<state::DepthSourceV22, ProgramError> {
+        use crate::depth_src_v22 as ds;
+        let bad = || ProgramError::from(PercolatorError::DepthSourceInvalid);
+        let pool_ai = account(accounts, 5)?;
+        let bv_ai = account(accounts, 6)?;
+        let qv_ai = account(accounts, 7)?;
+        let bm_ai = account(accounts, 8)?;
+        let qm_ai = account(accounts, 9)?;
+        let pool_owner = pool_ai.owner.to_bytes();
+        let kind = ds::amm_kind_for_program(&pool_owner).ok_or_else(bad)?;
+        let pool_data = pool_ai.try_borrow_data()?;
+        let sides = ds::parse_pool(kind, &pool_data).ok_or_else(bad)?;
+        let bv = ds::parse_token_account(&bv_ai.owner.to_bytes(), &bv_ai.try_borrow_data()?)
+            .ok_or_else(bad)?;
+        let qv = ds::parse_token_account(&qv_ai.owner.to_bytes(), &qv_ai.try_borrow_data()?)
+            .ok_or_else(bad)?;
+        let base_decimals = ds::parse_mint(&bm_ai.owner.to_bytes(), &bm_ai.try_borrow_data()?)
+            .ok_or_else(bad)?;
+        let quote_decimals = ds::parse_mint(&qm_ai.owner.to_bytes(), &qm_ai.try_borrow_data()?)
+            .ok_or_else(bad)?;
+        let (bm, qm) = (bm_ai.key.to_bytes(), qm_ai.key.to_bytes());
+        if bv.mint != bm
+            || qv.mint != qm
+            || bv_ai.owner != bm_ai.owner
+            || qv_ai.owner != qm_ai.owner
+            || bm == *collateral_mint
+        {
+            return Err(bad());
+        }
+        let side_flag = ds::orientation(&sides, &bv_ai.key.to_bytes(), &qv_ai.key.to_bytes(), &bm, &qm)
+            .ok_or_else(bad)?;
+        let rec = ds::DepthSourceV22 {
+            market: market_key.to_bytes(),
+            amm_program: pool_owner,
+            pool: pool_ai.key.to_bytes(),
+            base_vault: bv_ai.key.to_bytes(),
+            quote_vault: qv_ai.key.to_bytes(),
+            base_mint: bm,
+            quote_mint: qm,
+            market_id,
+            set_slot: Clock::get()?.slot,
+            asset_index,
+            base_decimals,
+            quote_decimals,
+            flags: ds::DEPTH_SRC_FLAG_ACTIVE | side_flag,
+            version: ds::DEPTH_SOURCE_VERSION,
+            bump,
+            amm_kind: kind,
+            _reserved: [0u8; 8],
+        };
+        if !ds::validate_depth_source(&rec) {
+            return Err(bad());
+        }
+        let view = ds::PushView {
+            market: rec.market,
+            asset_index,
+            market_id,
+            pool_key: rec.pool,
+            pool_owner,
+            sides,
+            base_vault_key: rec.base_vault,
+            quote_vault_key: rec.quote_vault,
+            base_vault_program: bv_ai.owner.to_bytes(),
+            quote_vault_program: qv_ai.owner.to_bytes(),
+            base_vault: bv,
+            quote_vault: qv,
+        };
+        if !ds::pin_matches(&rec, &view) {
+            return Err(bad());
+        }
+        let (b, q) = rec.sides();
+        let mut amounts = [0u64; 2];
+        amounts[b] = bv.amount;
+        amounts[q] = qv.amount;
+        ds::pool_reserves(kind, &pool_data, amounts).ok_or_else(bad)?;
+        Ok(rec)
+    }
+
+    /// SetDepthSource (tag 123, R2.1 item 4). UPGRADE AUTHORITY only (ProgramData-proven, the
+    /// same check as tags 93 / 117). op 1 creates (UA pays) or replaces the market's
+    /// `DepthSourceV22` pin (`depth_source_build_pin` lists every check); op 0 CLEARS an
+    /// existing pin (every pin field zeroed, `flags = 0`): PushAuthMark mode 2 is then refused
+    /// with `DepthSourceInvalid` until a new op 1 (fail closed). A wrong PDA address, a clear
+    /// with no record, or a record of another market: `DepthSourceInvalid`. Non-UA:
+    /// `Unauthorized`. For op 0 the wire's asset / generation are not checked (a stale pin of a
+    /// reused slot can always be cleared).
+    #[inline(never)]
+    fn handle_set_depth_source<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        op: u8,
+        asset_index: u16,
+        market_id: u64,
+    ) -> ProgramResult {
+        let upgrade_authority = account(accounts, 0)?;
+        let program_data_ai = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        let src_ai = account(accounts, 3)?;
+        let system_program_ai = account(accounts, 4)?;
+        expect_signer(upgrade_authority)?;
+        let (program_data_key, _) = derive_program_data_address(program_id);
+        expect_key(program_data_ai, &program_data_key)?;
+        if read_program_data_upgrade_authority(program_data_ai)? != Some(*upgrade_authority.key) {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        expect_owner(market_ai, program_id)?;
+        expect_writable(src_ai)?;
+        let (pda, bump) = state::derive_depth_source(program_id, market_ai.key);
+        if *src_ai.key != pda {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        let market_bytes = market_ai.key.to_bytes();
+        if op == crate::constants::DEPTH_SOURCE_OP_CLEAR {
+            if src_ai.data_is_empty() || src_ai.owner != program_id {
+                return Err(PercolatorError::DepthSourceInvalid.into());
+            }
+            let mut data = src_ai.try_borrow_mut_data()?;
+            let old = state::read_depth_source(&data)?;
+            if old.market != market_bytes {
+                return Err(PercolatorError::DepthSourceInvalid.into());
+            }
+            state::write_depth_source(
+                &mut data,
+                &state::DepthSourceV22::cleared(market_bytes, old.bump),
+                false,
+            )?;
+            solana_program::log::sol_log("g8_depth_source_cleared");
+            return Ok(());
+        }
+        let collateral_mint = depth_source_market_collateral(market_ai, asset_index, market_id)?;
+        let rec = depth_source_build_pin(
+            accounts,
+            market_ai.key,
+            asset_index,
+            market_id,
+            bump,
+            &collateral_mint,
+        )?;
+        let fresh = src_ai.data_is_empty();
+        if fresh {
+            expect_writable(upgrade_authority)?;
+            let bump_bytes = [bump];
+            let seeds: &[&[u8]] = &[
+                crate::depth_src_v22::DEPTH_SOURCE_SEED,
+                market_ai.key.as_ref(),
+                bump_bytes.as_ref(),
+            ];
+            create_pda_account(
+                upgrade_authority,
+                src_ai,
+                system_program_ai,
+                state::depth_source_account_len(),
+                program_id,
+                seeds,
+            )?;
+        } else {
+            if src_ai.owner != program_id {
+                return Err(PercolatorError::DepthSourceInvalid.into());
+            }
+            let old = state::read_depth_source(&src_ai.try_borrow_data()?)?;
+            if old.market != market_bytes || old.bump != bump {
+                return Err(PercolatorError::DepthSourceInvalid.into());
+            }
+        }
+        state::write_depth_source(&mut src_ai.try_borrow_mut_data()?, &rec, fresh)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "g8_depth_source_set asset={} kind={} flags={} base_decimals={}",
+            asset_index, rec.amm_kind, rec.flags, rec.base_decimals
         ));
         Ok(())
     }
@@ -47871,22 +48349,28 @@ mod g8_kani_proofs {
         kani::cover!(!c && band == 0, "off-band");
     }
 
-    /// I-D3: attested depth never yields a tier above 1; any other source is tier 0.
-    /// Mutants: attested uncapped (raw tier); unknown source -> raw tier; threshold off by one.
+    /// I-D3: attested depth never yields a tier above 1; the on-chain DEX source (2, round 2)
+    /// yields the raw tier; any other source is tier 0.
+    /// Mutants: attested uncapped (raw tier); unknown source -> raw tier; DEX capped; threshold
+    /// off by one.
     #[kani::proof]
     fn kani_g8_attested_capped_tier1() {
         let d: u64 = kani::any();
         let src: u8 = kani::any();
         let t = depth_tier(d, src);
-        assert!(t <= 1);
-        if src != DEPTH_SOURCE_ATTESTED {
-            assert_eq!(t, 0);
-        } else {
+        let raw = if d >= DEPTH_TIER3_E6 { 3 } else if d >= DEPTH_TIER2_E6 { 2 } else if d >= DEPTH_TIER1_E6 { 1 } else { 0 };
+        if src == DEPTH_SOURCE_ATTESTED {
+            assert!(t <= 1);
             assert_eq!(t == 1, d >= DEPTH_TIER1_E6);
+        } else if src == DEPTH_SOURCE_DEX {
+            assert_eq!(t, raw);
+        } else {
+            assert_eq!(t, 0);
         }
         kani::cover!(src == DEPTH_SOURCE_ATTESTED && d >= DEPTH_TIER3_E6 && t == 1, "tier-3 depth capped at 1");
         kani::cover!(src == DEPTH_SOURCE_ATTESTED && d == DEPTH_TIER1_E6 - 1 && t == 0, "just below tier 1");
-        kani::cover!(src == 2 && d >= DEPTH_TIER3_E6 && t == 0, "unbuilt on-chain source fails closed");
+        kani::cover!(src == DEPTH_SOURCE_DEX && d >= DEPTH_TIER3_E6 && t == 3, "on-chain DEX depth reaches tier 3");
+        kani::cover!(src > DEPTH_SOURCE_DEX && d >= DEPTH_TIER3_E6 && t == 0, "unknown source fails closed");
     }
 
     /// I-D1: stale (> 150 slots), future-stamped or absent (either read 0) depth is effective 0,
@@ -48043,7 +48527,8 @@ mod g8_kani_proofs {
         let n: u32 = kani::any();
         let now: u32 = kani::any();
         let (d, p, s, n, now) = (d as u64, p as u64, s as u64, n as u64, now as u64);
-        let (d2, p2, s2) = depth_push_update(d, p, s, n, now);
+        let src: u8 = kani::any();
+        let (d2, p2, s2) = depth_push_update(d, p, s, n, now, src);
         if s != 0 && now <= s {
             assert!(d2 <= d && d2 <= n);
             assert_eq!((p2, s2), (p, s));

@@ -967,13 +967,18 @@ pub const DEPTH_MAX_AGE_SLOTS: u64 = 150;
 /// `AssetGrowthV19::depth_source`: no depth (a 35 B push, or never pushed).
 pub const DEPTH_SOURCE_NONE: u8 = 0;
 /// `AssetGrowthV19::depth_source`: keeper-attested (PushAuthMark 44 B, mode 1). Trusted, and
-/// capped at tier 1 (I-D3). An on-chain pool source (tiers 2 and 3) is not built: no source
-/// value other than these two is accepted by the decoder or the record validator.
+/// capped at tier 1 (I-D3).
 pub const DEPTH_SOURCE_ATTESTED: u8 = 1;
-/// PushAuthMark 44 B `depth_mode`: 0 = none (the depth must be 0), 1 = keeper-attested. Any
-/// other value is refused with `DepthInputInvalid` (128).
+/// `AssetGrowthV19::depth_source`: on-chain DEX pool (PushAuthMark 44 B, mode 2; round 2 R2.1
+/// item 4): the program computed the depth itself from the pool pinned by tag 123
+/// (`depth_src_v22`). Not capped. No other source value is accepted by the record validator.
+pub const DEPTH_SOURCE_DEX: u8 = 2;
+/// PushAuthMark 44 B `depth_mode`: 0 = none (the depth must be 0), 1 = keeper-attested, 2 =
+/// on-chain DEX (the depth on the wire must be 0). Any other value is refused with
+/// `DepthInputInvalid` (128); see `depth_src_v22::decode_depth_mode`.
 pub const DEPTH_MODE_NONE: u8 = 0;
 pub const DEPTH_MODE_ATTESTED: u8 = 1;
+pub const DEPTH_MODE_DEX: u8 = crate::depth_src_v22::DEPTH_MODE_DEX;
 /// Tier thresholds: USD of ±2% depth in collateral atoms (6 decimals): $25k / $100k / $500k.
 pub const DEPTH_TIER1_E6: u64 = 25_000_000_000;
 pub const DEPTH_TIER2_E6: u64 = 100_000_000_000;
@@ -1008,13 +1013,19 @@ pub fn effective_depth_e6(depth_e6: u64, depth_prev_e6: u64, depth_slot: u64, no
 ///   always spans two distinct slots, and a same-slot repeat can never raise the depth.
 /// * A push stamped BEFORE the stored sample (`now < depth_slot`; the handler refuses a slot
 ///   regression, so this is defensive) is treated like the same slot (fall only).
+///
+/// `source` (0 none / 1 attested / 2 DEX) is the source of `new_depth_e6`. The stored depth
+/// rotation does not depend on it here; the parameter keeps this signature identical to the
+/// per-market-tiers branch, which records it (sticky `DEPTH_EVER`).
 pub fn depth_push_update(
     depth_e6: u64,
     depth_prev_e6: u64,
     depth_slot: u64,
     new_depth_e6: u64,
     now_slot: u64,
+    source: u8,
 ) -> (u64, u64, u64) {
+    let _ = source;
     if depth_slot != 0 && now_slot <= depth_slot {
         let d = if new_depth_e6 < depth_e6 {
             new_depth_e6
@@ -1028,8 +1039,9 @@ pub fn depth_push_update(
 }
 
 /// The liquidity tier of an EFFECTIVE depth: 0 below $25k (or absent / stale: I-D1), 1 from
-/// $25k, 2 from $100k, 3 from $500k, but keeper-attested depth is capped at tier 1 (I-D3) and
-/// any other source (none, or an unbuilt on-chain source) is tier 0 (fail closed).
+/// $25k, 2 from $100k, 3 from $500k, but keeper-attested depth is capped at tier 1 (I-D3), an
+/// on-chain DEX depth (source 2, computed by the program from the pinned pool) is not capped,
+/// and any other source (none, unknown) is tier 0 (fail closed).
 pub fn depth_tier(effective_depth_e6: u64, source: u8) -> u8 {
     let raw = if effective_depth_e6 >= DEPTH_TIER3_E6 {
         3
@@ -1046,6 +1058,8 @@ pub fn depth_tier(effective_depth_e6: u64, source: u8) -> u8 {
         } else {
             raw
         }
+    } else if source == DEPTH_SOURCE_DEX {
+        raw
     } else {
         0
     }
@@ -1922,7 +1936,10 @@ mod tests {
         assert_eq!(depth_tier(t1, DEPTH_SOURCE_ATTESTED), 1);
         assert_eq!(depth_tier(DEPTH_TIER3_E6, DEPTH_SOURCE_ATTESTED), 1, "I-D3");
         assert_eq!(depth_tier(DEPTH_TIER3_E6, DEPTH_SOURCE_NONE), 0);
-        assert_eq!(depth_tier(DEPTH_TIER3_E6, 2), 0, "unbuilt on-chain source: fail closed");
+        assert_eq!(depth_tier(DEPTH_TIER3_E6, DEPTH_SOURCE_DEX), 3, "on-chain DEX depth: uncapped");
+        assert_eq!(depth_tier(DEPTH_TIER2_E6, DEPTH_SOURCE_DEX), 2);
+        assert_eq!(depth_tier(DEPTH_TIER1_E6 - 1, DEPTH_SOURCE_DEX), 0);
+        assert_eq!(depth_tier(DEPTH_TIER3_E6, 3), 0, "unknown source: fail closed");
         assert_eq!((l_depth_x100(0, 300), l_depth_x100(1, 300), l_depth_x100(2, 300), l_depth_x100(3, 300)), (300, 500, 1_000, 2_000));
         assert_eq!((lambda_depth_bps(0), lambda_depth_bps(1), lambda_depth_bps(2), lambda_depth_bps(3)), (10_000, 10_000, 20_000, 30_000));
         assert_eq!((kappa_depth_bps(0), kappa_depth_bps(1), kappa_depth_bps(2), kappa_depth_bps(3)), (5_000, 10_000, 10_000, 20_000));
@@ -1934,18 +1951,18 @@ mod tests {
     fn g8_wl2_same_slot_push_is_not_a_second_sample() {
         let t1 = DEPTH_TIER1_E6;
         // later slot: rotate
-        assert_eq!(depth_push_update(t1, 0, 10, 2 * t1, 11), (2 * t1, t1, 11));
+        assert_eq!(depth_push_update(t1, 0, 10, 2 * t1, 11, 1), (2 * t1, t1, 11));
         // first ever push (slot 0 = never): rotate
-        assert_eq!(depth_push_update(0, 0, 0, t1, 5), (t1, 0, 5));
+        assert_eq!(depth_push_update(0, 0, 0, t1, 5, 1), (t1, 0, 5));
         // same slot: prev kept, depth can only fall
-        assert_eq!(depth_push_update(t1, 0, 10, 2 * t1, 10), (t1, 0, 10), "cannot raise");
-        assert_eq!(depth_push_update(2 * t1, 7, 10, t1, 10), (t1, 7, 10), "can fall");
-        assert_eq!(depth_push_update(2 * t1, 7, 10, 0, 10), (0, 7, 10), "35 B in the same slot zeroes");
+        assert_eq!(depth_push_update(t1, 0, 10, 2 * t1, 10, 1), (t1, 0, 10), "cannot raise");
+        assert_eq!(depth_push_update(2 * t1, 7, 10, t1, 10, 1), (t1, 7, 10), "can fall");
+        assert_eq!(depth_push_update(2 * t1, 7, 10, 0, 10, 1), (0, 7, 10), "35 B in the same slot zeroes");
         // two same-slot attested pushes from nothing: still one sample -> effective 0
-        let (d, p, s) = depth_push_update(0, 0, 0, 5 * t1, 20);
-        let (d, p, s) = depth_push_update(d, p, s, 5 * t1, 20);
+        let (d, p, s) = depth_push_update(0, 0, 0, 5 * t1, 20, 1);
+        let (d, p, s) = depth_push_update(d, p, s, 5 * t1, 20, 1);
         assert_eq!(effective_depth_e6(d, p, s, 20), 0, "W-L2: one slot is one sample");
-        let (d, p, s) = depth_push_update(d, p, s, 5 * t1, 21);
+        let (d, p, s) = depth_push_update(d, p, s, 5 * t1, 21, 1);
         assert_eq!(effective_depth_e6(d, p, s, 21), 5 * t1, "two slots: effective");
         // MUTANT (pre-W-L2 rotate-always): the same-slot pair becomes effective at once
         let mutant = |d: u64, _p: u64, _s: u64, n: u64, now: u64| (n, d, now);
@@ -1953,7 +1970,7 @@ mod tests {
         let (d, p, s) = mutant(d, p, s, 5 * t1, 20);
         assert_eq!(effective_depth_e6(d, p, s, 20), 5 * t1, "mutant: one-slot spike counts");
         // regression stamp: fall only
-        assert_eq!(depth_push_update(t1, 3, 10, 2 * t1, 9), (t1, 3, 10));
+        assert_eq!(depth_push_update(t1, 3, 10, 2 * t1, 9, 1), (t1, 3, 10));
     }
 
     #[test]
