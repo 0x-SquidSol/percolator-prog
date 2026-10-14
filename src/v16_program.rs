@@ -41788,6 +41788,20 @@ pub mod processor {
         })
     }
 
+    /// G8 `N_cap` for the TradeCpi open-room clip (`growth_n_cap_g8`, 0 on `None`: no room), in
+    /// its own frame so the pinned `p1_cpi_preflight_before_matcher` frame does not grow.
+    #[inline(never)]
+    fn growth_clip_n_cap_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        g: &state::AssetGrowthV19,
+        c_m: u128,
+        price: u64,
+    ) -> Result<u128, ProgramError> {
+        let ctx = growth_g8_ctx_view(group, asset_index, g)?;
+        Ok(growth_n_cap_g8(g, &ctx, c_m, price).unwrap_or(0))
+    }
+
     /// v2.2 growth overnight §1.1: whether the market's BOUND vault-LP asset is clamp-enforced
     /// (`growth_v19::clamp_enforced_for` on the engine band and that asset's stored r_gap).
     /// No bound asset, or growth OFF on it: `false` (fail closed).
@@ -42894,9 +42908,9 @@ pub mod processor {
                             account_b.header.fee_credits.get(),
                         )
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                        // G8: the same N_cap as the post-fill gate and the matcher caps.
-                        let ctx = growth_g8_ctx_view(&group, asset_index, &g)?;
-                        let n_cap = growth_n_cap_g8(&g, &ctx, c_m, price).unwrap_or(0);
+                        // G8: the same N_cap as the post-fill gate and the matcher caps (own
+                        // frame: this preflight is a pinned hot-path frame).
+                        let n_cap = growth_clip_n_cap_view(&group, asset_index, &g, c_m, price)?;
                         let long_side = size_q > 0;
                         let oi_side = if long_side {
                             market.engine.asset.oi_eff_long_q.get()
