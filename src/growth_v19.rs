@@ -1036,7 +1036,10 @@ pub fn c_launch_atoms_for(c_m: u128) -> u128 {
 /// r_gap, the dials, the rent snapshot) is the market's CONFIGURATION and survives a restart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GraduationFields {
-    pub c_launch_atoms: u64,
+    /// Round 3 item 6: the volatility EWMA (bytes 0..4; was `c_launch_atoms` 0..8 -- retired).
+    pub vol_var_x100: u32,
+    /// Round 3 item 7: the rent-snapshot stamp (bytes 4..8, `slot / 64`).
+    pub rent_stamp64: u32,
     pub ceil_x100: u16,
     pub ceil_slot: u64,
     pub depth_e6: u64,
@@ -1063,7 +1066,8 @@ pub struct GraduationFields {
 /// `kani_g8_i1_reset_postconditions`.
 pub fn graduation_reset(l_launch_x100: u16, l_tier_x100: u16, now_slot: u64) -> GraduationFields {
     GraduationFields {
-        c_launch_atoms: 0,
+        vol_var_x100: 0,
+        rent_stamp64: 0,
         ceil_x100: if l_launch_x100 < l_tier_x100 {
             l_launch_x100
         } else {
@@ -1885,6 +1889,104 @@ pub fn tier_ramp_u64(d: u64, th: [u64; 3], table: [u64; 4]) -> u64 {
     lo + add as u64
 }
 
+// ── v2.2 round 3 item 6 (design GAP-6): a volatility input to the leverage target ───────────
+
+/// The EWMA weight of a new sample: `1 / 2^4` (~16 pushes, ~1 min at the keeper's cadence).
+pub const VOL_EWMA_SHIFT: u32 = 4;
+/// z of the volatility term (protocol constant, conservative).
+pub const VOL_Z: u64 = 3;
+/// One move is capped at 100% for the arithmetic (u64 squares never overflow); a larger move
+/// still saturates the variance far above any leverage it could allow.
+pub const VOL_MOVE_CAP_BPS: u64 = 10_000;
+/// The variance a market's FIRST sample is seeded at (no data -> no loosening): (5 bps)^2 per
+/// slot, x100 -- about 5x a calm major's per-slot volatility, so the EWMA can only fall toward the
+/// measured level (~16 calm pushes per e-fold), never start below it.
+pub const VOL_VAR_SEED_X100: u32 = 2_500;
+/// `AssetGrowthV19::flags` bit 0 (round 3): bytes 0..8 hold round-3 data (the variance 0..4 and
+/// the rent-snapshot stamp 4..8). Clear = a record from before round 3 whose 0..8 are the
+/// retired `c_launch_atoms`: no volatility data, no rent stamp.
+pub const GROWTH_FLAG_R3_LAYOUT: u8 = 0x01;
+/// `flags` bit 1: the variance has at least one sample (requires bit 0).
+pub const GROWTH_FLAG_VOL_DATA: u8 = 0x02;
+
+/// Validator for the `flags` byte: only bits 0-1, and bit 1 only with bit 0.
+pub fn growth_flags_ok(flags: u8) -> bool {
+    flags & !(GROWTH_FLAG_R3_LAYOUT | GROWTH_FLAG_VOL_DATA) == 0
+        && (flags & GROWTH_FLAG_VOL_DATA == 0 || flags & GROWTH_FLAG_R3_LAYOUT != 0)
+}
+
+/// One squared move, bps^2 per slot x100: `min(|p - p0| * 1e4 / p0, cap)^2 * 100 / dt` (ceil:
+/// never understates). `None` (no sample) with no previous mark or `dt == 0` (same-slot pushes
+/// are skipped).
+pub fn vol_sample_x100(prev_mark_e6: u64, mark_e6: u64, dt_slots: u64) -> Option<u64> {
+    if prev_mark_e6 == 0 || dt_slots == 0 {
+        return None;
+    }
+    let diff = (mark_e6 as u128).abs_diff(prev_mark_e6 as u128);
+    let mv = (diff * BPS).div_ceil(prev_mark_e6 as u128);
+    let mv = if mv > VOL_MOVE_CAP_BPS as u128 { VOL_MOVE_CAP_BPS as u128 } else { mv };
+    Some(((mv * mv * 100).div_ceil(dt_slots as u128)) as u64)
+}
+
+/// The EWMA update (stored u32, saturating): the first sample seeds `max(sample, seed)`; later
+/// `var + (sample - var) / 16` (rounded toward the sample on a rise, toward var on a fall: never
+/// understates).
+pub fn vol_update_x100(var_x100: u32, has_data: bool, sample_x100: u64) -> u32 {
+    let sample = if sample_x100 > u32::MAX as u64 { u32::MAX } else { sample_x100 as u32 };
+    if !has_data {
+        return if sample > VOL_VAR_SEED_X100 { sample } else { VOL_VAR_SEED_X100 };
+    }
+    if sample >= var_x100 {
+        let up = (sample - var_x100) as u64;
+        let step = up.div_ceil(1u64 << VOL_EWMA_SHIFT);
+        let v = var_x100 as u64 + step;
+        if v > u32::MAX as u64 { u32::MAX } else { v as u32 }
+    } else {
+        var_x100 - (var_x100 - sample) / (1u32 << VOL_EWMA_SHIFT)
+    }
+}
+
+/// `ceil(sqrt(x))` for u128 (Newton from above; exact).
+pub fn isqrt_ceil_u128(x: u128) -> u128 {
+    if x < 2 {
+        return x;
+    }
+    // floor sqrt by Newton
+    let mut r = x;
+    let mut y = x / 2 + 1; // < x for x >= 2, and never overflows
+    while y < r {
+        r = y;
+        y = (r + x / r) / 2;
+    }
+    if r * r == x { r } else { r + 1 }
+}
+
+/// σ over the horizon, bps: `ceil(sqrt(var_x100 * h / 100))`.
+pub fn sigma_h_bps(var_x100: u32, h_slots: u64) -> u64 {
+    let v = (var_x100 as u128) * (h_slots as u128);
+    let s = isqrt_ceil_u128(v.div_ceil(100));
+    if s > u64::MAX as u128 { u64::MAX } else { s as u64 }
+}
+
+/// The volatility leverage ceiling (x100): `floor(1e6 / max(engine IMR, z * σ_H + liq fee))`,
+/// saturating at u16. `None` (no data) -> the caller uses LAUNCH (fails closed: no volatility
+/// measured, no loosening above launch). Monotone non-increasing in σ.
+pub fn l_vol_x100(engine_imr_bps: u64, sigma_h_bps: u64, liq_fee_bps: u64) -> u16 {
+    let need = VOL_Z.saturating_mul(sigma_h_bps).saturating_add(liq_fee_bps);
+    let den = if need > engine_imr_bps { need } else { engine_imr_bps };
+    if den == 0 {
+        return u16::MAX;
+    }
+    let l = 1_000_000u64 / den;
+    if l > u16::MAX as u64 { u16::MAX } else { l as u16 }
+}
+
+/// The leverage signal with the volatility term: `min(l_signal, L_vol)`; no data -> `launch`.
+pub fn l_signal_with_vol(l_signal_x100: u16, vol: Option<u16>, launch_x100: u16) -> u16 {
+    let v = vol.unwrap_or(launch_x100);
+    if v < l_signal_x100 { v } else { l_signal_x100 }
+}
+
 /// The κ table (bps of the depth) by tier: 0.5 / 1 / 1 / 2 (`kappa_depth_bps`).
 pub const KAPPA_TABLE_BPS: [u64; 4] = [5_000, 10_000, 10_000, 20_000];
 /// The λ_depth table (bps) by tier: 1x / 1x / 2x / 3x (`lambda_depth_bps`).
@@ -2203,18 +2305,16 @@ pub fn ceiling_in_force_x100(
 }
 
 /// The ratchet WRITER at a site with the bound vault LP's `C_m` in hand (clamp-enforced markets
-/// only). Returns `(ceil_x100, ceil_slot, c_launch_atoms)`:
-/// * `c_launch == 0` (never recorded, or reset by I-1): snapshot `c_launch_atoms_for(C_m)` when
-///   `C_m > 0`, and the ceiling does NOT climb in this call (it can only fall to launch). The
-///   snapshot is kept (I-1 / ledger record) although the R2.1 target no longer reads it;
-/// * otherwise ratchet toward `target_ceiling_x100` (falls <= 1x per call, the h-lock at once;
-///   rises <= +1x per epoch).
+/// only; the target's book tier was built from it). Returns `(ceil_x100, ceil_slot)`: ratchet
+/// toward `target_ceiling_x100` (falls <= 1x per call, the h-lock at once; rises <= +1x per
+/// epoch). Round 3 item 6: the retired `c_launch` snapshot (R2.1 stopped reading it; its
+/// "no climb in the snapshot call" hold is redundant with the I-1 / bind stamp `ceil_slot = now`,
+/// which already makes the first climb wait a full epoch) is gone, and its bytes 0..8 carry the
+/// volatility EWMA and the rent stamp.
 #[allow(clippy::too_many_arguments)]
 pub fn graduation_ratchet(
     prev_ceil_x100: u16,
     prev_slot: u64,
-    c_launch_atoms: u64,
-    c_m: u128,
     graduation: bool,
     stress: u8,
     l_launch_x100: u16,
@@ -2222,28 +2322,12 @@ pub fn graduation_ratchet(
     l_table_tier_x100: u16,
     stress_cap_x100: u16,
     now_slot: u64,
-) -> (u16, u64, u64) {
+) -> (u16, u64) {
     let launch = if l_launch_x100 < l_tier_x100 {
         l_launch_x100
     } else {
         l_tier_x100
     };
-    if c_launch_atoms == 0 {
-        let c_launch = if c_m > 0 {
-            u64::try_from(c_launch_atoms_for(c_m)).unwrap_or(u64::MAX)
-        } else {
-            0
-        };
-        // No climb in this call, not even toward launch from a ceiling below it: the target is
-        // min(prev, launch), so the ceiling can only fall (to launch) or stay.
-        let hold = if launch < prev_ceil_x100 {
-            launch
-        } else {
-            prev_ceil_x100
-        };
-        let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, hold, launch, stress, now_slot);
-        return (c, s, c_launch);
-    }
     let target = target_ceiling_x100(
         graduation,
         stress,
@@ -2252,8 +2336,7 @@ pub fn graduation_ratchet(
         l_table_tier_x100,
         stress_cap_x100,
     );
-    let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, target, launch, stress, now_slot);
-    (c, s, c_launch_atoms)
+    ratchet_ceiling_x100(prev_ceil_x100, prev_slot, target, launch, stress, now_slot)
 }
 
 /// The FALL-ONLY ratchet (PushAuthMark: the depth changed but no `C_m` is in hand). The caller
@@ -2638,6 +2721,35 @@ mod tests {
 
     const PS: u128 = 1_000_000;
 
+    /// Round 3 item 6 (GAP-6): the volatility term.
+    #[test]
+    fn r3_item6_vol_term() {
+        assert_eq!(vol_sample_x100(0, 5, 1), None, "no previous mark");
+        assert_eq!(vol_sample_x100(5, 6, 0), None, "same slot");
+        // 1% over 10 slots: 100^2 * 100 / 10 = 100,000
+        assert_eq!(vol_sample_x100(1_000_000, 1_010_000, 10), Some(100_000));
+        // capped at 100%
+        assert_eq!(vol_sample_x100(1_000_000, 9_000_000, 1), Some(10_000u64 * 10_000 * 100));
+        // seed and EWMA
+        assert_eq!(vol_update_x100(0, false, 0), VOL_VAR_SEED_X100);
+        assert_eq!(vol_update_x100(0, false, 99_999), 99_999);
+        assert_eq!(vol_update_x100(1_600, true, 0), 1_500);
+        assert_eq!(vol_update_x100(0, true, 17), 2, "ceil toward a rise");
+        // sigma over 1,200 slots of the seed: sqrt(2,500 * 1,200 / 100) = sqrt(30,000) -> 174
+        assert_eq!(sigma_h_bps(VOL_VAR_SEED_X100, 1_200), 174);
+        assert_eq!(isqrt_ceil_u128(u128::MAX), 1u128 << 64);
+        assert_eq!(isqrt_ceil_u128(16), 4);
+        assert_eq!(isqrt_ceil_u128(17), 5);
+        // L_vol: 1e6 / max(IMR 500, 3 * 174 + 50 = 572) = 1,748 (17.48x)
+        assert_eq!(l_vol_x100(500, 174, 50), 1_748);
+        assert_eq!(l_vol_x100(500, 0, 50), 2_000, "calm: the engine IMR binds (20x)");
+        assert_eq!(l_vol_x100(500, 1_000, 50), 327, "storm: 1e6 / 3,050 = 3.27x");
+        assert_eq!(l_signal_with_vol(2_000, None, 500), 500, "no data: launch");
+        assert_eq!(l_signal_with_vol(2_000, Some(1_748), 500), 1_748);
+        assert!(growth_flags_ok(0) && growth_flags_ok(1) && growth_flags_ok(3));
+        assert!(!growth_flags_ok(2) && !growth_flags_ok(4));
+    }
+
     /// Round 3 item 5 (GAP-3): the tier ramp.
     #[test]
     fn r3_item5_tier_ramp() {
@@ -2910,7 +3022,8 @@ mod tests {
         assert_eq!(
             r,
             GraduationFields {
-                c_launch_atoms: 0,
+                vol_var_x100: 0,
+                rent_stamp64: 0,
                 ceil_x100: 550,
                 ceil_slot: 77,
                 ..Default::default()
@@ -3362,31 +3475,22 @@ mod tests {
         assert_eq!(ceiling_in_force_x100(true, 900, 850, 300, 1_000, STRESS_ADL), 850);
         assert_eq!(ceiling_in_force_x100(true, 900, 400, 300, 1_000, STRESS_HLOCK), 400, "h-lock at once");
         assert_eq!(ceiling_in_force_x100(true, 400, 900, 300, 1_000, STRESS_NONE), 400);
-        // ratchet writer: c_launch snapshot, no climb in that call
-        assert_eq!(
-            graduation_ratchet(500, 0, 0, 5_000_000_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 50_000),
-            (500, 0, 5_000_000_000)
-        );
-        assert_eq!(
-            graduation_ratchet(500, 0, 0, 1, true, STRESS_NONE, 500, 2_000, 1_000, n, 50_000),
-            (500, 0, MIN_C_LAUNCH_ATOMS as u64),
-            "floored snapshot"
-        );
+        // round 3 item 6: no c_launch snapshot any more; a climb waits a full epoch from the
+        // stamp (bind / I-1 reset stamp ceil_slot = now)
+        assert_eq!(graduation_ratchet(500, 50_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 50_000), (500, 50_000));
         // +1x per 9,000 slots toward 10x; falls 1x per call (h-lock at once); unchanged keeps its stamp
-        let c = 1_000_000_000u64;
-        let cm = 1u128;
-        assert_eq!(graduation_ratchet(500, 0, c, cm, true, STRESS_NONE, 500, 2_000, 1_000, n, 8_999), (500, 0, c));
-        assert_eq!(graduation_ratchet(500, 0, c, cm, true, STRESS_NONE, 500, 2_000, 1_000, n, 9_000), (600, 9_000, c));
-        assert_eq!(graduation_ratchet(600, 9_000, c, cm, true, STRESS_NONE, 500, 2_000, 1_000, n, 18_000), (700, 18_000, c));
-        assert_eq!(graduation_ratchet(1_000, 18_000, c, cm, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_000), (1_000, 18_000, c), "at target: stamp kept");
-        assert_eq!(graduation_ratchet(1_000, 18_000, c, cm, false, STRESS_NONE, 500, 2_000, 500, n, 40_001), (900, 40_001, c), "depth gone: one step down");
-        assert_eq!(graduation_ratchet(1_000, 18_000, c, cm, true, STRESS_HLOCK, 500, 2_000, 1_000, n, 40_001), (500, 40_001, c), "h-lock: launch at once");
-        assert_eq!(graduation_ratchet(2_000, 18_000, c, cm, true, STRESS_DRAW, 500, 2_000, 2_000, 1_000, 40_001), (1_900, 40_001, c), "draw: one step toward L_table(2)");
-        assert_eq!(graduation_ratchet(2_000, 18_000, c, cm, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_001), (1_900, 40_001, c), "tier 3 -> 2: one step");
+        assert_eq!(graduation_ratchet(500, 0, true, STRESS_NONE, 500, 2_000, 1_000, n, 8_999), (500, 0));
+        assert_eq!(graduation_ratchet(500, 0, true, STRESS_NONE, 500, 2_000, 1_000, n, 9_000), (600, 9_000));
+        assert_eq!(graduation_ratchet(600, 9_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 18_000), (700, 18_000));
+        assert_eq!(graduation_ratchet(1_000, 18_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_000), (1_000, 18_000), "at target: stamp kept");
+        assert_eq!(graduation_ratchet(1_000, 18_000, false, STRESS_NONE, 500, 2_000, 500, n, 40_001), (900, 40_001), "depth gone: one step down");
+        assert_eq!(graduation_ratchet(1_000, 18_000, true, STRESS_HLOCK, 500, 2_000, 1_000, n, 40_001), (500, 40_001), "h-lock: launch at once");
+        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_DRAW, 500, 2_000, 2_000, 1_000, 40_001), (1_900, 40_001), "draw: one step toward L_table(2)");
+        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_001), (1_900, 40_001), "tier 3 -> 2: one step");
         // 20x -> 10x takes 10 writer calls, never more than 1x each
         let (mut ce, mut sl) = (2_000u16, 0u64);
         for i in 1..=10u64 {
-            let (c2, s2, _) = graduation_ratchet(ce, sl, c, cm, true, STRESS_NONE, 500, 2_000, 1_000, n, 100_000 + i);
+            let (c2, s2) = graduation_ratchet(ce, sl, true, STRESS_NONE, 500, 2_000, 1_000, n, 100_000 + i);
             assert_eq!(ce - c2, 100);
             (ce, sl) = (c2, s2);
         }

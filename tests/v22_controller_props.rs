@@ -277,3 +277,45 @@ fn r3_item5_mutants_are_caught() {
     // the pure step (no ramp): a 5x jump at T2; the ramp moves 0.2x for +1%
     assert_eq!(gv::tier_ramp_u64(101_000, th, t), 520);
 }
+
+// ── item 6 (GAP-6): the volatility input ───────────────────────────────────────────────────
+
+/// MUTANT: no seed (the first calm sample sets the variance to ~0 -> L_vol at the engine IMR).
+fn vol_update_mutant_noseed(_var: u32, has: bool, x: u64) -> u32 {
+    if has { 0 } else { x.min(u32::MAX as u64) as u32 }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+    /// Full width: the sample never understates the capped move; the EWMA stays between the old
+    /// value and the sample (the seed bounds the first); L_vol is monotone non-increasing in the
+    /// variance and never above 1e6 / IMR; no data never loosens above launch.
+    #[test]
+    fn item6_vol(p0 in 1u64..u64::MAX, p1 in any::<u64>(), dt in 1u64..1_000_000, var in any::<u32>(), has in any::<bool>(), x in any::<u64>(), v1 in any::<u32>(), v2 in any::<u32>(), h in 0u64..1_000_000, imr in 1u64..=10_000, fee in 0u64..1_000, sig in any::<u16>(), launch in any::<u16>()) {
+        let smp = gv::vol_sample_x100(p0, p1, dt).unwrap();
+        let mv = ((p1 as u128).abs_diff(p0 as u128) * 10_000) / (p0 as u128);
+        let mv = mv.min(gv::VOL_MOVE_CAP_BPS as u128);
+        prop_assert!(smp as u128 >= mv * mv * 100 / dt as u128);
+        let u = gv::vol_update_x100(var, has, x);
+        let xs = x.min(u32::MAX as u64) as u32;
+        if has { prop_assert!(u >= var.min(xs) && u <= var.max(xs)); } else { prop_assert!(u >= gv::VOL_VAR_SEED_X100.max(xs)); }
+        let (a, b) = if v1 <= v2 { (v1, v2) } else { (v2, v1) };
+        let la = gv::l_vol_x100(imr, gv::sigma_h_bps(a, h), fee);
+        let lb = gv::l_vol_x100(imr, gv::sigma_h_bps(b, h), fee);
+        prop_assert!(lb <= la);
+        prop_assert!(la as u64 <= 1_000_000 / imr);
+        prop_assert!(gv::l_signal_with_vol(sig, None, launch) <= launch);
+        prop_assert!(gv::l_signal_with_vol(sig, Some(la), launch) <= sig.min(la));
+    }
+}
+
+#[test]
+fn r3_item6_mutants_are_caught() {
+    // no seed: one calm sample would read "no volatility" -> the engine IMR's leverage at once
+    assert_eq!(vol_update_mutant_noseed(0, false, 0), 0);
+    assert_eq!(gv::vol_update_x100(0, false, 0), gv::VOL_VAR_SEED_X100);
+    let calm = gv::l_vol_x100(500, gv::sigma_h_bps(vol_update_mutant_noseed(0, false, 0), 1_200), 50);
+    let seeded = gv::l_vol_x100(500, gv::sigma_h_bps(gv::VOL_VAR_SEED_X100, 1_200), 50);
+    assert!(calm > seeded, "mutant witness: {calm} > {seeded}");
+}

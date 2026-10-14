@@ -2704,7 +2704,7 @@ fn g8_off_band_ceiling_stays_launch_whatever_depth_and_capital() {
     let lp = env.lp(1_000 * USD);
     let lp_owner = lp.owner.insecure_clone();
     let g0 = env.growth();
-    assert_eq!((g0.l_launch_x100, g0.ceil_x100, g0.c_launch_atoms), (300, 300, 0));
+    assert_eq!((g0.l_launch_x100, g0.ceil_x100, g0.flags), (300, 300, percolator_prog::growth_v19::GROWTH_FLAG_R3_LAYOUT));
     env.depth_twice(5 * DEPTH_T1);
     env.deposit_to(&lp_owner, lp.account, 7_000 * USD);
     env.warp(9_001);
@@ -2714,7 +2714,7 @@ fn g8_off_band_ceiling_stays_launch_whatever_depth_and_capital() {
     assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "off-band: 3.5x over the 3x launch ceiling");
     env.trade_cpi(&taker.0, taker.1, &lp, 290 * Q).expect("control: 2.9x inside the launch ceiling");
     let g = env.growth();
-    assert_eq!((g.ceil_x100, g.ceil_slot, g.c_launch_atoms), (g0.ceil_x100, g0.ceil_slot, 0), "never ratcheted off-band");
+    assert_eq!((g.ceil_x100, g.ceil_slot), (g0.ceil_x100, g0.ceil_slot), "never ratcheted off-band");
     assert_eq!(g.depth_source, 1 | DEPTH_PREV_REAL | DEPTH_EVER, "the depth is stored (and ignored) off-band");
 }
 
@@ -2731,13 +2731,14 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     let lp = env.lp(1_000 * USD);
     let lp_owner = lp.owner.insecure_clone();
     let g0 = env.growth();
-    assert_eq!((g0.l_launch_x100, g0.ceil_x100, g0.c_launch_atoms), (300, 300, 0));
+    assert_eq!((g0.l_launch_x100, g0.ceil_x100, g0.flags), (300, 300, percolator_prog::growth_v19::GROWTH_FLAG_R3_LAYOUT));
     let s0 = g0.ceil_slot;
     env.depth_twice(5 * DEPTH_T1);
-    // First evaluation: c_launch snapshotted (floored at $1,000), no climb in that call.
+    // First evaluation: no climb (round 3: no c_launch snapshot; the bind stamp makes the first
+    // climb wait a full epoch).
     env.settle_rent(lp.account, lp.account).expect("tag 106: ratchet site");
     let g = env.growth();
-    assert_eq!((g.c_launch_atoms, g.ceil_x100, g.ceil_slot), (1_000 * USD as u64, 300, s0));
+    assert_eq!((g.ceil_x100, g.ceil_slot), (300, s0));
     // C_m $33k: book tier 1 PAST its round-3 ramp ($25k -> $31.25k), so the target is L1 = 5x
     // exactly (at $30k the smoothed target would be 4.6x)
     env.deposit_to(&lp_owner, lp.account, 32_000 * USD);
@@ -4448,4 +4449,63 @@ fn r3_item5_ceiling_target_is_smooth_across_t2() {
     let hi = percolator_prog::growth_v19::tier_ramp_u64(th[1] * 102 / 100, th, lt);
     assert!(hi - lo <= 40, "a ±2% oscillation moves the target by {} x100", hi - lo);
     env.assert_conservation();
+}
+
+/// Round 3 item 6 (GAP-6): a volatility storm lowers the leverage target, smoothly. 20x band
+/// market graduated to 20x with a calm (constant) mark; then the keeper's marks swing +-1% every
+/// 10 slots (an ~sigma x 25 storm): sigma over two band epochs grows, L_vol = 1e4 / (3 sigma_H +
+/// liq fee) falls below 20x, and the stored ceiling descends at most 1x per writer call (each
+/// push is one) toward it -- never a cliff, never above L_vol for long. NEGATIVE CONTROL (file
+/// copy): without the L_vol term the ceiling stays at 20x through the storm.
+#[test]
+fn r3_item6_vol_storm_lowers_the_ceiling_smoothly() {
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    env.auth_mark();
+    env.set_tiers([5_000, 20_000, 100_000], [0; 3], 3).expect("UA tier table");
+    let lp = env.lp(150_000 * USD);
+    let tier3 = 150_000 * USD_E6;
+    env.depth_twice(tier3);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    env.climb_to(&lp, tier3, 2_000, 40);
+    assert_eq!(env.growth().ceil_x100, 2_000, "calm: graduated to 20x");
+    assert!(env.growth().vol_has_data());
+    let calm_var = env.growth().vol_var_x100();
+    // the storm: +-1% marks every 10 slots, depth kept fresh (44 B pushes)
+    let mut c = env.growth().ceil_x100;
+    let mut fell = 0;
+    for k in 0..80u64 {
+        env.warp(10);
+        let mark = if k % 2 == 0 { PRICE * 101 / 100 } else { PRICE };
+        env.push_depth(mark, 1, tier3).expect("storm push");
+        let n = env.growth().ceil_x100;
+        assert!(n + 100 >= c, "at most 1x per writer call: {c} -> {n}");
+        if n < c {
+            fell += 1;
+        }
+        c = n;
+    }
+    let g = env.growth();
+    assert!(g.vol_var_x100() > calm_var * 4, "the variance rose: {} vs {}", g.vol_var_x100(), calm_var);
+    assert!(fell >= 3 && c < 2_000, "the storm lowered the ceiling smoothly: {c} after {fell} falls");
+}
+
+/// Round 3 item 6 (bytes): a record written before round 3 (flags bit 0 clear) still holds its
+/// retired `c_launch` in bytes 0..8; it validates, reads "no volatility data" (L_vol = launch:
+/// fails closed), and its first push migrates it (bytes zeroed, bit 0 + the first sample).
+#[test]
+fn r3_item6_legacy_c_launch_record_migrates_on_push() {
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    env.poke_growth(|g| {
+        g.flags = 0;
+        g.vol_var_x100_le = 1_000_000_000u32.to_le_bytes(); // the old c_launch ($1,000)
+        g.rent_stamp64_le = [0; 4];
+    });
+    let g = env.growth();
+    assert_eq!((g.vol_has_data(), g.vol_var_x100(), g.rent_stamp64()), (false, 0, 0), "legacy bytes read as no data");
+    env.warp(1);
+    env.push(PRICE);
+    let g = env.growth();
+    assert_eq!(g.flags, percolator_prog::growth_v19::GROWTH_FLAG_R3_LAYOUT | percolator_prog::growth_v19::GROWTH_FLAG_VOL_DATA);
+    assert_eq!(g.vol_var_x100(), percolator_prog::growth_v19::VOL_VAR_SEED_X100, "migrated, seeded by the first (calm) sample");
 }

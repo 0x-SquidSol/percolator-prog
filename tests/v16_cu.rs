@@ -26190,7 +26190,9 @@ fn p2b_restart_asset_oracle_clears_the_adl_episode_record() {
 /// is 1x and `l_launch == l_tier == ceil == 100`.
 fn i1_seed_stale_growth(env: &mut V16CuEnv, asset_index: usize) -> state::AssetGrowthV19 {
     let g = state::AssetGrowthV19 {
-        c_launch_atoms: 7_000_000_000,
+        // round 3: a pre-round-3 record's bytes 0..8 hold its retired c_launch (flags bit 0 clear)
+        vol_var_x100_le: 7_000_000_000u64.to_le_bytes()[..4].try_into().unwrap(),
+        rent_stamp64_le: 7_000_000_000u64.to_le_bytes()[4..].try_into().unwrap(),
         ceil_slot: 5,
         lambda_bps: 9_000,
         l_launch_x100: 100,
@@ -26225,7 +26227,8 @@ fn i1_stale_depth() -> state::AssetGrowthV19 {
 fn i1_assert_reset(env: &V16CuEnv, asset_index: usize, before: &state::AssetGrowthV19, now: u64) {
     let data = env.svm.get_account(&env.market).unwrap().data;
     let after = state::read_asset_growth(&data, asset_index, 10_000).unwrap().expect("growth kept ON");
-    assert_eq!(after.c_launch_atoms, 0, "old launch capital must not survive (I-1)");
+    // round 3: the reset owns bytes 0..8 (zeroed: no volatility data, no rent stamp)
+    assert_eq!((after.vol_var_x100_le, after.rent_stamp64_le, after.flags), ([0; 4], [0; 4], percolator_prog::growth_v19::GROWTH_FLAG_R3_LAYOUT), "old launch capital / volatility must not survive (I-1)");
     assert_eq!(after.ceil_x100, before.l_launch_x100.min(before.l_tier_x100));
     assert_eq!(after.ceil_slot, now, "the ceiling is re-stamped at the new market's start");
     assert_eq!(
@@ -26235,7 +26238,12 @@ fn i1_assert_reset(env: &V16CuEnv, asset_index: usize, before: &state::AssetGrow
     );
     let mut kept = after;
     kept.set_graduation(before.graduation());
-    assert_eq!(&kept, before, "configuration (version, lambda, kink, tiers, r_gap, dials) kept");
+    // set_graduation stamps the round-3 layout; compare the configuration with it masked out
+    let mut b = *before;
+    b.flags = kept.flags;
+    b.vol_var_x100_le = kept.vol_var_x100_le;
+    b.rent_stamp64_le = kept.rent_stamp64_le;
+    assert_eq!(kept, b, "configuration (version, lambda, kink, tiers, r_gap, dials) kept");
     assert_eq!(
         after.graduation(),
         percolator_prog::growth_v19::graduation_reset(before.l_launch_x100, before.l_tier_x100, now)

@@ -88,11 +88,11 @@ proptest! {
     /// Ratchet: <= +1x per epoch, only after the epoch; never climbs in the snapshot call;
     /// fall-only never rises.
     #[test]
-    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), cl in any::<u64>(), cm in any::<u128>(), grad in any::<bool>(), stress in 0u8..=3, la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), tier in 0u8..=3, now in any::<u64>(), stored in any::<u16>()) {
+    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), grad in any::<bool>(), stress in 0u8..=3, la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), tier in 0u8..=3, now in any::<u64>(), stored in any::<u16>()) {
         let tab = tier_leverage(lev, la, lt);
         let lx = l_table_x100(tier, tab);
         let cap = stress_cap_x100(stress, tier, tab);
-        let (c, s, cl2) = graduation_ratchet(prev, ps, cl, cm, grad, stress, la, lt, lx, cap, now);
+        let (c, s) = graduation_ratchet(prev, ps, grad, stress, la, lt, lx, cap, now);
         // round 3 item 3: never more than 1x down per writer call except the h-lock
         if c < prev && stress < STRESS_HLOCK { prop_assert!(prev - c <= RATCHET_STEP_X100); }
         let t = target_ceiling_x100(grad, stress, la, lt, lx, cap);
@@ -100,13 +100,11 @@ proptest! {
         prop_assert!(f <= stored && f >= stored.min(t));
         if stored > t && stress < STRESS_HLOCK { prop_assert!(stored - f <= RATCHET_STEP_X100); }
         if c > prev {
-            prop_assert!(cl != 0);
             prop_assert!(c as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
             prop_assert!(now >= ps.saturating_add(RATCHET_EPOCH_SLOTS));
             prop_assert_eq!(s, now);
         }
-        if c == prev && cl != 0 { prop_assert!(s == ps || s == now); }
-        if cl != 0 { prop_assert_eq!(cl2, cl); } else { prop_assert_eq!(cl2 == 0, cm == 0); }
+        if c == prev { prop_assert!(s == ps || s == now); }
         let (f, _) = graduation_fall_only(prev, ps, grad, stress, la, lt, lx, cap, now);
         prop_assert!(f <= prev);
         if stress < STRESS_HLOCK { prop_assert!(prev - f <= RATCHET_STEP_X100); }

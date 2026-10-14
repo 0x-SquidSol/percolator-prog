@@ -3760,17 +3760,21 @@ fn growth_v19_fee_channel_on_requires_taker_consent() {
     assert!(run(Params::default(), 0).is_ok(), "legacy: channel off");
 }
 
-/// c_launch is recorded ONCE, at the first junior deposit into a growth asset.
+/// Round 3 item 6: the retired `c_launch` is NOT recorded any more (R2.1 stopped reading it): a
+/// junior deposit leaves bytes 0..8 of the growth record alone -- they are the round-3 volatility
+/// EWMA and rent stamp (the new record owns them from birth: flags bit 0). (Was:
+/// `growth_v19_c_launch_recorded_once`.)
 #[test]
-fn growth_v19_c_launch_recorded_once() {
+fn growth_v19_c_launch_retired_bytes_owned_by_round3() {
     let mut env = Env::new(growth_params());
     let lp = env.bind(2_000);
-    assert_eq!(growth_rec(&env).unwrap().c_launch_atoms, 0);
+    let g0 = growth_rec(&env).unwrap();
+    assert_eq!(g0.flags, percolator_prog::growth_v19::GROWTH_FLAG_R3_LAYOUT, "a new record owns 0..8");
+    assert_eq!((g0.vol_var_x100(), g0.rent_stamp64()), (0, 0));
     let admin = env.admin.insecure_clone();
     env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
-    assert_eq!(growth_rec(&env).unwrap().c_launch_atoms, 1_000_000_000);
-    env.junior_deposit_as(&admin, lp.portfolio, 500_000_000).expect("junior +$500");
-    assert_eq!(growth_rec(&env).unwrap().c_launch_atoms, 1_000_000_000, "never overwritten");
+    let g1 = growth_rec(&env).unwrap();
+    assert_eq!((g1.vol_var_x100_le, g1.rent_stamp64_le), (g0.vol_var_x100_le, g0.rent_stamp64_le), "no c_launch write");
     // NEGATIVE CONTROL: no growth record on a legacy market
     let mut legacy = Env::new(Params::default());
     let llp = legacy.bind(2_000);
