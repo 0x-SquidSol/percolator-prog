@@ -277,6 +277,7 @@ fn gate_verdicts(
             kink_bps: growth_v19::DEFAULT_KINK_BPS,
             crowd_blocked: false, // capacity alone; the h-lock is not needed for the verdict
             asset_bound: true,    // as if bound (growth-1 admits opens only there)
+            depth_cap_q: u128::MAX, // G8: no depth (growth-1 capacity)
         })
     };
     (gate(crowd_dir * size), gate(-crowd_dir * size))

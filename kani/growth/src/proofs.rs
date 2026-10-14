@@ -103,6 +103,9 @@ fn any_gate(lp_some: bool) -> GrowthGateIn {
         kink_bps: kani::any(),
         crowd_blocked: kani::any(),
         asset_bound: kani::any(),
+        // G8: no depth cap (these harnesses prove the growth-1 gate; the depth cap is a
+        // `min` with a second bound, covered by kani_g8_* in src/v16_program.rs).
+        depth_cap_q: u128::MAX,
     };
     set_ncap(kani::any());
     unsafe {
@@ -809,6 +812,7 @@ fn kani_growth_t5_at_capacity_costs_full_margin() {
         kink_bps: kani::any(),
         crowd_blocked: false,
         asset_bound: true,
+        depth_cap_q: u128::MAX,
     };
     kani::assume(joins_crowd(lb as i128, la as i128));
     kani::assume(g.kink_bps < 10_000 && g.ceil_imr_bps <= 10_000 && g.ceil_imr_bps >= g.engine_imr_bps);
@@ -1207,6 +1211,7 @@ fn admits(p: &[i128; 3], i: usize, d: i128, n: u128) -> bool {
         kink_bps: 5_000,
         crowd_blocked: false,
         asset_bound: true,
+        depth_cap_q: u128::MAX,
     };
     growth_gate(&g) == GrowthVerdict::Allow
 }

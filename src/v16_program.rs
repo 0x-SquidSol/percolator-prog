@@ -22664,8 +22664,20 @@ pub mod processor {
             // clamp, so a band market may raise lambda up to `band_lambda_max` (the vault LP
             // stays 5% clear of its own maintenance over two epochs) and lower the toll to 0;
             // a rent market may lower the toll to the 25 bps entry floor.
+            // v2.2 growth overnight §1.1: the loosened box needs the PER-MARKET clamp predicate
+            // (band on AND the stored r_gap == G(d)), not the band alone; a mismatch fails closed
+            // to the growth-1 tighten-only box.
             let band_bps = group.header.config.band_bps.get();
-            let band = if band_bps == 0 {
+            let stored = {
+                let engine_imr = group.header.config.initial_margin_bps.get();
+                let market = group
+                    .markets
+                    .get(asset_index as usize)
+                    .ok_or(PercolatorError::InvalidInstruction)?;
+                state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?
+                    .ok_or(PercolatorError::GrowthInvalidConfig)?
+            };
+            let band = if !growth_v19::clamp_enforced_for(band_bps, stored.r_gap_bps) {
                 None
             } else {
                 let g_bps = percolator::band_rent::band_worst_adverse_bps(band_bps)
@@ -39132,9 +39144,12 @@ pub mod processor {
         d: [u16; 4],
     ) -> ProgramResult {
         let [alpha, buffer, target, share] = d;
-        // v2.2: alpha above 50% only on a band market (up to 70%).
-        let band_on = state::market_band_bps(&market_ai.try_borrow_data()?)? != 0;
-        if alpha > growth_v19::alloc_alpha_max_bps(band_on)
+        // v2.2: alpha above 50% only on a band market (up to 70%). v2.2 growth overnight §1.1:
+        // only on a CLAMP-ENFORCED one (band on AND the bound asset's stored r_gap == G(d)); a
+        // band market with no growth record on its bound asset, or with no bound asset, keeps
+        // the growth-1 50% (fail closed).
+        let clamp = market_bound_asset_clamp_enforced(&mut market_ai.try_borrow_mut_data()?)?;
+        if alpha > growth_v19::alloc_alpha_max_bps(clamp)
             || !(vault_lp_v18::ALLOC_BUFFER_MIN_BPS..=10_000).contains(&buffer)
             || target > 10_000
             || share > 10_000
@@ -41555,17 +41570,128 @@ pub mod processor {
         )
     }
 
-    /// growth-v19: the leverage ceiling (x100) in force. Graduation is OFF in growth-1, so this
-    /// is `min(L_launch, L_tier)`; once it is on, the stored ratcheted `ceil_x100`.
-    fn growth_ceiling_x100(g: &state::AssetGrowthV19) -> u16 {
-        // v2.2: graduation is a runtime predicate (band on AND an on-chain depth tier). The
-        // depth tier is item 4 (Wave C); until it exists the tier reads 0 (I-D1: absent depth
-        // is tier 0) and the ceiling stays at min(L_launch, L_tier).
-        if growth_v19::graduation_allowed(0, 0) {
-            g.ceil_x100
-        } else {
-            growth_v19::graduated_ceiling_x100(false, g.l_launch_x100, g.l_tier_x100, 0, 0)
+    /// v2.2 growth overnight §1.1-1.3 (G8): everything a growth reader needs besides the bound
+    /// LP's `C_m`, from one asset's record and the market. Off a clamp-enforced market only the
+    /// predicate is evaluated (no Clock read, no extra account bytes) and every other field is
+    /// the growth-1 neutral value, so callers reproduce growth-1 exactly.
+    #[derive(Clone, Copy)]
+    struct GrowthG8Ctx {
+        /// `growth_v19::clamp_enforced_for(engine band_bps, stored r_gap)`.
+        clamp: bool,
+        /// `growth_v19::graduation_on(clamp, band_bps, tier)`.
+        graduation: bool,
+        /// `growth_v19::depth_tier(effective depth, source)`; 0 off the clamp.
+        tier: u8,
+        /// `growth_v19::effective_depth_e6(..)`; 0 off the clamp.
+        effective_depth_e6: u64,
+        /// §1.2 force-down: a senior draw / G9 backstop outstanding (the fill-time halt mirror
+        /// or unbooked moved atoms), the bankruptcy h-lock latched, or ADL on either side.
+        force_down: bool,
+        /// `authenticated_market_slot_or_fallback_view`; 0 off the clamp (unused there).
+        now: u64,
+    }
+
+    #[inline(never)]
+    fn growth_g8_ctx_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        g: &state::AssetGrowthV19,
+    ) -> Result<GrowthG8Ctx, ProgramError> {
+        let band_bps = group.header.config.band_bps.get();
+        let clamp = growth_v19::clamp_enforced_for(band_bps, g.r_gap_bps);
+        if !clamp {
+            return Ok(GrowthG8Ctx {
+                clamp: false,
+                graduation: false,
+                tier: 0,
+                effective_depth_e6: 0,
+                force_down: false,
+                now: 0,
+            });
         }
+        let now = authenticated_market_slot_or_fallback_view(group);
+        let effective_depth_e6 =
+            growth_v19::effective_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, now);
+        let tier = growth_v19::depth_tier(effective_depth_e6, g.depth_source);
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let asset = &market.engine.asset;
+        let adl = asset.a_long.get() != percolator::ADL_ONE
+            || asset.a_short.get() != percolator::ADL_ONE
+            || asset.mode_long != 0
+            || asset.mode_short != 0;
+        let draw = state::asset_vault_lp_draw_from_wrapper_bytes(&market.wrapper[..])?;
+        let draw_out = draw.outstanding_mirror_atoms != 0 || draw.pending_moved_atoms != 0;
+        let hlock = group.header.bankruptcy_hlock_active != 0;
+        Ok(GrowthG8Ctx {
+            clamp,
+            graduation: growth_v19::graduation_on(clamp, band_bps, tier),
+            tier,
+            effective_depth_e6,
+            force_down: adl || draw_out || hlock,
+            now,
+        })
+    }
+
+    /// v2.2 growth overnight §1.1: whether the market's BOUND vault-LP asset is clamp-enforced
+    /// (`growth_v19::clamp_enforced_for` on the engine band and that asset's stored r_gap).
+    /// No bound asset, or growth OFF on it: `false` (fail closed).
+    fn market_bound_asset_clamp_enforced(market_data: &mut [u8]) -> Result<bool, ProgramError> {
+        let (_cfg, group) = state::market_view_mut(market_data)?;
+        let band_bps = group.header.config.band_bps.get();
+        if band_bps == 0 {
+            return Ok(false);
+        }
+        let Some(i) = market_bound_vault_asset(&group)? else {
+            return Ok(false);
+        };
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let market = group
+            .markets
+            .get(i)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        Ok(match state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)? {
+            Some(g) => growth_v19::clamp_enforced_for(band_bps, g.r_gap_bps),
+            None => false,
+        })
+    }
+
+    /// growth-v19 / G8: the leverage ceiling (x100) the gate applies for an LP with conservative
+    /// equity `c_m` (`None`: no LP in hand, the launch ceiling's capital term). Off a
+    /// clamp-enforced market: `min(L_launch, L_tier)`, exactly growth-1. On one:
+    /// `min(stored ratcheted ceil_x100, live target)` (§1.2), never looser than the live target.
+    fn growth_ceiling_x100(g: &state::AssetGrowthV19, ctx: &GrowthG8Ctx, c_m: Option<u128>) -> u16 {
+        let target = growth_v19::target_ceiling_x100(
+            ctx.graduation,
+            ctx.force_down,
+            g.l_launch_x100,
+            g.l_tier_x100,
+            growth_v19::l_depth_x100(ctx.tier, g.l_launch_x100),
+            c_m.unwrap_or(0),
+            g.c_launch_atoms as u128,
+        );
+        growth_v19::ceiling_in_force_x100(ctx.clamp, g.ceil_x100, target, g.l_launch_x100, g.l_tier_x100)
+    }
+
+    /// G8 `N_cap` of the bound LP with conservative equity `c_m` (`growth_v19::n_cap_g8_q`), the
+    /// ONE capacity number the gate, the TradeCpi clip and the rent snapshot share.
+    fn growth_n_cap_g8(
+        g: &state::AssetGrowthV19,
+        ctx: &GrowthG8Ctx,
+        c_m: u128,
+        price: u64,
+    ) -> Option<u128> {
+        growth_v19::n_cap_g8_q(
+            ctx.clamp,
+            c_m,
+            g.lambda_bps,
+            ctx.tier,
+            ctx.effective_depth_e6,
+            price,
+            percolator::POS_SCALE,
+        )
     }
 
     /// growth-v19 `(inventory_cap_q, liquidity_notional_e6)` for the matcher's ext v3, from the
@@ -41592,11 +41718,16 @@ pub mod processor {
             lp.header.fee_credits.get(),
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        // R8: the pure extraction (Kani target) is the whole decision.
-        Ok(growth_v19::growth_matcher_caps(
+        // R8: the pure extraction (Kani target) is the whole decision. G8: off a clamp-enforced
+        // market `growth_matcher_caps_g8` IS `growth_matcher_caps(.., stored lambda, ..)`.
+        let ctx = growth_g8_ctx_view(group, asset_index, g)?;
+        Ok(growth_v19::growth_matcher_caps_g8(
             group.header.bankruptcy_hlock_active != 0,
+            ctx.clamp,
             c_m,
             g.lambda_bps,
+            ctx.tier,
+            ctx.effective_depth_e6,
             price,
             percolator::POS_SCALE,
             percolator::MAX_POSITION_ABS_Q,
@@ -41630,8 +41761,9 @@ pub mod processor {
             None => return Ok(()),
         };
         let engine_imr = group.header.config.initial_margin_bps.get();
-        let ceil_imr_bps = growth_v19::ceiling_imr_bps(engine_imr, growth_ceiling_x100(&g))
-            .ok_or(PercolatorError::GrowthLeverageExceeded)?;
+        // G8 (v2.2 growth overnight): the per-market clamp predicate, depth tier and force-down.
+        // Off a clamp-enforced market every derived number below is growth-1's exactly.
+        let ctx = growth_g8_ctx_view(group, asset_index, &g)?;
         let price = group
             .markets
             .get(asset_index)
@@ -41711,6 +41843,23 @@ pub mod processor {
             }),
             None => None,
         };
+        // §1.2: the ceiling in force is min(stored ratcheted ceiling, live target at the bound
+        // LP's C_m); no LP counterparty -> the target's capital term is 0 (launch).
+        let ceil_imr_bps = growth_v19::ceiling_imr_bps(
+            engine_imr,
+            growth_ceiling_x100(&g, &ctx, lp_in.map(|l| l.equity)),
+        )
+        .ok_or(PercolatorError::GrowthLeverageExceeded)?;
+        // §1.3: N_cap = min(n_cap_q(C_m, λ_eff), κ·depth/P) on a clamp-enforced market; off it
+        // the stored lambda and no depth cap (growth-1).
+        let (gate_lambda_bps, gate_depth_cap_q) = if ctx.clamp {
+            (
+                growth_v19::lambda_eff_bps(g.lambda_bps, ctx.tier),
+                growth_v19::depth_cap_q(ctx.tier, ctx.effective_depth_e6, price, percolator::POS_SCALE),
+            )
+        } else {
+            (g.lambda_bps, u128::MAX)
+        };
         let sides: [(bool, &percolator::PortfolioV16ViewMut<'_>, i128, i128, i128); 2] = [
             (a_is_taker, account_a, position_a_before, a_eff, a_eff),
             (b_is_taker, account_b, position_b_before, b_eff, b_eff),
@@ -41738,10 +41887,11 @@ pub mod processor {
                 engine_imr_bps: engine_imr,
                 min_nonzero_im_req: group.header.config.min_nonzero_im_req.get(),
                 ceil_imr_bps,
-                lambda_bps: g.lambda_bps,
+                lambda_bps: gate_lambda_bps,
                 kink_bps: g.kink_bps,
                 crowd_blocked: group.header.bankruptcy_hlock_active != 0,
                 asset_bound,
+                depth_cap_q: gate_depth_cap_q,
             };
             match growth_v19::growth_gate(&input) {
                 growth_v19::GrowthVerdict::Allow => {}
@@ -42591,9 +42741,9 @@ pub mod processor {
                             account_b.header.fee_credits.get(),
                         )
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                        let n_cap =
-                            growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE)
-                                .unwrap_or(0);
+                        // G8: the same N_cap as the post-fill gate and the matcher caps.
+                        let ctx = growth_g8_ctx_view(&group, asset_index, &g)?;
+                        let n_cap = growth_n_cap_g8(&g, &ctx, c_m, price).unwrap_or(0);
                         let long_side = size_q > 0;
                         let oi_side = if long_side {
                             market.engine.asset.oi_eff_long_q.get()
@@ -43486,6 +43636,11 @@ pub mod processor {
     /// `lp` (the caller has the LP's portfolio in hand) and refresh the growth record's rent
     /// `N_cap` snapshot from the LP's conservative equity. A no-op unless `lp_key` IS the
     /// asset's bound vault LP. Returns the atoms routed.
+    ///
+    /// v2.2 growth overnight §1.2 (G8): the same site is the graduation RATCHET writer (the
+    /// bound LP's `C_m` is in hand: TradeCpi / NoCpi / batch post-fill, tags 103 and 106). Only on
+    /// a clamp-enforced market; off it the record is never touched by the ratchet. A market with
+    /// neither rent nor growth returns at once, as before.
     #[inline(never)]
     fn vault_lp_rent_route_and_snapshot_view(
         group: &mut state::MarketViewMutV16<'_>,
@@ -43493,9 +43648,19 @@ pub mod processor {
         lp_key: &Pubkey,
         asset_index: usize,
     ) -> Result<u128, ProgramError> {
-        // CU: a market without a rent ceiling has nothing to route and no rent rate to measure.
-        if group.header.config.rent_max_e9_per_slot.get() == 0
-            || asset_index >= group.header.config.max_market_slots.get() as usize
+        if asset_index >= group.header.config.max_market_slots.get() as usize {
+            return Ok(0);
+        }
+        let rent_on = group.header.config.rent_max_e9_per_slot.get() != 0;
+        // CU: a market without a rent ceiling and a growth-OFF asset has nothing to route, no
+        // rent rate to measure and no ceiling to ratchet (one byte read).
+        // Off-band without rent is therefore exactly the old early return (no ratchet off the
+        // clamp, and the clamp needs the band).
+        if !rent_on
+            && (group.header.config.band_bps.get() == 0
+                || group.markets[asset_index].wrapper
+                    [constants::ASSET_GROWTH_OFF + state::ASSET_GROWTH_VERSION_FIELD_OFF]
+                    == 0)
         {
             return Ok(0);
         }
@@ -43505,9 +43670,13 @@ pub mod processor {
         {
             return Ok(0);
         }
-        let routed = group
-            .route_rent_to_account_not_atomic(asset_index, lp)
-            .map_err(map_v16_error)?;
+        let routed = if rent_on {
+            group
+                .route_rent_to_account_not_atomic(asset_index, lp)
+                .map_err(map_v16_error)?
+        } else {
+            0
+        };
         let engine_imr = group.header.config.initial_margin_bps.get();
         let price = group.markets[asset_index].engine.asset.effective_price.get();
         let c_m = vault_lp_v18::conservative_equity(
@@ -43516,19 +43685,50 @@ pub mod processor {
             lp.header.fee_credits.get(),
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let market = group
-            .markets
-            .get_mut(asset_index)
-            .ok_or(PercolatorError::InvalidInstruction)?;
-        if let Some(mut g) = state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)? {
-            let n_cap = growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE)
+        let Some(mut g) =
+            state::asset_growth_from_wrapper_bytes(&group.markets[asset_index].wrapper[..], engine_imr)?
+        else {
+            return Ok(routed);
+        };
+        let ctx = growth_g8_ctx_view(group, asset_index, &g)?;
+        let mut dirty = false;
+        if rent_on {
+            // G8: the rent denominator is the same N_cap the gate and the clip use.
+            let n_cap = growth_n_cap_g8(&g, &ctx, c_m, price)
                 .unwrap_or(0)
                 .min(percolator::MAX_POSITION_ABS_Q);
             let n_cap = u64::try_from(n_cap).unwrap_or(u64::MAX);
             if g.rent_n_cap_q != n_cap {
                 g.rent_n_cap_q = n_cap;
-                state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+                dirty = true;
             }
+        }
+        if ctx.clamp {
+            let (ceil, slot, c_launch) = growth_v19::graduation_ratchet(
+                g.ceil_x100,
+                g.ceil_slot,
+                g.c_launch_atoms,
+                c_m,
+                ctx.graduation,
+                ctx.force_down,
+                g.l_launch_x100,
+                g.l_tier_x100,
+                growth_v19::l_depth_x100(ctx.tier, g.l_launch_x100),
+                ctx.now,
+            );
+            if (ceil, slot, c_launch) != (g.ceil_x100, g.ceil_slot, g.c_launch_atoms) {
+                g.ceil_x100 = ceil;
+                g.ceil_slot = slot;
+                g.c_launch_atoms = c_launch;
+                dirty = true;
+            }
+        }
+        if dirty {
+            let market = group
+                .markets
+                .get_mut(asset_index)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
         }
         Ok(routed)
     }

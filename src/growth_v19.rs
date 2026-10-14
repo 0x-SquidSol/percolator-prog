@@ -44,9 +44,13 @@ pub const MAX_LAMBDA_BPS: u32 = 100_000;
 pub const DEFAULT_KINK_BPS: u16 = 5_000;
 /// `AssetGrowthV19::version` of an enabled block. 0 == off (all-zero slot).
 pub const GROWTH_VERSION: u8 = 1;
-/// Graduation of the ceiling above `L_launch` is OFF until `r_gap` is program-enforced
-/// (plan §2.9 L3, epoch clamp). While off, `L_ceil = min(L_launch, L_tier)`.
-pub const GRADUATION_ENABLED: bool = false;
+/// Graduation of the ceiling above `L_launch` (plan §2.9 L3). v2.2 growth overnight §1.1: ON,
+/// meaning "the program enforces it PER MARKET": graduation is reachable only through
+/// `graduation_on`, i.e. on a clamp-enforced market (`clamp_enforced`: engine band on AND the
+/// stored `r_gap` is the band's derived `G(d)`) with a depth tier >= 1. Everywhere else
+/// `L_ceil = min(L_launch, L_tier)` exactly as in growth-1. Setting this `false` is the
+/// program-wide kill switch (every market back to the launch ceiling).
+pub const GRADUATION_ENABLED: bool = true;
 /// Ratchet epoch: the ceiling climbs at most one step (+1x) per this many slots (~1h).
 pub const RATCHET_EPOCH_SLOTS: u64 = 9_000;
 /// One ratchet step: +1x.
@@ -154,7 +158,13 @@ pub fn ratchet_ceiling_x100(
     } else {
         target_x100
     };
-    if target <= prev_ceil_x100 {
+    // v2.2 growth overnight: an UNCHANGED ceiling keeps its stamp (a steady writer -- every fill,
+    // every crank -- must not keep pushing the next epoch boundary out forever); a fall is
+    // stamped `now`, so a climb after a fall waits a full epoch.
+    if target == prev_ceil_x100 {
+        return (prev_ceil_x100, prev_slot);
+    }
+    if target < prev_ceil_x100 {
         return (target, now_slot);
     }
     if now_slot >= prev_slot.saturating_add(RATCHET_EPOCH_SLOTS) {
@@ -361,6 +371,11 @@ pub struct GrowthGateIn {
     /// opens only there: users OI can be apportioned to one LP only when that LP is every
     /// user's exclusive counterparty (this also removes the multi-LP overshoot).
     pub asset_bound: bool,
+    /// G8 (v2.2 growth overnight §1.3): the depth cap on `N_cap` (`depth_cap_q`), `u128::MAX` =
+    /// none (off a clamp-enforced market, or no fresh depth: growth-1 capacity exactly). The
+    /// gate's `N_cap` is `min(n_cap_q(lp.equity, lambda_bps), depth_cap_q)`, the same number as
+    /// `n_cap_g8_q` (`lambda_bps` is then `λ_eff`).
+    pub depth_cap_q: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,6 +407,7 @@ pub fn growth_required_imr_bps(g: &GrowthGateIn) -> Result<u64, GrowthVerdict> {
             }
             let n = n_cap_q(lp.equity, g.lambda_bps, g.price_e6, g.pos_scale)
                 .ok_or(GrowthVerdict::CapacityFull)?;
+            let n = if n < g.depth_cap_q { n } else { g.depth_cap_q };
             // N-1: `u = OI_users(taker side after) / N_cap` for EVERY open. A crowd-joining
             // open pays the kinked IMR_dyn at that u; a thin open pays only the ceiling but
             // may not take its own side past N_cap either (otherwise the thin side can become
@@ -739,7 +755,11 @@ pub fn growth_sides(cpi: bool, a_is_lp: bool, b_is_lp: bool) -> (bool, bool, Opt
 
 /// Plan §2.9 L3: until the epoch return clamp makes `r_gap` program-enforced, the dials may
 /// only TIGHTEN (or stay at) the growth-1 defaults: `lambda <= 1x`, `kink <= 50%`.
-pub const EPOCH_CLAMP_ENFORCED: bool = false;
+/// v2.2 growth overnight §1.1: ON, meaning "enforced PER MARKET" through `clamp_enforced` (the
+/// engine band is the program-enforced epoch clamp). Off-band markets keep the growth-1
+/// tighten-only box exactly. Setting this `false` is the program-wide kill switch: no market is
+/// then clamp-enforced (no loosening anywhere).
+pub const EPOCH_CLAMP_ENFORCED: bool = true;
 
 /// Bounds for the UA setters. Without the epoch clamp: `lambda in [1, DEFAULT_LAMBDA_BPS]`
 /// (never more LP leverage than 1x) and `kink in [0, DEFAULT_KINK_BPS]` (the step never starts
@@ -797,9 +817,9 @@ pub fn growth_pinned_matcher_caps() -> crate::vault_lp_v18::PinnedMatcherCaps {
 /// Graduation of the leverage ceiling above `L_launch` (design §1.1 "Graduation unlock").
 /// Replaces the `GRADUATION_ENABLED` constant: allowed only on a band market (the Band Safety
 /// Law, validated at InitMarket, is the program-enforced epoch clamp `r_gap` waited for) AND
-/// with an on-chain depth tier >= 1 (item 4, Wave C). Until item 4 supplies a tier, callers
-/// pass 0 and the ceiling stays at `min(L_launch, L_tier)` (I-D1: stale/absent depth is tier
-/// 0, never looser).
+/// with a depth tier >= 1 (item 4 / G8). v2.2 growth overnight: the only caller is
+/// `graduation_on`, with the REAL engine `band_bps` and the REAL `depth_tier` (I-D1: stale or
+/// absent depth is tier 0, never looser).
 pub fn graduation_allowed(band_bps: u64, depth_tier: u8) -> bool {
     band_bps != 0 && depth_tier >= 1
 }
@@ -809,6 +829,29 @@ pub fn graduation_allowed(band_bps: u64, depth_tier: u8) -> bool {
 pub fn band_r_gap_bps(band_bps: u64) -> Option<u16> {
     let g = percolator::band_rent::band_worst_adverse_bps(band_bps).ok()?;
     u16::try_from(g).ok()
+}
+
+/// v2.2 growth overnight §1.1: the per-market clamp predicate (pure core; Kani target). A market
+/// is clamp-enforced iff the program-wide switch is on, the engine band is on (`band_bps != 0`;
+/// the Band Safety Law was validated at InitMarket) AND the stored growth `r_gap` equals the
+/// band's derived `G(d)` (`derived_r_gap_bps`, i.e. `band_r_gap_bps(band_bps)`). Every mismatch
+/// (an off-band market, a growth record written by an older rule, an underivable `G`) fails
+/// CLOSED: not enforced, so no loosening (graduation above `L_launch`, lambda > 1, alpha > 50%,
+/// a utilisation fee below the default, the depth tiers) is reachable.
+pub fn clamp_enforced(band_bps: u64, stored_r_gap_bps: u16, derived_r_gap_bps: Option<u16>) -> bool {
+    EPOCH_CLAMP_ENFORCED && band_bps != 0 && derived_r_gap_bps == Some(stored_r_gap_bps)
+}
+
+/// `clamp_enforced` with `G(d)` derived here (re-checked at every read).
+pub fn clamp_enforced_for(band_bps: u64, stored_r_gap_bps: u16) -> bool {
+    band_bps != 0 && clamp_enforced(band_bps, stored_r_gap_bps, band_r_gap_bps(band_bps))
+}
+
+/// v2.2 growth overnight §1.1: graduation in force on one market right now: the program-wide
+/// switch, the clamp predicate, and `graduation_allowed` on the REAL engine band and the REAL
+/// depth tier (`depth_tier`).
+pub fn graduation_on(clamp: bool, band_bps: u64, depth_tier: u8) -> bool {
+    GRADUATION_ENABLED && clamp && graduation_allowed(band_bps, depth_tier)
 }
 
 /// v2.2: the vault-LP leverage ceiling a band market allows:
@@ -837,7 +880,8 @@ pub const BAND_LAMBDA_CAP_BPS: u32 = 30_000;
 
 /// v2.2: the UA dial bounds. Off-band (no epoch clamp): the growth-1 tighten-only box
 /// (`growth_dials_ok(false, ..)`). On a band market: `lambda in [1, band_lambda_max]`, kink
-/// in [0, 100%].
+/// in [0, 100%]. v2.2 growth overnight §1.1: `band` is `Some` only on a CLAMP-ENFORCED market
+/// (`clamp_enforced`); the effective lambda is still `min(lambda, λ_depth(tier))` at every read.
 pub fn growth_dials_ok_for(band: Option<(u64, u64)>, lambda_bps: u32, kink_bps: u16) -> bool {
     match band {
         None => growth_dials_ok(false, lambda_bps, kink_bps),
@@ -855,6 +899,8 @@ pub fn growth_dials_ok_for(band: Option<(u64, u64)>, lambda_bps: u32, kink_bps: 
 pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 7_000;
 #[cfg(not(feature = "devnet"))]
 pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 6_000;
+/// v2.2 growth overnight §1.1: `band_on` is the per-market CLAMP predicate (`clamp_enforced`),
+/// not the band alone (callers: tag 99's dial trailer).
 pub fn alloc_alpha_max_bps(band_on: bool) -> u16 {
     if band_on {
         ALLOC_ALPHA_MAX_BAND_BPS
@@ -913,6 +959,344 @@ pub fn graduation_reset(l_launch_x100: u16, l_tier_x100: u16, now_slot: u64) -> 
     }
 }
 
+// ── v2.2 growth overnight §1.3: G8 depth input and liquidity tiers ─────────────────────────
+
+/// A stored depth older than this many slots reads as absent (~60 s at 400 ms slots; the keeper
+/// pushes every few seconds), the same bound as the ADL wind-down's mark age.
+pub const DEPTH_MAX_AGE_SLOTS: u64 = 150;
+/// `AssetGrowthV19::depth_source`: no depth (a 35 B push, or never pushed).
+pub const DEPTH_SOURCE_NONE: u8 = 0;
+/// `AssetGrowthV19::depth_source`: keeper-attested (PushAuthMark 44 B, mode 1). Trusted, and
+/// capped at tier 1 (I-D3). An on-chain pool source (tiers 2 and 3) is not built: no source
+/// value other than these two is accepted by the decoder or the record validator.
+pub const DEPTH_SOURCE_ATTESTED: u8 = 1;
+/// PushAuthMark 44 B `depth_mode`: 0 = none (the depth must be 0), 1 = keeper-attested. Any
+/// other value is refused with `DepthInputInvalid` (128).
+pub const DEPTH_MODE_NONE: u8 = 0;
+pub const DEPTH_MODE_ATTESTED: u8 = 1;
+/// Tier thresholds: USD of ±2% depth in collateral atoms (6 decimals): $25k / $100k / $500k.
+pub const DEPTH_TIER1_E6: u64 = 25_000_000_000;
+pub const DEPTH_TIER2_E6: u64 = 100_000_000_000;
+pub const DEPTH_TIER3_E6: u64 = 500_000_000_000;
+
+/// The effective depth: `min(depth_e6, depth_prev_e6)` (a one-push spike buys nothing), and 0
+/// (absent) when either read is 0, when the last push is older than `DEPTH_MAX_AGE_SLOTS`, or
+/// when `depth_slot` is AFTER `now` (a clock that went backwards is not trusted: fail closed).
+pub fn effective_depth_e6(depth_e6: u64, depth_prev_e6: u64, depth_slot: u64, now_slot: u64) -> u64 {
+    if depth_e6 == 0 || depth_prev_e6 == 0 {
+        return 0;
+    }
+    match now_slot.checked_sub(depth_slot) {
+        Some(age) if age <= DEPTH_MAX_AGE_SLOTS => {
+            if depth_e6 < depth_prev_e6 {
+                depth_e6
+            } else {
+                depth_prev_e6
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// The liquidity tier of an EFFECTIVE depth: 0 below $25k (or absent / stale: I-D1), 1 from
+/// $25k, 2 from $100k, 3 from $500k, but keeper-attested depth is capped at tier 1 (I-D3) and
+/// any other source (none, or an unbuilt on-chain source) is tier 0 (fail closed).
+pub fn depth_tier(effective_depth_e6: u64, source: u8) -> u8 {
+    let raw = if effective_depth_e6 >= DEPTH_TIER3_E6 {
+        3
+    } else if effective_depth_e6 >= DEPTH_TIER2_E6 {
+        2
+    } else if effective_depth_e6 >= DEPTH_TIER1_E6 {
+        1
+    } else {
+        0
+    };
+    if source == DEPTH_SOURCE_ATTESTED {
+        if raw > 1 {
+            1
+        } else {
+            raw
+        }
+    } else {
+        0
+    }
+}
+
+/// `L_depth` (x100): tier 0 -> `L_launch`, 1 -> 5x, 2 -> 10x, 3 -> 20x.
+pub fn l_depth_x100(tier: u8, l_launch_x100: u16) -> u16 {
+    match tier {
+        1 => 500,
+        2 => 1_000,
+        3 => 2_000,
+        _ => l_launch_x100,
+    }
+}
+
+/// `λ_depth` (bps): 1x at tiers 0 and 1, 2x at tier 2, 3x at tier 3.
+pub fn lambda_depth_bps(tier: u8) -> u32 {
+    match tier {
+        2 => 20_000,
+        3 => 30_000,
+        _ => DEFAULT_LAMBDA_BPS,
+    }
+}
+
+/// `κ_depth` (bps of the depth): 0.5 at tier 0, 1 at tiers 1 and 2, 2 at tier 3.
+pub fn kappa_depth_bps(tier: u8) -> u32 {
+    match tier {
+        1 | 2 => 10_000,
+        3 => 20_000,
+        _ => 5_000,
+    }
+}
+
+/// `λ_eff = min(stored λ, λ_depth(tier))`.
+pub fn lambda_eff_bps(stored_lambda_bps: u32, tier: u8) -> u32 {
+    let d = lambda_depth_bps(tier);
+    if stored_lambda_bps < d {
+        stored_lambda_bps
+    } else {
+        d
+    }
+}
+
+/// The depth capacity notional `floor(κ_depth · depth / 1e4)` (collateral atoms), or `None`
+/// when the effective depth is 0 (absent / stale: no depth cap, today's capacity). Never
+/// overflows (`u64 · 2e4 < 2^79`).
+pub fn depth_notional_cap_e6(tier: u8, effective_depth_e6: u64) -> Option<u128> {
+    if effective_depth_e6 == 0 {
+        return None;
+    }
+    Some((effective_depth_e6 as u128) * (kappa_depth_bps(tier) as u128) / BPS)
+}
+
+/// The depth cap on `N_cap` in engine Q: `floor(depth_notional * POS_SCALE / price)` (rounds
+/// DOWN, so `<= κ·depth/P`, I-D4), `u128::MAX` (no cap) when the depth is absent, and 0 (fail
+/// closed) on a zero price.
+pub fn depth_cap_q(tier: u8, effective_depth_e6: u64, price_e6: u64, pos_scale: u128) -> u128 {
+    match depth_notional_cap_e6(tier, effective_depth_e6) {
+        None => u128::MAX,
+        Some(nd) => n_cap_q(nd, DEFAULT_LAMBDA_BPS, price_e6, pos_scale).unwrap_or(0),
+    }
+}
+
+/// G8 `N_cap` (every reader: the post-fill gate, the TradeCpi open-room clip, the matcher ext
+/// v3 caps, the rent `N_cap` snapshot). Off a clamp-enforced market: EXACTLY growth-1's
+/// `n_cap_q(C_m, stored λ)` (depth is stored but never read there). On one:
+/// `min(n_cap_q(C_m, λ_eff), depth cap)`, the depth cap only while the depth is fresh.
+/// `None` (refuse crowd growth) exactly where `n_cap_q` is.
+pub fn n_cap_g8_q(
+    clamp: bool,
+    c_m: u128,
+    stored_lambda_bps: u32,
+    tier: u8,
+    effective_depth_e6: u64,
+    price_e6: u64,
+    pos_scale: u128,
+) -> Option<u128> {
+    if !clamp {
+        return n_cap_q(c_m, stored_lambda_bps, price_e6, pos_scale);
+    }
+    let n = n_cap_q(c_m, lambda_eff_bps(stored_lambda_bps, tier), price_e6, pos_scale)?;
+    let d = depth_cap_q(tier, effective_depth_e6, price_e6, pos_scale);
+    Some(if n < d { n } else { d })
+}
+
+/// G8 ext-v3 `(inventory_cap_q, liquidity_notional_e6)`. Off a clamp-enforced market, or with
+/// no fresh depth: `growth_matcher_caps` at the lambda `n_cap_g8_q` uses (byte-identical off
+/// the clamp). With a fresh depth: the cap is `min(N_cap(λ_eff), depth cap, engine limit)` and
+/// the liquidity is `DEPTH_MULT` times the SMALLER capacity notional, so the matcher's impact
+/// stays finite at the cap and `N_cap` stays the one binding number.
+#[allow(clippy::too_many_arguments)]
+pub fn growth_matcher_caps_g8(
+    hlock_active: bool,
+    clamp: bool,
+    c_m: u128,
+    stored_lambda_bps: u32,
+    tier: u8,
+    effective_depth_e6: u64,
+    price_e6: u64,
+    pos_scale: u128,
+    max_position_abs_q: u128,
+) -> (u128, u128) {
+    if !clamp {
+        return growth_matcher_caps(
+            hlock_active,
+            c_m,
+            stored_lambda_bps,
+            price_e6,
+            pos_scale,
+            max_position_abs_q,
+        );
+    }
+    let lam = lambda_eff_bps(stored_lambda_bps, tier);
+    let nd = match depth_notional_cap_e6(tier, effective_depth_e6) {
+        None => {
+            return growth_matcher_caps(hlock_active, c_m, lam, price_e6, pos_scale, max_position_abs_q)
+        }
+        Some(nd) => nd,
+    };
+    if hlock_active {
+        return (0, 0);
+    }
+    let cap = n_cap_g8_q(true, c_m, stored_lambda_bps, tier, effective_depth_e6, price_e6, pos_scale)
+        .unwrap_or(0);
+    let cap = if cap > max_position_abs_q {
+        max_position_abs_q
+    } else {
+        cap
+    };
+    if cap == 0 {
+        return (0, 0);
+    }
+    let liq_capital = liquidity_notional_e6(c_m, lam).unwrap_or(0);
+    let liq_depth = nd.saturating_mul(DEPTH_MULT);
+    (cap, if liq_capital < liq_depth { liq_capital } else { liq_depth })
+}
+
+// ── v2.2 growth overnight §1.2: ceiling target, force-down, ratchet ────────────────────────
+
+/// The live ceiling target (x100):
+/// ```text
+/// graduation on, no force-down: min(L_tier, max(L_launch, min(L_depth, L_launch + steps·1x)))
+/// otherwise:                    min(L_launch, L_tier)
+/// ```
+/// `steps = floor(log2(C_m / C_launch))` (0 when `C_launch == 0` or `C_m < C_launch`), via
+/// `graduated_ceiling_x100`. Never above `L_tier` or `max(launch, L_depth)` (I-D2), never below
+/// the launch ceiling. `force_down`: a senior draw / backstop outstanding, the bankruptcy h-lock
+/// latched, or ADL on either side.
+pub fn target_ceiling_x100(
+    graduation: bool,
+    force_down: bool,
+    l_launch_x100: u16,
+    l_tier_x100: u16,
+    l_depth_x100: u16,
+    c_m: u128,
+    c_launch: u128,
+) -> u16 {
+    let launch = if l_launch_x100 < l_tier_x100 {
+        l_launch_x100
+    } else {
+        l_tier_x100
+    };
+    if !graduation || force_down {
+        return launch;
+    }
+    // min(L_tier, launch + steps), == launch with no launch capital.
+    let stepped = graduated_ceiling_x100(true, l_launch_x100, l_tier_x100, c_m, c_launch);
+    let capped = if l_depth_x100 < stepped {
+        l_depth_x100
+    } else {
+        stepped
+    };
+    if capped > launch {
+        capped
+    } else {
+        launch
+    }
+}
+
+/// The ceiling the gate applies (x100). Off a clamp-enforced market: `min(L_launch, L_tier)`,
+/// exactly growth-1 (off-band identity). On one: `min(stored ratcheted ceil, live target)`, so
+/// it is never looser than the target now (a stale stored ceiling cannot outlive the depth,
+/// capital or force-down that justified it).
+pub fn ceiling_in_force_x100(
+    clamp: bool,
+    stored_ceil_x100: u16,
+    target_x100: u16,
+    l_launch_x100: u16,
+    l_tier_x100: u16,
+) -> u16 {
+    if !clamp {
+        return if l_launch_x100 < l_tier_x100 {
+            l_launch_x100
+        } else {
+            l_tier_x100
+        };
+    }
+    if stored_ceil_x100 < target_x100 {
+        stored_ceil_x100
+    } else {
+        target_x100
+    }
+}
+
+/// The ratchet WRITER at a site with the bound vault LP's `C_m` in hand (clamp-enforced markets
+/// only). Returns `(ceil_x100, ceil_slot, c_launch_atoms)`:
+/// * `c_launch == 0` (never recorded, or reset by I-1): snapshot `c_launch_atoms_for(C_m)` when
+///   `C_m > 0`, and the ceiling does NOT climb in this call (target = launch);
+/// * otherwise ratchet toward `target_ceiling_x100` (falls at once, rises <= +1x per epoch).
+#[allow(clippy::too_many_arguments)]
+pub fn graduation_ratchet(
+    prev_ceil_x100: u16,
+    prev_slot: u64,
+    c_launch_atoms: u64,
+    c_m: u128,
+    graduation: bool,
+    force_down: bool,
+    l_launch_x100: u16,
+    l_tier_x100: u16,
+    l_depth_x100: u16,
+    now_slot: u64,
+) -> (u16, u64, u64) {
+    let launch = if l_launch_x100 < l_tier_x100 {
+        l_launch_x100
+    } else {
+        l_tier_x100
+    };
+    if c_launch_atoms == 0 {
+        let c_launch = if c_m > 0 {
+            u64::try_from(c_launch_atoms_for(c_m)).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, launch, launch, force_down, now_slot);
+        return (c, s, c_launch);
+    }
+    let target = target_ceiling_x100(
+        graduation,
+        force_down,
+        l_launch_x100,
+        l_tier_x100,
+        l_depth_x100,
+        c_m,
+        c_launch_atoms as u128,
+    );
+    let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, target, launch, force_down, now_slot);
+    (c, s, c_launch_atoms)
+}
+
+/// The FALL-ONLY ratchet (PushAuthMark: the depth changed but no `C_m` is in hand). The upper
+/// bound is the target at unbounded capital, so the stored ceiling only ever falls here (at
+/// once, stamped `now`); it never rises without the LP's equity.
+#[allow(clippy::too_many_arguments)]
+pub fn graduation_fall_only(
+    prev_ceil_x100: u16,
+    prev_slot: u64,
+    c_launch_atoms: u64,
+    graduation: bool,
+    force_down: bool,
+    l_launch_x100: u16,
+    l_tier_x100: u16,
+    l_depth_x100: u16,
+    now_slot: u64,
+) -> (u16, u64) {
+    let upper = target_ceiling_x100(
+        graduation,
+        force_down,
+        l_launch_x100,
+        l_tier_x100,
+        l_depth_x100,
+        u128::MAX,
+        c_launch_atoms as u128,
+    );
+    if upper < prev_ceil_x100 {
+        (upper, now_slot)
+    } else {
+        (prev_ceil_x100, prev_slot)
+    }
+}
+
 /// v2.2 item 2: on a rent market the one-time utilisation toll is only an ENTRY floor (a
 /// one-slot flash lock pays no rent), 25 bps at `u = 1` instead of 500 (closes N-2: rent, not
 /// a toll, prices a held lock-out).
@@ -959,6 +1343,7 @@ pub fn util_fee_max_effective_bps_for(stored_bps: u16, rent_on: bool) -> u16 {
 
 /// UA dial bounds for the utilisation fee: tighten-only from the default off-band without
 /// rent; down to the rent entry floor on a rent market; down to 0 on a band market.
+/// v2.2 growth overnight §1.1: `band_on` is the per-market CLAMP predicate (`clamp_enforced`).
 pub fn util_fee_dial_ok_for(band_on: bool, rent_on: bool, util_max_bps: u16) -> bool {
     let lo = if band_on {
         0
@@ -1332,6 +1717,7 @@ mod tests {
             kink_bps: 5_000,
             crowd_blocked: false,
             asset_bound: true,
+            depth_cap_q: u128::MAX,
         }
     }
 
@@ -1457,6 +1843,136 @@ mod tests {
     }
 
     #[test]
+    fn i1_graduation_reset_postconditions() {
+        let r = graduation_reset(550, 1_000, 77);
+        assert_eq!(
+            r,
+            GraduationFields {
+                c_launch_atoms: 0,
+                ceil_x100: 550,
+                ceil_slot: 77,
+                ..Default::default()
+            }
+        );
+        assert_eq!(graduation_reset(1_200, 1_000, 5).ceil_x100, 1_000, "launch above tier clamps");
+    }
+
+    #[test]
+    fn g8_flags_on_and_clamp_predicate() {
+        assert!(GRADUATION_ENABLED && EPOCH_CLAMP_ENFORCED);
+        // band on AND r_gap == G(d); every mismatch fails closed
+        assert!(clamp_enforced(130, 397, Some(397)));
+        assert!(!clamp_enforced(0, 397, Some(397)), "off-band");
+        assert!(!clamp_enforced(130, 400, Some(397)), "stored r_gap from another rule");
+        assert!(!clamp_enforced(130, 397, None), "underivable G");
+        assert!(graduation_on(true, 130, 1));
+        assert!(!graduation_on(false, 130, 1), "no clamp, no graduation");
+        assert!(!graduation_on(true, 130, 0), "tier 0 (absent depth), no graduation");
+    }
+
+    #[test]
+    fn g8_effective_depth_and_tiers() {
+        let t1 = DEPTH_TIER1_E6;
+        // min of the two reads; absent if either is 0
+        assert_eq!(effective_depth_e6(5 * t1, 2 * t1, 100, 100), 2 * t1);
+        assert_eq!(effective_depth_e6(5 * t1, 0, 100, 100), 0, "first push: prev 0");
+        assert_eq!(effective_depth_e6(0, 5 * t1, 100, 100), 0, "35 B push zeroes");
+        // freshness: <= 150 slots fresh, 151 stale, a future stamp is stale (fail closed)
+        assert_eq!(effective_depth_e6(t1, t1, 100, 250), t1);
+        assert_eq!(effective_depth_e6(t1, t1, 100, 251), 0);
+        assert_eq!(effective_depth_e6(t1, t1, 101, 100), 0);
+        // tiers; attested capped at 1, any other source 0
+        assert_eq!(depth_tier(t1 - 1, DEPTH_SOURCE_ATTESTED), 0);
+        assert_eq!(depth_tier(t1, DEPTH_SOURCE_ATTESTED), 1);
+        assert_eq!(depth_tier(DEPTH_TIER3_E6, DEPTH_SOURCE_ATTESTED), 1, "I-D3");
+        assert_eq!(depth_tier(DEPTH_TIER3_E6, DEPTH_SOURCE_NONE), 0);
+        assert_eq!(depth_tier(DEPTH_TIER3_E6, 2), 0, "unbuilt on-chain source: fail closed");
+        assert_eq!((l_depth_x100(0, 300), l_depth_x100(1, 300), l_depth_x100(2, 300), l_depth_x100(3, 300)), (300, 500, 1_000, 2_000));
+        assert_eq!((lambda_depth_bps(0), lambda_depth_bps(1), lambda_depth_bps(2), lambda_depth_bps(3)), (10_000, 10_000, 20_000, 30_000));
+        assert_eq!((kappa_depth_bps(0), kappa_depth_bps(1), kappa_depth_bps(2), kappa_depth_bps(3)), (5_000, 10_000, 10_000, 20_000));
+        assert_eq!(lambda_eff_bps(30_000, 1), 10_000);
+        assert_eq!(lambda_eff_bps(5_000, 3), 5_000);
+    }
+
+    #[test]
+    fn g8_n_cap_depth_cap_only_when_fresh_and_identity_off_clamp() {
+        let c_m = 1_000_000_000u128; // $1,000
+        // off the clamp: n_cap_q with the STORED lambda, depth ignored entirely
+        for (lam, d) in [(10_000u32, 0u64), (30_000, 1), (10_000, DEPTH_TIER1_E6)] {
+            assert_eq!(n_cap_g8_q(false, c_m, lam, 1, d, 1_000_000, PS), n_cap_q(c_m, lam, 1_000_000, PS));
+            assert_eq!(
+                growth_matcher_caps_g8(false, false, c_m, lam, 1, d, 1_000_000, PS, u128::MAX),
+                growth_matcher_caps(false, c_m, lam, 1_000_000, PS, u128::MAX)
+            );
+        }
+        // on the clamp, no fresh depth: n_cap at λ_eff (a stored 3x reads 1x at tier 0/1)
+        assert_eq!(n_cap_g8_q(true, c_m, 30_000, 0, 0, 1_000_000, PS), n_cap_q(c_m, 10_000, 1_000_000, PS));
+        // fresh depth $100 at tier 0 (κ 0.5): cap = $50 of notional, below the capital's $1,000
+        assert_eq!(n_cap_g8_q(true, c_m, 10_000, 0, 100_000_000, 1_000_000, PS), Some(50_000_000));
+        assert_eq!(depth_cap_q(0, 0, 1_000_000, PS), u128::MAX, "absent: no cap");
+        assert_eq!(depth_cap_q(1, 100_000_000, 0, PS), 0, "price 0: fail closed");
+        // matcher: cap and liquidity follow the binding (depth) notional, x DEPTH_MULT
+        assert_eq!(
+            growth_matcher_caps_g8(false, true, c_m, 10_000, 0, 100_000_000, 1_000_000, PS, u128::MAX),
+            (50_000_000, 200_000_000)
+        );
+        assert_eq!(
+            growth_matcher_caps_g8(true, true, c_m, 10_000, 0, 100_000_000, 1_000_000, PS, u128::MAX),
+            (0, 0),
+            "h-lock closes"
+        );
+        // the gate uses the same number
+        let mut g = base_in();
+        g.depth_cap_q = 50 * PS; // 50 units, the taker opens 100
+        assert_eq!(growth_gate(&g), GrowthVerdict::CapacityFull);
+        g.depth_cap_q = 100 * PS; // u == 1 exactly: admitted only at 100% IMR (Q3)
+        assert_eq!(growth_gate(&g), GrowthVerdict::LeverageExceeded);
+        g.depth_cap_q = 200 * PS; // u = 50% <= kink: the ceiling only
+        assert_eq!(growth_gate(&g), GrowthVerdict::Allow);
+    }
+
+    #[test]
+    fn g8_target_ceiling_ratchet_and_force_down() {
+        let cl = 1_000u128;
+        // off graduation / forced: launch
+        assert_eq!(target_ceiling_x100(false, false, 300, 1_000, 500, 1 << 40, cl), 300);
+        assert_eq!(target_ceiling_x100(true, true, 300, 1_000, 500, 1 << 40, cl), 300);
+        // capital doubling twice -> launch + 2x, capped by L_depth (5x at tier 1)
+        assert_eq!(target_ceiling_x100(true, false, 300, 1_000, 500, 4_000, cl), 500);
+        assert_eq!(target_ceiling_x100(true, false, 300, 1_000, 500, 2_000, cl), 400);
+        assert_eq!(target_ceiling_x100(true, false, 300, 1_000, 2_000, 1 << 40, cl), 1_000, "L_tier");
+        assert_eq!(target_ceiling_x100(true, false, 800, 1_000, 500, 1 << 40, cl), 800, "never below launch");
+        assert_eq!(target_ceiling_x100(true, false, 300, 1_000, 500, 1 << 40, 0), 300, "no C_launch");
+        // ceiling in force: off clamp == launch whatever is stored
+        assert_eq!(ceiling_in_force_x100(false, 900, 900, 300, 1_000), 300);
+        assert_eq!(ceiling_in_force_x100(true, 900, 400, 300, 1_000), 400);
+        assert_eq!(ceiling_in_force_x100(true, 400, 900, 300, 1_000), 400);
+        // ratchet writer: c_launch snapshot, no climb in that call
+        assert_eq!(
+            graduation_ratchet(300, 0, 0, 5_000_000_000, true, false, 300, 1_000, 500, 50_000),
+            (300, 0, 5_000_000_000)
+        );
+        assert_eq!(
+            graduation_ratchet(300, 0, 0, 1, true, false, 300, 1_000, 500, 50_000),
+            (300, 0, MIN_C_LAUNCH_ATOMS as u64),
+            "floored snapshot"
+        );
+        // +1x per 9,000 slots, falls at once, unchanged keeps its stamp
+        let c = 1_000_000_000u64;
+        let cm = 8 * c as u128; // 3 doublings
+        assert_eq!(graduation_ratchet(300, 0, c, cm, true, false, 300, 1_000, 500, 8_999), (300, 0, c));
+        assert_eq!(graduation_ratchet(300, 0, c, cm, true, false, 300, 1_000, 500, 9_000), (400, 9_000, c));
+        assert_eq!(graduation_ratchet(400, 9_000, c, cm, true, false, 300, 1_000, 500, 18_000), (500, 18_000, c));
+        assert_eq!(graduation_ratchet(500, 18_000, c, cm, true, false, 300, 1_000, 500, 40_000), (500, 18_000, c), "at target: stamp kept");
+        assert_eq!(graduation_ratchet(500, 18_000, c, cm, false, false, 300, 1_000, 300, 40_001), (300, 40_001, c), "depth gone: falls at once");
+        assert_eq!(graduation_ratchet(500, 18_000, c, cm, true, true, 300, 1_000, 500, 40_001), (300, 40_001, c), "force-down");
+        // fall-only (push): never rises
+        assert_eq!(graduation_fall_only(300, 7, c, true, false, 300, 1_000, 500, 99), (300, 7));
+        assert_eq!(graduation_fall_only(500, 7, c, false, false, 300, 1_000, 300, 99), (300, 99));
+        assert_eq!(graduation_fall_only(500, 7, c, true, false, 300, 1_000, 400, 99), (400, 99));
+    }
+
+    #[test]
     fn m1_mid_and_counterparty() {
         // strict close of a short 100: the LP goes from -900 to -1000 (the close grows |LP|)
         assert_eq!(lp_mid_q(-900, -100, 0), Some(-1_000));
@@ -1493,6 +2009,7 @@ mod tests {
             kink_bps: 5_000,
             crowd_blocked: false,
             asset_bound: true,
+            depth_cap_q: u128::MAX,
         };
         assert_eq!(
             growth_gate(&g),
@@ -1720,6 +2237,7 @@ mod tests {
             kink_bps: 5_000,
             crowd_blocked: false,
             asset_bound: true,
+            depth_cap_q: u128::MAX,
         };
         growth_gate(&g) == GrowthVerdict::Allow
     }
