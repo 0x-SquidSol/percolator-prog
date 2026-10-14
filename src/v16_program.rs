@@ -47941,7 +47941,7 @@ mod g8_kani_proofs {
     /// Mutants: `max` for the depth `min`; step 200; `now > prev_slot` without the epoch;
     /// climbing in the snapshot call; fall-only writer using `max`.
     #[kani::proof]
-    #[kani::unwind(18)]
+    #[kani::unwind(20)] // u16 c_m: <= 17 doublings + the exit test (18 was one short: unwinding-assertion FAIL, run 2026-10-14)
     #[kani::solver(cadical)]
     fn kani_g8_ceiling_min_chain_and_ratchet() {
         let grad: bool = kani::any();
