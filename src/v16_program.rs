@@ -27950,7 +27950,7 @@ pub mod processor {
             Some((growth_v19::DEPTH_MODE_ATTESTED, d)) => (growth_v19::DEPTH_SOURCE_ATTESTED, d),
             // Mode 2: `d` here is the depth the PROGRAM computed from the pinned pool
             // (`handle_push_auth_mark` replaced the wire's 0 after the pin check).
-            Some((growth_v19::DEPTH_MODE_DEX, d)) => (growth_v19::DEPTH_SOURCE_DEX, d),
+            Some((growth_v19::DEPTH_SOURCE_DEX, d)) => (growth_v19::DEPTH_SOURCE_DEX, d),
             Some((growth_v19::DEPTH_MODE_NONE, 0)) | None => (growth_v19::DEPTH_SOURCE_NONE, 0),
             // The decoder admits nothing else; refuse rather than store an unknown source.
             Some(_) => return Err(PercolatorError::DepthInputInvalid.into()),
@@ -28180,8 +28180,9 @@ pub mod processor {
             }
             // Mode 2: the program's own depth replaces the wire's 0 (computed before any write).
             let depth = match dex {
+                // Same tuple the tiers branch's writer expects: (DEPTH_SOURCE_DEX = 2, depth).
                 Some(r) => Some((
-                    growth_v19::DEPTH_MODE_DEX,
+                    growth_v19::DEPTH_SOURCE_DEX,
                     dex_depth_e6(
                         &r,
                         &cfg.collateral_mint,

@@ -845,7 +845,7 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
 
     env.warp(2);
     let dex = env.dex_accounts(chill());
-    env.push(2, 0, &dex).expect("mode 2 push");
+    let cu_dex = env.push(2, 0, &dex).expect("mode 2 push");
     let g = env.growth();
     assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (2_027_034_782, 0, growth_v19::DEPTH_SOURCE_DEX));
     assert_eq!(g.depth_slot, env.slot);
@@ -857,9 +857,13 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
     assert_eq!(growth_v19::effective_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, env.slot), 2_027_034_782);
     // 35 B afterwards: as today (zeroes, prev keeps the last depth, source 0)
     env.warp(1);
-    env.push(255, 0, &[]).expect("35 B push");
+    let cu_35 = env.push(255, 0, &[]).expect("35 B push");
     let g = env.growth();
     assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 2_027_034_782, 0));
+    // CU: mode 2 costs the four account reads, the pin check, the isqrt and one log line on
+    // top of the 35 B push (incl. the transaction's compute-budget instruction).
+    eprintln!("CU mode2={cu_dex} 35B={cu_35} delta={}", cu_dex.saturating_sub(cu_35));
+    assert!(cu_dex < cu_35 + 40_000, "mode 2 overhead bounded: {cu_dex} vs {cu_35}");
     // mode 1 still attested
     env.warp(1);
     env.push(1, 30_000_000_000, &[]).expect("mode 1 push");
