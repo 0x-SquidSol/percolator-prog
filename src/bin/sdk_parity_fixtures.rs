@@ -110,7 +110,8 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::ConfigureEwmaMark { .. } => "ConfigureEwmaMark",
         Instruction::PushEwmaMark { .. } => "PushEwmaMark",
         Instruction::ConfigureAuthMark { .. } => "ConfigureAuthMark",
-        Instruction::PushAuthMark { .. } => "PushAuthMark",
+        // G8: the 44-byte depth form is the same tag 63, same name.
+        Instruction::PushAuthMark { .. } | Instruction::PushAuthMarkDepth { .. } => "PushAuthMark",
         Instruction::ForceCloseAbandonedAsset { .. } => "ForceCloseAbandonedAsset",
         Instruction::RestartAssetOracle { .. } => "RestartAssetOracle",
         Instruction::UpdateAssetLifecycle { .. } => "UpdateAssetLifecycle",

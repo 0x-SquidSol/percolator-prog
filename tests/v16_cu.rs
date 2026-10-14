@@ -26209,9 +26209,15 @@ fn i1_seed_stale_growth(env: &mut V16CuEnv, asset_index: usize) -> state::AssetG
     g
 }
 
-/// The old market's depth fields (G8). All-zero until the depth writer lands.
+/// The old market's G8 depth: tier-1 attested depth in both reads, stamped at slot 4.
 fn i1_stale_depth() -> state::AssetGrowthV19 {
-    state::AssetGrowthV19::default()
+    state::AssetGrowthV19 {
+        depth_e6: 30_000_000_000,
+        depth_slot: 4,
+        depth_prev_e6: 30_000_000_000,
+        depth_source: percolator_prog::growth_v19::DEPTH_SOURCE_ATTESTED,
+        ..Default::default()
+    }
 }
 
 /// I-1: everything but the graduation fields is the market's configuration and survives; the

@@ -1250,7 +1250,14 @@ pub fn graduation_ratchet(
         } else {
             0
         };
-        let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, launch, launch, force_down, now_slot);
+        // No climb in this call, not even toward launch from a ceiling below it: the target is
+        // min(prev, launch), so the ceiling can only fall (to launch) or stay.
+        let hold = if launch < prev_ceil_x100 {
+            launch
+        } else {
+            prev_ceil_x100
+        };
+        let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, hold, launch, force_down, now_slot);
         return (c, s, c_launch);
     }
     let target = target_ceiling_x100(

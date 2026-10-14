@@ -1853,7 +1853,16 @@ VaultLpMultiAssetMarket,
         /// NoCpi) that would exceed the per-portfolio position cap. Custom(127). SDK agent: add
         /// `CounterpartyPositionCapReached = 127`.
         CounterpartyPositionCapReached = 127,
+        // ── v2.2 growth overnight §1.3 (G8): depth input ────────────────────
+        // Explicit discriminant; appended after CounterpartyPositionCapReached (127). Do NOT
+        // renumber.
+        /// PushAuthMark's 44-byte form carried an invalid depth: a `depth_mode` other than
+        /// 0 (none) or 1 (keeper-attested), or mode 0 with a non-zero `depth_e6`. Custom(128).
+        /// Keeper: send mode 1 with the attested ±2% depth, or the 35-byte form for no depth.
+        /// SDK agent: add `DepthInputInvalid = 128`.
+        DepthInputInvalid = 128,
     }
+    const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
     const _: () = assert!(PercolatorError::PositionCapReached as u32 == 126);
     const _: () = assert!(PercolatorError::CounterpartyPositionCapReached as u32 == 127);
     const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
@@ -1871,7 +1880,7 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::InsuranceBackstopRefused as u32 == 116);
     /// v2.2 combined release: every error code of the Phase 2b / v2.2 block, pinned DISTINCT at
     /// compile time (rustc also rejects duplicate enum discriminants; this keeps the claim visible).
-    const V22_ERROR_CODES: [u32; 27] = [
+    const V22_ERROR_CODES: [u32; 30] = [
         PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32,
         PercolatorError::VaultLpAllocateRefused as u32,
         101, 102, 103,
@@ -1895,6 +1904,9 @@ VaultLpMultiAssetMarket,
         PercolatorError::BondDepositAboveCap as u32,
         PercolatorError::BondSlippage as u32,
         PercolatorError::G9AllowlistTimelock as u32,
+        PercolatorError::PositionCapReached as u32,
+        PercolatorError::CounterpartyPositionCapReached as u32,
+        PercolatorError::DepthInputInvalid as u32,
     ];
     const fn all_distinct_u32(a: &[u32]) -> bool {
         let mut i = 0;
@@ -7645,11 +7657,8 @@ pub mod state {
         if g.version != crate::growth_v19::GROWTH_VERSION
             || g.flags != 0
             || g._reserved0 != [0u8; 3]
-            // G8 depth bytes: zero until the depth writer lands (§1.3).
-            || g.depth_source != 0
-            || g.depth_e6 != 0
-            || g.depth_slot != 0
-            || g.depth_prev_e6 != 0
+            // G8 (§1.3): the depth bytes 44 and 56..80 carry data; only the two known sources.
+            || g.depth_source > crate::growth_v19::DEPTH_SOURCE_ATTESTED
             || g.rent_kink_bps as u128 > crate::growth_v19::BPS
             || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
             || g._reserved1 != [0u8; 24]
@@ -8421,6 +8430,19 @@ pub mod ix {
             now_slot: u64,
             mark_e6: u64,
             observation_sequence: u64,
+        },
+        /// v2.2 growth overnight §1.3 (G8): tag 63's 44-byte form, the 35-byte body plus
+        /// `[depth_mode u8][depth_e6 u64]`. Same tag, same accounts, same signer. `depth_mode`
+        /// is 0 (none: `depth_e6` must be 0) or 1 (keeper-attested); the decoder refuses any
+        /// other value with `DepthInputInvalid` (128).
+        PushAuthMarkDepth {
+            asset_index: u16,
+            market_id: u64,
+            now_slot: u64,
+            mark_e6: u64,
+            observation_sequence: u64,
+            depth_mode: u8,
+            depth_e6: u64,
         },
         ForceCloseAbandonedAsset {
             asset_index: u16,
@@ -9405,13 +9427,41 @@ pub mod ix {
                     initial_mark_e6: read_u64(&mut rest)?,
                     observation_sequence: read_u64(&mut rest)?,
                 },
-                63 => Self::PushAuthMark {
-                    asset_index: read_u16(&mut rest)?,
-                    market_id: read_u64(&mut rest)?,
-                    now_slot: read_u64(&mut rest)?,
-                    mark_e6: read_u64(&mut rest)?,
-                    observation_sequence: read_u64(&mut rest)?,
-                },
+                63 => {
+                    let asset_index = read_u16(&mut rest)?;
+                    let market_id = read_u64(&mut rest)?;
+                    let now_slot = read_u64(&mut rest)?;
+                    let mark_e6 = read_u64(&mut rest)?;
+                    let observation_sequence = read_u64(&mut rest)?;
+                    if rest.is_empty() {
+                        Self::PushAuthMark {
+                            asset_index,
+                            market_id,
+                            now_slot,
+                            mark_e6,
+                            observation_sequence,
+                        }
+                    } else {
+                        // G8: the 44-byte form (any other length fails the reads or the
+                        // trailing-bytes check below with InvalidInstructionData).
+                        let depth_mode = read_u8(&mut rest)?;
+                        let depth_e6 = read_u64(&mut rest)?;
+                        if depth_mode > crate::growth_v19::DEPTH_MODE_ATTESTED
+                            || (depth_mode == crate::growth_v19::DEPTH_MODE_NONE && depth_e6 != 0)
+                        {
+                            return Err(crate::error::PercolatorError::DepthInputInvalid.into());
+                        }
+                        Self::PushAuthMarkDepth {
+                            asset_index,
+                            market_id,
+                            now_slot,
+                            mark_e6,
+                            observation_sequence,
+                            depth_mode,
+                            depth_e6,
+                        }
+                    }
+                }
                 64 => Self::ForceCloseAbandonedAsset {
                     asset_index: read_u16(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
@@ -10417,6 +10467,24 @@ pub mod ix {
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, mark_e6);
                     push_u64(&mut out, observation_sequence);
+                }
+                Self::PushAuthMarkDepth {
+                    asset_index,
+                    market_id,
+                    now_slot,
+                    mark_e6,
+                    observation_sequence,
+                    depth_mode,
+                    depth_e6,
+                } => {
+                    out.push(63);
+                    push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
+                    push_u64(&mut out, now_slot);
+                    push_u64(&mut out, mark_e6);
+                    push_u64(&mut out, observation_sequence);
+                    out.push(depth_mode);
+                    push_u64(&mut out, depth_e6);
                 }
                 Self::ForceCloseAbandonedAsset {
                     asset_index,
@@ -12895,6 +12963,7 @@ pub mod lag_policy {
             Instruction::PushEwmaMark { .. } => entry("PushEwmaMark", LagPolicy::MarkFree, "moves the TARGET, never a payout"),
             Instruction::ConfigureAuthMark { .. } => entry("ConfigureAuthMark", LagPolicy::MarkFree, "oracle config"),
             Instruction::PushAuthMark { .. } => entry("PushAuthMark", LagPolicy::MarkFree, "moves the TARGET, never a payout"),
+            Instruction::PushAuthMarkDepth { .. } => entry("PushAuthMarkDepth", LagPolicy::MarkFree, "moves the TARGET and the G8 depth, never a payout"),
             Instruction::ForceCloseAbandonedAsset { .. } => entry("ForceCloseAbandonedAsset", LagPolicy::MarkDriven, "abandoned-asset close at P_last by design"),
             Instruction::RestartAssetOracle { .. } => entry("RestartAssetOracle", LagPolicy::MarkDriven, "re-arms the oracle (the band re-initialises at the restart price)"),
             Instruction::UpdateAssetLifecycle { .. } => entry("UpdateAssetLifecycle", LagPolicy::MarkFree, "lifecycle dial"),
@@ -15152,6 +15221,25 @@ pub mod processor {
                 now_slot,
                 mark_e6,
                 observation_sequence,
+                None,
+            ),
+            Instruction::PushAuthMarkDepth {
+                asset_index,
+                market_id,
+                now_slot,
+                mark_e6,
+                observation_sequence,
+                depth_mode,
+                depth_e6,
+            } => handle_push_auth_mark(
+                program_id,
+                accounts,
+                asset_index,
+                market_id,
+                now_slot,
+                mark_e6,
+                observation_sequence,
+                Some((depth_mode, depth_e6)),
             ),
             Instruction::ForceCloseAbandonedAsset {
                 asset_index,
@@ -27620,7 +27708,68 @@ pub mod processor {
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)
     }
 
+    /// G8 depth writer (PushAuthMark, both forms). Growth OFF on the asset (version byte 0):
+    /// returns without reading or writing anything else. Otherwise the previous `depth_e6` moves
+    /// to `depth_prev_e6`, the new depth (0 for the 35-byte form or mode 0) and its source are
+    /// stored, stamped `authenticated_slot`; then, on a clamp-enforced market, the ceiling is
+    /// ratcheted FALL-ONLY (`growth_v19::graduation_fall_only`: no `C_m` is in hand here, so it
+    /// may only fall to the new depth's bound or to launch on a force-down).
     #[inline(never)]
+    fn push_auth_mark_depth_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        depth: Option<(u8, u64)>,
+        authenticated_slot: u64,
+    ) -> ProgramResult {
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let Some(mut g) = state::asset_growth_from_wrapper_bytes(
+            &group
+                .markets
+                .get(asset_index)
+                .ok_or(PercolatorError::InvalidInstruction)?
+                .wrapper[..],
+            engine_imr,
+        )?
+        else {
+            return Ok(());
+        };
+        let (source, depth_e6) = match depth {
+            Some((growth_v19::DEPTH_MODE_ATTESTED, d)) => (growth_v19::DEPTH_SOURCE_ATTESTED, d),
+            Some((growth_v19::DEPTH_MODE_NONE, 0)) | None => (growth_v19::DEPTH_SOURCE_NONE, 0),
+            // The decoder admits nothing else; refuse rather than store an unknown source.
+            Some(_) => return Err(PercolatorError::DepthInputInvalid.into()),
+        };
+        g.depth_prev_e6 = g.depth_e6;
+        g.depth_e6 = depth_e6;
+        g.depth_source = source;
+        g.depth_slot = authenticated_slot;
+        let ctx = growth_g8_ctx_view(group, asset_index, &g)?;
+        if ctx.clamp {
+            let (ceil, slot) = growth_v19::graduation_fall_only(
+                g.ceil_x100,
+                g.ceil_slot,
+                g.c_launch_atoms,
+                ctx.graduation,
+                ctx.force_down,
+                g.l_launch_x100,
+                g.l_tier_x100,
+                growth_v19::l_depth_x100(ctx.tier, g.l_launch_x100),
+                ctx.now,
+            );
+            g.ceil_x100 = ceil;
+            g.ceil_slot = slot;
+        }
+        let market = group
+            .markets
+            .get_mut(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)
+    }
+
+    /// `depth`: `None` for the 35-byte form (zeroes the stored depth), `Some((mode, depth_e6))`
+    /// for the 44-byte form (decoder-validated: mode 0 with depth 0, or mode 1).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn handle_push_auth_mark<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -27629,6 +27778,7 @@ pub mod processor {
         now_slot: u64,
         mark_e6: u64,
         observation_sequence: u64,
+        depth: Option<(u8, u64)>,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -27689,6 +27839,9 @@ pub mod processor {
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
+            // v2.2 growth overnight §1.3 (G8): record the depth on a growth asset (a 35-byte
+            // push zeroes it). Growth OFF: nothing is written (the record stays all-zero).
+            push_auth_mark_depth_view(&mut group, asset_index_usize, depth, authenticated_slot)?;
             if asset_index_usize == 0 {
                 // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
                 // write to asset 0 keeps a non-base refresh from masking base hard-stale
@@ -47516,3 +47669,4 @@ mod p1_position_cap_kani_proofs {
         kani::cover!(opened == usize::MAX && active == usize::MAX, "saturating add reached");
     }
 }
+
