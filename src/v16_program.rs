@@ -3404,6 +3404,23 @@ pub mod state {
         asset_growth_from_wrapper_bytes(wrapper, engine_imr_bps)
     }
 
+    /// growth-v19: write asset `asset_index`'s growth record into a market account (validated,
+    /// like every writer). Test / tooling helper; handlers write through the market view.
+    pub fn write_asset_growth(
+        data: &mut [u8],
+        asset_index: usize,
+        g: &AssetGrowthV19,
+        engine_imr_bps: u64,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = asset_growth_range(data, asset_index)?;
+        let start = range.start - crate::constants::ASSET_GROWTH_OFF;
+        let wrapper = data
+            .get_mut(start..range.end)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        asset_growth_to_wrapper_bytes(wrapper, g, engine_imr_bps)
+    }
+
     pub fn write_asset_risk_limits(
         data: &mut [u8],
         asset_index: usize,
@@ -7528,14 +7545,24 @@ pub mod state {
         /// it and climbs to the engine's `rent_max_e9_per_slot` at `u = 1`. 0 with
         /// `rent_max == 0` on a market without rent.
         pub rent_kink_bps: u16, // 42..44
-        pub _reserved0: [u8; 4], // 44..48
+        /// v2.2 growth overnight §1.3 (G8): where the stored depth came from. 0 = none (a 35 B
+        /// push, or never pushed), 1 = keeper-attested (capped at tier 1, I-D3). Nothing else is
+        /// accepted until an on-chain pool reader exists.
+        pub depth_source: u8, // 44
+        pub _reserved0: [u8; 3], // 45..48
         /// v2.2 item 2: snapshot of the bound vault LP's `N_cap` (engine Q, clamped to the
         /// engine position limit), refreshed wherever the LP's equity is in hand (post-fill,
         /// tags 78 / 103 / 106, bind). The rent rate's denominator at every accrual, so a
         /// crank needs no extra account. 0 = not measured yet (rent rate 0).
         pub rent_n_cap_q: u64, // 48..56
-        pub _reserved0b: [u8; 16], // 56..72
-        pub _reserved1: [u8; 32],    // 72..104
+        /// G8: the last pushed ±2% depth (collateral atoms, e6 USD at 6 decimals); 0 = absent.
+        pub depth_e6: u64, // 56..64
+        /// G8: the authenticated slot of the last PushAuthMark (35 B or 44 B) on this asset.
+        pub depth_slot: u64, // 64..72
+        /// G8: the depth of the push BEFORE the last one. The effective depth is
+        /// `min(depth_e6, depth_prev_e6)`, so a one-push spike buys nothing.
+        pub depth_prev_e6: u64, // 72..80
+        pub _reserved1: [u8; 24],    // 80..104
         pub _reserved2: [u8; 16],    // 104..120
     }
     const _: () =
@@ -7544,6 +7571,60 @@ pub mod state {
     pub const ASSET_GROWTH_VERSION_FIELD_OFF: usize = 38;
     const _: () =
         assert!(core::mem::offset_of!(AssetGrowthV19, version) == ASSET_GROWTH_VERSION_FIELD_OFF);
+    // v2.2 growth overnight §1.6 allocation claims: the G8 depth bytes (SDK mirrors these).
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_source) == 44);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, rent_n_cap_q) == 48);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_e6) == 56);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_slot) == 64);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_prev_e6) == 72);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, _reserved1) == 80);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, _reserved2) == 104);
+
+    impl AssetGrowthV19 {
+        /// The graduation / depth fields (`growth_v19::GraduationFields`).
+        pub fn graduation(&self) -> crate::growth_v19::GraduationFields {
+            crate::growth_v19::GraduationFields {
+                c_launch_atoms: self.c_launch_atoms,
+                ceil_x100: self.ceil_x100,
+                ceil_slot: self.ceil_slot,
+                depth_e6: self.depth_e6,
+                depth_slot: self.depth_slot,
+                depth_prev_e6: self.depth_prev_e6,
+                depth_source: self.depth_source,
+            }
+        }
+
+        pub fn set_graduation(&mut self, f: crate::growth_v19::GraduationFields) {
+            self.c_launch_atoms = f.c_launch_atoms;
+            self.ceil_x100 = f.ceil_x100;
+            self.ceil_slot = f.ceil_slot;
+            self.depth_e6 = f.depth_e6;
+            self.depth_slot = f.depth_slot;
+            self.depth_prev_e6 = f.depth_prev_e6;
+            self.depth_source = f.depth_source;
+        }
+    }
+
+    /// Security review I-1 (v2.2 growth overnight §1.4): reset the graduation state of the
+    /// growth record in `wrapper` (an asset slot's wrapper bytes) for a NEW market on this slot
+    /// (`growth_v19::graduation_reset`). Configuration (version, lambda, kink, l_tier, l_launch,
+    /// r_gap, dials, rent snapshot) is kept, so the vault-LP binding that also survives stays
+    /// consistent. Growth OFF (version 0): nothing is read or written (one byte).
+    pub fn reset_asset_growth_graduation_in_wrapper_bytes(
+        wrapper: &mut [u8],
+        engine_imr_bps: u64,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        let Some(mut g) = asset_growth_from_wrapper_bytes(wrapper, engine_imr_bps)? else {
+            return Ok(());
+        };
+        g.set_graduation(crate::growth_v19::graduation_reset(
+            g.l_launch_x100,
+            g.l_tier_x100,
+            now_slot,
+        ));
+        asset_growth_to_wrapper_bytes(wrapper, &g, engine_imr_bps)
+    }
 
     /// Structural validation (`engine_imr_bps` is the market's engine IMR). All-zero is valid
     /// (off). `version == 0` with ANY other non-zero byte is corrupt (fail closed), as is an
@@ -7563,11 +7644,15 @@ pub mod state {
             .ok_or(ProgramError::InvalidAccountData)?;
         if g.version != crate::growth_v19::GROWTH_VERSION
             || g.flags != 0
-            || g._reserved0 != [0u8; 4]
-            || g._reserved0b != [0u8; 16]
+            || g._reserved0 != [0u8; 3]
+            // G8 depth bytes: zero until the depth writer lands (§1.3).
+            || g.depth_source != 0
+            || g.depth_e6 != 0
+            || g.depth_slot != 0
+            || g.depth_prev_e6 != 0
             || g.rent_kink_bps as u128 > crate::growth_v19::BPS
             || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
-            || g._reserved1 != [0u8; 32]
+            || g._reserved1 != [0u8; 24]
             || g._reserved2 != [0u8; 16]
             || g.alloc_alpha_bps != 0
             || g.alloc_buffer_bps != 0
@@ -25598,6 +25683,13 @@ pub mod processor {
             // P2b (review L-1): the restarted asset is a new market (new market_id, epochs
             // back at 0): it must not inherit the old ADL episode start or N override.
             state::clear_adl_episode_in_wrapper_bytes(&mut group.markets[asset_index].wrapper[..])?;
+            // Security review I-1 (path 1/4, restart): nor its growth graduation state.
+            let engine_imr = group.header.config.initial_margin_bps.get();
+            state::reset_asset_growth_graduation_in_wrapper_bytes(
+                &mut group.markets[asset_index].wrapper[..],
+                engine_imr,
+                authenticated_slot,
+            )?;
             group.validate_shape().map_err(map_v16_error)?;
             cfg
         };
@@ -25842,6 +25934,13 @@ pub mod processor {
                         state::clear_adl_episode_in_wrapper_bytes(
                             &mut group.markets[asset_index].wrapper[..],
                         )?;
+                        // Security review I-1 (path 2/4, slot reuse): nor graduation state.
+                        let engine_imr = group.header.config.initial_margin_bps.get();
+                        state::reset_asset_growth_graduation_in_wrapper_bytes(
+                            &mut group.markets[asset_index].wrapper[..],
+                            engine_imr,
+                            authenticated_slot,
+                        )?;
                         group.validate_shape().map_err(map_v16_error)?;
                         reuse_cfg_after = Some(cfg);
                         reuse_activated = true;
@@ -25882,6 +25981,20 @@ pub mod processor {
                         &state::clear_adl_episode(limits),
                     )?;
                     state::clear_p2b_senior_floor(&mut data, asset_index)?;
+                    // Security review I-1 (path 3/4, append activation): no graduation state.
+                    {
+                        let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+                        let engine_imr = group.header.config.initial_margin_bps.get();
+                        let market = group
+                            .markets
+                            .get_mut(asset_index)
+                            .ok_or(PercolatorError::InvalidInstruction)?;
+                        state::reset_asset_growth_graduation_in_wrapper_bytes(
+                            &mut market.wrapper[..],
+                            engine_imr,
+                            authenticated_slot,
+                        )?;
+                    }
                     if init_fee != 0 {
                         let (_cfg, mut group) = state::market_view_mut(&mut data)?;
                         deposit_market_zero_insurance_view(&mut group, init_fee)?;
@@ -26143,6 +26256,13 @@ pub mod processor {
                     // starts with no ADL episode record or N override.
                     state::clear_adl_episode_in_wrapper_bytes(
                         &mut group.markets[asset_index].wrapper[..],
+                    )?;
+                    // Security review I-1 (path 4/4, retired re-activation): nor graduation.
+                    let engine_imr = group.header.config.initial_margin_bps.get();
+                    state::reset_asset_growth_graduation_in_wrapper_bytes(
+                        &mut group.markets[asset_index].wrapper[..],
+                        engine_imr,
+                        authenticated_slot,
                     )?;
                     if was_retired && cfg.free_market_slot_count != 0 {
                         cfg.free_market_slot_count -= 1;

@@ -875,6 +875,44 @@ pub fn c_launch_atoms_for(c_m: u128) -> u128 {
     }
 }
 
+// ── v2.2 growth overnight §1.4: I-1 graduation reset ──────────────────────────────────────
+
+/// The graduation / depth part of an asset's growth record (`AssetGrowthV19` bytes 0..16,
+/// 24..26, 44, 56..80). Everything else in the record (version, lambda, kink, l_tier, l_launch,
+/// r_gap, the dials, the rent snapshot) is the market's CONFIGURATION and survives a restart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GraduationFields {
+    pub c_launch_atoms: u64,
+    pub ceil_x100: u16,
+    pub ceil_slot: u64,
+    pub depth_e6: u64,
+    pub depth_slot: u64,
+    pub depth_prev_e6: u64,
+    pub depth_source: u8,
+}
+
+/// Security review I-1 (security-review-v21-combination §8): a restarted asset, a reused slot,
+/// an append activation and a retired re-activation are NEW markets on an old slot. Their
+/// graduation state starts from scratch: no launch capital (`c_launch = 0`, re-snapshotted at
+/// the first graduation evaluation), the ceiling at `min(L_launch, L_tier)` stamped `now` (so
+/// the first climb waits a full ratchet epoch), and no depth (tier 0: I-D1). Kani:
+/// `kani_g8_i1_reset_postconditions`.
+pub fn graduation_reset(l_launch_x100: u16, l_tier_x100: u16, now_slot: u64) -> GraduationFields {
+    GraduationFields {
+        c_launch_atoms: 0,
+        ceil_x100: if l_launch_x100 < l_tier_x100 {
+            l_launch_x100
+        } else {
+            l_tier_x100
+        },
+        ceil_slot: now_slot,
+        depth_e6: 0,
+        depth_slot: 0,
+        depth_prev_e6: 0,
+        depth_source: 0,
+    }
+}
+
 /// v2.2 item 2: on a rent market the one-time utilisation toll is only an ENTRY floor (a
 /// one-slot flash lock pays no rent), 25 bps at `u = 1` instead of 500 (closes N-2: rent, not
 /// a toll, prices a held lock-out).

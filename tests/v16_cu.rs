@@ -26185,6 +26185,204 @@ fn p2b_restart_asset_oracle_clears_the_adl_episode_record() {
     assert!(expired_same);
 }
 
+/// Seed a growth record with a STALE graduation state (launch capital, a ceiling stamped at an
+/// old slot, depth from the old market) on `asset_index`. Engine IMR 10_000 here, so the tier
+/// is 1x and `l_launch == l_tier == ceil == 100`.
+fn i1_seed_stale_growth(env: &mut V16CuEnv, asset_index: usize) -> state::AssetGrowthV19 {
+    let g = state::AssetGrowthV19 {
+        c_launch_atoms: 7_000_000_000,
+        ceil_slot: 5,
+        lambda_bps: 9_000,
+        l_launch_x100: 100,
+        l_tier_x100: 100,
+        ceil_x100: 100,
+        kink_bps: 4_000,
+        r_gap_bps: 400,
+        version: 1,
+        util_fee_max_bps: 700,
+        rent_kink_bps: 0,
+        ..i1_stale_depth()
+    };
+    let mut acc = env.svm.get_account(&env.market).unwrap();
+    state::write_asset_growth(&mut acc.data, asset_index, &g, 10_000).unwrap();
+    env.svm.set_account(env.market, acc).unwrap();
+    g
+}
+
+/// The old market's depth fields (G8). All-zero until the depth writer lands.
+fn i1_stale_depth() -> state::AssetGrowthV19 {
+    state::AssetGrowthV19::default()
+}
+
+/// I-1: everything but the graduation fields is the market's configuration and survives; the
+/// graduation fields are exactly `growth_v19::graduation_reset(l_launch, l_tier, now)`.
+fn i1_assert_reset(env: &V16CuEnv, asset_index: usize, before: &state::AssetGrowthV19, now: u64) {
+    let data = env.svm.get_account(&env.market).unwrap().data;
+    let after = state::read_asset_growth(&data, asset_index, 10_000).unwrap().expect("growth kept ON");
+    assert_eq!(after.c_launch_atoms, 0, "old launch capital must not survive (I-1)");
+    assert_eq!(after.ceil_x100, before.l_launch_x100.min(before.l_tier_x100));
+    assert_eq!(after.ceil_slot, now, "the ceiling is re-stamped at the new market's start");
+    assert_eq!(
+        (after.depth_e6, after.depth_slot, after.depth_prev_e6, after.depth_source),
+        (0, 0, 0, 0),
+        "old depth must not survive (tier 0, I-D1)"
+    );
+    let mut kept = after;
+    kept.set_graduation(before.graduation());
+    assert_eq!(&kept, before, "configuration (version, lambda, kink, tiers, r_gap, dials) kept");
+    assert_eq!(
+        after.graduation(),
+        percolator_prog::growth_v19::graduation_reset(before.l_launch_x100, before.l_tier_x100, now)
+    );
+}
+
+/// Security review I-1 (path 1/4): RestartAssetOracle starts a new market on the slot, so the
+/// growth record's graduation state (c_launch, ceiling + ratchet stamp, depth) is reset; the
+/// configuration is kept.
+#[test]
+fn i1_restart_asset_oracle_resets_the_growth_graduation_state() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.svm.warp_to_slot(2_000);
+    let before = i1_seed_stale_growth(&mut env, 0);
+    env.mutate_market(|_, group| {
+        group.assets[0].lifecycle = AssetLifecycleV16::Recovery;
+    });
+    let data = env.svm.get_account(&env.market).unwrap().data;
+    assert_eq!(state::read_asset_growth(&data, 0, 10_000).unwrap(), Some(before), "seed survives mutate");
+    let old_market_id = state::read_market_trade_preflight(&data, 0).unwrap().3;
+    let observation_sequence = env.control_sequences(0).oracle_observation + 1;
+    env.send(
+        ProgInstruction::RestartAssetOracle {
+            market_id: old_market_id,
+            asset_index: 0,
+            now_slot: 2_000,
+            initial_price: 100,
+            observation_sequence,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("restart asset oracle");
+    let now = env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    i1_assert_reset(&env, 0, &before, now);
+}
+
+/// Security review I-1 (path 2/4): the permissionless REUSE of a retired slot resets the growth
+/// graduation state.
+#[test]
+fn i1_permissionless_reuse_of_a_retired_slot_resets_the_growth_graduation_state() {
+    let mut env = V16CuEnv::new();
+    let attacker = Keypair::new();
+    env.update_market_init_fee_policy_with_cu(1);
+    env.svm.warp_to_slot(1);
+    env.activate_permissionless_asset_with_fee(
+        &attacker, 1, 1, 100,
+        attacker.pubkey(), attacker.pubkey(), attacker.pubkey(), attacker.pubkey(), 1,
+    );
+    env.svm.warp_to_slot(3);
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_RETIRE, 1, 3, 0,
+    );
+    let before = i1_seed_stale_growth(&mut env, 1);
+    env.svm.warp_to_slot(40);
+    env.activate_permissionless_asset_with_fee(
+        &attacker, 1, u64::MAX, 250,
+        attacker.pubkey(), attacker.pubkey(), attacker.pubkey(), attacker.pubkey(), 1,
+    );
+    let (_, group) = env.market_state();
+    assert_eq!(group.assets[1].lifecycle, AssetLifecycleV16::Active);
+    i1_assert_reset(&env, 1, &before, 40);
+}
+
+/// Security review I-1 (path 3/4): an APPEND activation (asset_index == configured slots)
+/// resets whatever growth bytes the appended slot's storage holds. If the account already has
+/// storage for the slot, a stale record is planted first (STATE POKE) and the reset is
+/// asserted; in this harness the storage does NOT exist before the append (`planted = false`),
+/// so the test pins the appended record to OFF and the path-3 reset is defense in depth that
+/// the file-copy negative control could not exercise (recorded in the report).
+#[test]
+fn i1_permissionless_append_activation_resets_the_growth_graduation_state() {
+    let mut env = V16CuEnv::new();
+    let attacker = Keypair::new();
+    env.update_market_init_fee_policy_with_cu(1);
+    env.svm.warp_to_slot(60);
+    let mut acc = env.svm.get_account(&env.market).unwrap();
+    let planted = state::asset_growth_range(&acc.data, 1).is_ok();
+    let before = if planted {
+        let g = i1_seed_stale_growth(&mut env, 1);
+        acc = env.svm.get_account(&env.market).unwrap();
+        Some(g)
+    } else {
+        None
+    };
+    drop(acc);
+    eprintln!("i1 append: stale record planted = {planted}");
+    env.activate_permissionless_asset_with_fee(
+        &attacker, 1, u64::MAX, 100,
+        attacker.pubkey(), attacker.pubkey(), attacker.pubkey(), attacker.pubkey(), 1,
+    );
+    let (_, group) = env.market_state();
+    assert_eq!(group.assets[1].lifecycle, AssetLifecycleV16::Active);
+    match before {
+        Some(b) => i1_assert_reset(&env, 1, &b, 60),
+        None => {
+            // The slot's storage did not exist before the append: its growth record is the
+            // all-zero OFF record (nothing to inherit).
+            let data = env.svm.get_account(&env.market).unwrap().data;
+            assert_eq!(state::read_asset_growth(&data, 1, 10_000).unwrap(), None);
+        }
+    }
+}
+
+/// Security review I-1 (path 4/4): the privileged re-activation of a RETIRED slot resets the
+/// growth graduation state exactly like a restart.
+#[test]
+fn i1_privileged_reactivation_of_a_retired_slot_resets_the_growth_graduation_state() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.svm.warp_to_slot(1_000);
+    env.mutate_market(|_, group| {
+        group.assets[1].lifecycle = AssetLifecycleV16::Retired;
+        group.assets[1].retired_slot = 1;
+    });
+    let before = i1_seed_stale_growth(&mut env, 1);
+    let admin = env.admin.insecure_clone();
+    let authority = admin.pubkey().to_bytes();
+    let authority_epoch = env.control_sequences(0).authority_epoch;
+    let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        1,
+        true,
+    )
+    .unwrap_or((0, 0));
+    env.send(
+        ProgInstruction::UpdateAssetLifecycle {
+            market_id,
+            action: 0,
+            asset_index: 1,
+            authority_epoch,
+            now_slot: 1_000,
+            initial_price: 100,
+            max_init_fee: u128::MAX,
+            insurance_authority: authority,
+            insurance_operator: authority,
+            backing_bucket_authority: authority,
+            oracle_authority: authority,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("market authority re-activates the retired slot");
+    let now = env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    i1_assert_reset(&env, 1, &before, now);
+}
+
 /// P2b (security review L-1b): the market-authority (privileged) re-activation of a RETIRED
 /// slot also starts a new market on that slot, so it must clear the ADL episode record and
 /// the N override exactly like RestartAssetOracle and the permissionless reuse path.
