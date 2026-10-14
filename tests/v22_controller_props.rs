@@ -132,3 +132,72 @@ fn r3_item3_mutants_are_caught() {
     assert_eq!(gv::ceiling_in_force_x100(true, 2_000, 500, 500, 2_000, gv::STRESS_HLOCK), 500);
     assert_eq!(gv::ratchet_ceiling_x100(2_000, 0, 500, 500, gv::STRESS_DRAW, 1), (1_900, 1));
 }
+
+// ── item 4 (GAP-5, D-I1, D2): time-weighted two-bucket window ───────────────────────────────
+
+/// MUTANT (GAP-5): round 2 fed the raw fresh reading (no window): a one-sample spike counts.
+fn window_mutant_round2(_w: gv::DepthWindow, r: u32) -> u32 {
+    r
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+    /// The window minimum is <= every sample folded into the current and (adjacent) previous
+    /// bucket; a sample more than one bucket old never raises it (it is dropped, never folded
+    /// up); the window is full iff the previous bucket is present; ring wrap-around is safe.
+    #[test]
+    fn item4_window(samples in prop::collection::vec((any::<u32>(), 0u64..3_000), 1..40), start in any::<u64>()) {
+        let mut w = gv::DepthWindow::default();
+        let mut slot = start / 2;
+        let mut seen: Vec<(u64, u32)> = Vec::new();
+        for (r, dt) in samples {
+            let r = r.min(gv::DEPTH_TW_ABSENT - 1);
+            slot = slot.saturating_add(dt);
+            w = gv::depth_tw_update(w, r, slot);
+            seen.push((slot / gv::DEPTH_TW_BUCKET_SLOTS, r));
+            prop_assert!(gv::depth_tw_window_ok(w));
+            let b = slot / gv::DEPTH_TW_BUCKET_SLOTS;
+            let m = gv::depth_tw_min_atoms(w, 1).unwrap();
+            for &(sb, sr) in &seen {
+                if sb == b || (w.prev_tokens != gv::DEPTH_TW_ABSENT && sb + 1 == b) {
+                    prop_assert!(m <= sr as u64, "min {m} above a window sample {sr}");
+                }
+            }
+            prop_assert!(m <= r as u64);
+            prop_assert_eq!(gv::depth_tw_full(w), w.prev_tokens != gv::DEPTH_TW_ABSENT);
+        }
+    }
+
+    /// D-I1 + D2 at the limiter: the first reading is <= T1/16; a zero window holds last_good
+    /// and its slot; any positive window minimum yields <= max(2 * decayed base, T1/16).
+    #[test]
+    fn item4_limiter(lg in any::<u64>(), lgs in any::<u64>(), re in any::<u32>(), w in any::<u64>(), full in any::<bool>(), slot in any::<u64>(), seed in any::<u64>()) {
+        let floor = seed / gv::DEPTH_BOOTSTRAP_DIV;
+        let (a, _, s) = gv::depth_rate_limited(false, lg, lgs, re, w, full, slot, seed);
+        prop_assert!(a <= floor && a <= w && s == slot);
+        let (b, r2, s2) = gv::depth_rate_limited(true, lg, lgs, re, 0, full, slot, seed);
+        prop_assert_eq!((b, r2, s2), (lg, re, lgs));
+        if w > 0 {
+            let (c, _, _) = gv::depth_rate_limited(true, lg, lgs, re, w, full, slot, seed);
+            let base = gv::sticky_depth_e6(lg, lgs, slot);
+            prop_assert!(c <= base.saturating_mul(2).max(floor).max(base));
+            prop_assert!(c <= w.max(base));
+        }
+    }
+}
+
+#[test]
+fn r3_item4_mutants_are_caught() {
+    let b = gv::DEPTH_TW_BUCKET_SLOTS;
+    // a $2k bucket then a $50M spike in the next bucket: the window still reads $2k
+    let w = gv::depth_tw_update(gv::depth_tw_update(gv::DepthWindow::default(), 2_000, b), 50_000_000, 2 * b);
+    assert_eq!(gv::depth_tw_min_atoms(w, 1), Some(2_000));
+    assert_eq!(window_mutant_round2(w, 50_000_000), 50_000_000, "mutant witness: the spike counts");
+    // D2: round 2 zeroed last_good on a real 0 (the mutant); now it is held
+    let (held, _, _) = gv::depth_rate_limited(true, 150_000, 7, 0, 0, true, 100, 25_000);
+    assert_eq!(held, 150_000);
+    // D-I1: the first reading of a $500M flash is T1/16, not T1 - 1
+    let (first, _, _) = gv::depth_rate_limited(false, 0, 0, 0, 500_000_000, false, 5, 24_999);
+    assert_eq!(first, 24_999 / 16);
+}

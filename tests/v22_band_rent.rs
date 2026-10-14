@@ -2640,15 +2640,15 @@ fn g8_push_auth_mark_wire_35_44_and_mode_refusals() {
     // R2.1: the pair (30k, 40k) in two slots was a fresh effective depth: DEPTH_EVER is set
     // and the last good depth is min(30k, 40k).
     assert_eq!(g.depth_source, 1 | DEPTH_PREV_REAL | DEPTH_EVER);
-    // R2-M1: the market's FIRST fresh reading is clamped below T1 (tier 0): T1 - 1
-    assert_eq!((g.depth_last_good_e6, g.depth_last_good_slot), (DEPTH_T1 - 1, env.clock_slot()));
+    // R2-M1 + round 3 D-I1: the market's FIRST fresh reading is clamped to T1 / 16 (tier 0)
+    assert_eq!((g.depth_last_good_e6, g.depth_last_good_slot), ((DEPTH_T1 - 1) / 16, env.clock_slot()));
     // The 35 B form zeroes the depth (absent is never stale-but-trusted); DEPTH_EVER and the
     // last good depth stay (the sticky cap's input).
     env.warp(1);
     env.push(PRICE);
     let g = env.growth();
     assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 40_000_000_000, DEPTH_EVER | DEPTH_PREV_REAL));
-    assert_eq!(g.depth_last_good_e6, DEPTH_T1 - 1);
+    assert_eq!(g.depth_last_good_e6, (DEPTH_T1 - 1) / 16);
     assert_eq!(g.depth_slot, env.clock_slot());
     // 44 B with mode 0 and depth 0 is the explicit "none" form.
     env.push_depth(PRICE, 0, 0).expect("44 B mode 0");
@@ -2749,26 +2749,27 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     env.depth_twice(5 * DEPTH_T1); // ends at s0 + 8,999
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().ceil_x100, 300, "inside the epoch: no climb");
-    // R2-M1 / D-L2: the venue depth is still the tier-0 first reading (T1 - 1) here; it may
-    // double only 9,000 slots after that rise. At that slot (past the ceiling's epoch too) the
-    // depth reaches tier 1 and the ceiling takes one step.
-    let w = env.next_rise_slot();
-    env.warp(w - 1 - env.slot);
-    env.depth_twice(5 * DEPTH_T1);
-    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    // R2-M1 / D-L2 + round 3 D-I1 / GAP-5: the venue depth starts at T1 / 16 and doubles once
+    // per 9,000 slots of HELD depth (a full time-weighted window); while it is below T1 (tier 0)
+    // the ceiling stays at launch; in the window it reaches T1 the ceiling takes one step.
+    let mut windows = 0;
+    loop {
+        let c = env.epoch_step(&lp, 5 * DEPTH_T1);
+        windows += 1;
+        if env.growth().depth_last_good_e6 >= DEPTH_T1 {
+            break;
+        }
+        assert_eq!(c, 300, "tier 0: launch");
+        assert!(windows < 6, "T1 / 16 -> T1 in five doublings");
+    }
+    // (T1 - 1) / 16 * 16 = T1 - 16 atoms: the fifth doubling crosses T1
+    assert_eq!(windows, 5, "T1 / 16 -> T1: five doublings");
     let g = env.growth();
-    assert!(g.depth_last_good_e6 >= DEPTH_T1, "depth tier 1 after one window");
     assert_eq!((g.ceil_x100, g.ceil_slot), (400, env.clock_slot()), "one step at the boundary");
     env.settle_rent(lp.account, lp.account).expect("tag 106 again, same slot");
     assert_eq!(env.growth().ceil_x100, 400, "one step per epoch, not per call");
-    env.warp(9_000);
-    env.depth_twice(5 * DEPTH_T1);
-    env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().ceil_x100, 500);
-    env.warp(9_000);
-    env.depth_twice(5 * DEPTH_T1);
-    env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().ceil_x100, 500, "capped at L_table(1) = 5x, not 6x");
+    assert_eq!(env.epoch_step(&lp, 5 * DEPTH_T1), 500);
+    assert_eq!(env.epoch_step(&lp, 5 * DEPTH_T1), 500, "capped at L_table(1) = 5x, not 6x");
     // Stale depth (no position held yet, same slot): the stored ceiling is 5x but the depth's
     // stamp is 151 slots old (STATE POKE: one past DEPTH_MAX_AGE_SLOTS), so the GATE alone
     // (min(stored, live target)) refuses 3.5x.
@@ -2948,16 +2949,33 @@ impl Env {
     }
 
     /// One ratchet epoch: warp to `ceil_slot + 9,000` AND past the depth's rise window (R2-M1 /
-    /// D-L2: the usable depth can rise once per 9,000 slots since its last rise), a fresh
-    /// attested pair at `depth`, then the tag-106 ratchet site. Returns the stored ceiling.
+    /// D-L2: the usable depth can rise once per 9,000 slots since its last rise), the depth
+    /// HELD meanwhile (round 3 item 4: a rise needs the time-weighted window -- one attested
+    /// sample in every 750-slot bucket, here every 600 slots), a fresh attested pair at `depth`,
+    /// then the tag-106 ratchet site. Returns the stored ceiling.
     fn epoch_step(&mut self, lp: &Lp, depth: u64) -> u16 {
         let e = percolator_prog::growth_v19::RATCHET_EPOCH_SLOTS;
         let due = core::cmp::max(self.growth().ceil_slot + e, self.next_rise_slot());
+        // at least two whole buckets of held samples (a keeper pushes every few seconds; the
+        // test must too, or a rise could never see a full window)
+        let bucket = percolator_prog::growth_v19::DEPTH_TW_BUCKET_SLOTS;
+        let hold_to = core::cmp::max(due.saturating_sub(1), self.slot + 2 * bucket + 10);
+        self.hold_depth_until(depth, hold_to);
+        let due = core::cmp::max(due, self.slot + 1);
         let to = due.saturating_sub(self.slot + 1).max(1);
         self.warp(to);
         self.depth_twice(depth);
         self.settle_rent(lp.account, lp.account).expect("tag 106: ratchet site");
         self.growth().ceil_x100
+    }
+
+    /// Round 3 item 4: keep `depth` attested in every 750-slot bucket (a push every 600 slots)
+    /// until `until` (the time-weighted window then reads `depth`).
+    fn hold_depth_until(&mut self, depth: u64, until: u64) {
+        while self.slot + 600 < until {
+            self.warp(600);
+            self.push_depth(PRICE, 1, depth).expect("held attested push");
+        }
     }
 
     /// D-L2: the first slot at which the rate-limited depth may rise again (the stored 64-slot
@@ -2973,6 +2991,8 @@ impl Env {
         let mut c = self.growth().ceil_x100;
         for k in 1..=max_steps {
             let n = self.epoch_step(lp, depth);
+            let g = self.growth();
+            eprintln!("climb step {k}: ceil {c} -> {n}, last_good {} window {:?}", g.depth_last_good_e6, g.depth_tw_min_e6());
             assert!(n == c || n == c + 100, "step {k}: {c} -> {n} (at most +1x per epoch)");
             c = n;
             if c == target {
@@ -3046,15 +3066,18 @@ fn r2_sticky_cap_stale_first_push_of_pair_and_decay_to_zero() {
     assert_eq!(env.growth().depth_last_good_e6, 600 * USD_E6, "R2-M1: no second rise in an epoch");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64);
-    // the next epoch: one rise, to min(2,000, max(2 x 600, T1/16 = $1,562.49...))
-    let g0 = env.growth();
+    // the next epoch, the $2,000 HELD over the time-weighted window (round 3 item 4): one rise,
+    // to min(2,000, max(2 x 600, T1/16 = $1,562.49...))
     let seed = percolator_prog::growth_v19::DEPTH_TIER1_E6 - 1;
     let next = env.next_rise_slot();
+    env.hold_depth_until(2_000 * USD_E6, next - 1);
+    assert_eq!(env.growth().depth_last_good_e6, 600 * USD_E6, "held, but no rise before the window opens");
+    let g0 = env.growth();
     env.warp(next - env.slot);
     env.depth_twice(2_000 * USD_E6);
     let g = env.growth();
-    let (want, _) = percolator_prog::growth_v19::depth_rate_limited(
-        true, g0.depth_last_good_e6, u32::from_le_bytes(g0.depth_rise_slot64_le), 2_000 * USD_E6, next, seed,
+    let (want, _, _) = percolator_prog::growth_v19::depth_rate_limited(
+        true, g0.depth_last_good_e6, g0.depth_last_good_slot, u32::from_le_bytes(g0.depth_rise_slot64_le), 2_000 * USD_E6, true, next, seed,
     );
     assert_eq!(want, seed / 16, "the bootstrap floor binds here");
     assert_eq!(g.depth_last_good_e6, want);
@@ -3104,9 +3127,10 @@ fn r2_attested_max_tier_1_vs_3() {
     let lp = env.lp(150_000 * USD);
     env.depth_twice(600_000 * USD_E6);
     env.settle_rent(lp.account, lp.account).expect("snapshot");
-    // R2-M1: the first reading starts below T1 and the usable depth doubles per epoch; three
-    // epochs take it past T2 ($100k). Attested is capped at tier 1 (L1 = 5x = launch) throughout.
-    for _ in 0..3 {
+    // R2-M1 + round 3 D-I1: the first reading starts at T1 / 16 ($1,562.49) and the usable depth
+    // doubles per held window; seven windows take it past T2 ($100k; six reach $99,999.99).
+    // Attested is capped at tier 1 (L1 = 5x = launch) throughout.
+    for _ in 0..7 {
         assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 500, "attested capped at tier 1: 5x = launch");
     }
     assert!(env.growth().depth_last_good_e6 >= percolator_prog::growth_v19::DEPTH_TIER2_E6);
@@ -3133,8 +3157,9 @@ fn r2_book_tier_limits_venue_tier() {
     let owner = lp.owner.insecure_clone();
     env.depth_twice(600_000 * USD_E6);
     env.settle_rent(lp.account, lp.account).expect("snapshot");
-    // four epochs: the rate-limited venue depth reaches ~$400k (tier 2); the book tier 1 holds
-    for _ in 0..4 {
+    // seven held windows: the rate-limited venue depth reaches ~$200k (tier 2) from T1 / 16; the
+    // book tier 1 holds
+    for _ in 0..7 {
         assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 500, "book tier 1 holds the venue at 5x");
     }
     assert!(env.growth().depth_last_good_e6 >= percolator_prog::growth_v19::DEPTH_TIER2_E6);
@@ -3181,11 +3206,11 @@ fn r2_band_market_graduates_5x_10x_20x_and_drops_on_depth_loss() {
     env.depth_twice(tier2);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().ceil_x100, 500, "inside the epoch: no climb");
-    // R2-M1: the usable depth starts at T1 - 1 ($4,999.99) and doubles per epoch ($10k: tier
-    // 1 = 5x = launch, $20k - 4 atoms: still tier 1, $40k: tier 2), so the climb starts in the
-    // third epoch; the ceiling never moves more than +1x per epoch.
-    let steps = env.climb_to(&lp, tier2, 1_000, 12);
-    assert!(steps >= 7, "two epochs of depth warm-up + five +1x steps: {steps}");
+    // R2-M1 + round 3 D-I1: the usable depth starts at T1 / 16 ($312.49) and doubles per held
+    // window ($5k: tier 1 = 5x = launch after four, $40k: tier 2 after seven), so the climb
+    // starts in the seventh window; the ceiling never moves more than +1x per epoch.
+    let steps = env.climb_to(&lp, tier2, 1_000, 16);
+    assert!(steps >= 11, "six windows of depth warm-up + five +1x steps: {steps}");
     assert_eq!(env.epoch_step(&lp, tier2), 1_000, "venue tier 2: holds at 10x");
     let t = env.trader(100 * USD);
     let r = env.trade_cpi(&t.0, t.1, &lp, 1_050 * Q);
@@ -3269,7 +3294,7 @@ fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
     let lp = env.lp(150_000 * USD);
     env.depth_twice(600_000 * USD_E6);
     env.settle_rent(lp.account, lp.account).expect("snapshot");
-    env.climb_to(&lp, 600_000 * USD_E6, 600, 5);
+    env.climb_to(&lp, 600_000 * USD_E6, 600, 10);
     assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 600, "held at L2 = 6x");
     env.set_tiers([0; 3], [500, 1_000, 1_000], 3).expect("L2 = 10x");
     let g = env.growth();
@@ -3288,12 +3313,13 @@ fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
 }
 
 /// Coordinator ruling (most conservative wins): an attested (mode 1) reading of 0 is a REAL zero
-/// depth, not "absent": the κ cap is 0 AT ONCE (no second sample), DEPTH_EVER is set and the last
-/// good depth becomes 0; opens get nothing while a reduce lands. A later positive reading
-/// restores the normal rule only after its own min-of-two (the first positive sample's previous
-/// sample is the real 0). CONTROL: the 35 B form at the same point is absent, so the sticky
-/// last good depth ($600 -> 300 units) applies instead. Also: a market that never had depth is
-/// closed at once by an attested 0.
+/// depth, not "absent": the κ cap is 0 AT ONCE (no second sample) and DEPTH_EVER is set; opens
+/// get nothing while a reduce lands. Round 3 item 4 (D2): the last good depth is HELD and the
+/// zero is gated through the time-weighted window, so the cap stays 0 while the zero is inside
+/// the window (5-10 min) and then returns to the held depth at once (round 2: last good 0, then
+/// T1/16 doubling per 9,000 slots, ~7 h for a deep market). CONTROL: the 35 B form at the same
+/// point is absent, so the sticky last good depth ($600 -> 300 units) applies instead. Also: a
+/// market that never had depth is closed at once by an attested 0.
 #[test]
 fn r2_attested_zero_reading_caps_at_zero_at_once() {
     for absent_control in [false, true] {
@@ -3319,7 +3345,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
             assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "35 B: sticky $600");
             continue;
         }
-        assert_eq!((g.depth_e6, g.depth_last_good_e6, g.depth_source & DEPTH_EVER), (0, 0, DEPTH_EVER));
+        assert_eq!((g.depth_e6, g.depth_last_good_e6, g.depth_source & DEPTH_EVER), (0, 600 * USD_E6, DEPTH_EVER), "D2: last good held");
         // the κ cap is 0 at once; R2-L1: the rent snapshot is 1 (u = infinity: maximum rent)
         assert_eq!(env.growth().rent_n_cap_q, 1, "a real 0: cap 0 at once, rent at the maximum");
         let t2 = env.trader(1_000 * USD);
@@ -3331,19 +3357,22 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("positive after 0");
         env.settle_rent(lp.account, lp.account).expect("tag 106");
         assert_eq!(env.growth().rent_n_cap_q, 1, "first positive sample after a real 0: still cap 0");
-        // its own min-of-two: fresh again, but R2-M1 allows no rise in the epoch of the last rise
+        // its own min-of-two: fresh again, but the zero is still inside the window
         env.warp(1);
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("second positive");
         env.settle_rent(lp.account, lp.account).expect("tag 106");
-        assert_eq!(env.growth().rent_n_cap_q, 1, "same epoch: the rate-limited depth stays 0");
-        // the next epoch: back to min($600, T1/16), i.e. $600 at κ 0.5 -> 300 units
-        let next = env.next_rise_slot();
-        env.warp(next - env.slot);
+        assert_eq!(env.growth().rent_n_cap_q, 1, "the zero is still in the 5-10 min window: cap 0");
+        // D2: honest readings held across the window -> back to the held $600 within ~10 min
+        let z = env.clock_slot();
+        let until = z + 2 * percolator_prog::growth_v19::DEPTH_TW_BUCKET_SLOTS + 10;
+        env.hold_depth_until(600 * USD_E6, until);
+        env.warp(until - env.slot);
         env.depth_twice(600 * USD_E6);
         env.crank_current(taker.1);
         env.crank_current(lp.account);
         env.settle_rent(lp.account, lp.account).expect("tag 106");
-        assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "next epoch: $600 at κ 0.5");
+        assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "D2: $600 at κ 0.5 again");
+        assert!(env.clock_slot() - z < 2_200, "within one window (~10 min), not ~7 h");
         env.assert_conservation();
     }
     // never had depth: an attested 0 closes opens at once (and sets DEPTH_EVER)
@@ -3362,44 +3391,49 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
 
 /// Security review R2-M1, the reviewer's flash-liquidity shape on the attested path: real $2k of
 /// ±2% depth; a $50M reading held for two adjacent-slot pushes. Round 2 took it at once (tier 1
-/// here, tier 3 on the DEX source). Now the usable depth (min(fresh, rate-limited last good))
-/// does not rise in the epoch of its last rise, rises at most 2x per later epoch, and the next
-/// honest pair takes it back down at once; the κ cap (rent N_cap snapshot) follows, and the
-/// ceiling never moves more than +1x per epoch.
+/// here, tier 3 on the DEX source). Now (R2-M1 + round 3 item 4) the usable depth starts at
+/// T1/16 (D-I1), does not rise on a spike inside one bucket (the window keeps the honest
+/// minimum, and a rise needs a full window), rises at most 2x per 9,000 slots of HELD presence,
+/// and the next honest pair takes it back down at once; the κ cap (rent N_cap snapshot) follows,
+/// and the ceiling never moves more than +1x per epoch.
 #[test]
 fn r2m1_flash_liquidity_is_rate_limited() {
     let mut env = env_with_launch(band_cfg(), 500);
     env.auth_mark();
     let lp = env.lp(10_000 * USD);
     let real = 2_000 * USD_E6;
+    let floor = (DEPTH_T1 - 1) / 16;
     let inflated = 50_000_000 * USD_E6;
     let cap_of = |d: u64| d / 2 / 10; // κ 0.5 at tier 0; $1 = 1/10 unit at the 1e7 price
     env.warp(1);
     env.depth_twice(real);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().depth_last_good_e6, real);
-    assert_eq!(env.growth().rent_n_cap_q, cap_of(real));
-    // the whale: two adjacent-slot pushes at $50M, same epoch
+    assert_eq!(env.growth().depth_last_good_e6, floor, "D-I1: first reading T1 / 16");
+    assert_eq!(env.growth().rent_n_cap_q, cap_of(floor));
+    // the whale: two adjacent-slot pushes at $50M, same bucket
     env.warp(1);
     env.depth_twice(inflated);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     let g = env.growth();
-    assert_eq!(g.depth_last_good_e6, real, "no rise in the epoch of the last rise");
-    assert_eq!(g.rent_n_cap_q, cap_of(real), "the κ cap did not move");
+    assert_eq!(g.depth_last_good_e6, floor, "no rise");
+    assert_eq!(g.depth_tw_min_e6(), Some(real), "the window keeps the honest minimum");
+    assert_eq!(g.rent_n_cap_q, cap_of(floor), "the κ cap did not move");
     assert_eq!(g.ceil_x100, 500);
-    // held into the next epoch: ONE doubling, not 25,000x
+    // held over a full window into the next rise window: ONE doubling, not 25,000x
     let next = env.next_rise_slot();
+    env.hold_depth_until(inflated, next - 1);
+    assert_eq!(env.growth().depth_last_good_e6, floor, "held, but the 9,000 slots are not over");
     env.warp(next - env.slot);
     env.depth_twice(inflated);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().depth_last_good_e6, 2 * real);
-    assert_eq!(env.growth().rent_n_cap_q, cap_of(2 * real));
+    assert_eq!(env.growth().depth_last_good_e6, 2 * floor);
+    assert_eq!(env.growth().rent_n_cap_q, cap_of(2 * floor));
     // the whale withdraws: the next honest pair takes it down at once
     env.warp(1);
     env.depth_twice(real);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().depth_last_good_e6, real, "down at once");
-    // escalation held for several epochs: <= 2x per epoch, ceiling <= +1x per epoch
+    // escalation held for several windows: <= 2x per window, ceiling <= +1x per epoch
     let mut prev = real;
     let mut ceil = env.growth().ceil_x100;
     for _ in 0..6 {
@@ -3410,7 +3444,7 @@ fn r2m1_flash_liquidity_is_rate_limited() {
         prev = lg;
         ceil = c;
     }
-    assert_eq!(prev, real << 6, "six epochs of continuous presence: 64x, not 25,000x");
+    assert_eq!(prev, real << 6, "six windows of continuous presence: 64x, not 25,000x");
     // the honest reading still takes it down at once
     env.warp(1);
     env.depth_twice(real);
@@ -3490,42 +3524,43 @@ fn r2l2_thresholds_scale_with_collateral_decimals() {
     assert!(state::write_asset_growth(&mut acc.data, 0, &g, env.engine_imr).is_err(), "decimals 19 refused");
 }
 
-/// Security review D-L2 (the reviewer's straddle): a whale holds the inflated reading for three
-/// samples straddling a calendar boundary `k * 9,000` (slots k*9,000 - 2, -1, k*9,000). Round 2
-/// (gate on `slot / 9,000`) doubled at the second sample AND again at the third -- 4x one slot
-/// apart. Now a rise needs >= 9,000 slots since the last one: exactly one doubling in that
-/// window, and the next doubling only 9,000 slots after it.
+/// Security review D-L2 (the reviewer's straddle): a whale holds the inflated reading across a
+/// calendar boundary `k * 9,000`. Round 2 (gate on `slot / 9,000`) doubled before AND after the
+/// boundary -- 4x one slot apart. Now (D-L2 + round 3 item 4) a rise needs >= 9,000 slots since
+/// the last one and a full time-weighted window: exactly one doubling across the boundary, and
+/// the next doubling only one window after it.
 #[test]
 fn d_l2_boundary_straddle_gets_one_doubling() {
     let mut env = env_with_launch(band_cfg(), 500);
     env.auth_mark();
     let lp = env.lp(10_000 * USD);
     let real = 7_000 * USD_E6;
+    let floor = (DEPTH_T1 - 1) / 16;
     let inflated = 50_000_000 * USD_E6;
     env.warp(1);
     env.depth_twice(real);
-    assert_eq!(env.growth().depth_last_good_e6, real);
-    // past the first window, end right before a calendar boundary
+    assert_eq!(env.growth().depth_last_good_e6, floor, "D-I1: T1 / 16");
+    // held over the window, past the rise window, ending right before a calendar boundary
     let w = env.next_rise_slot();
     let k = (w / 9_000 + 1) * 9_000;
-    env.warp(k - 3 - env.slot);
-    env.push_depth(PRICE, 1, real).expect("honest, k*9000 - 3");
-    env.warp(1);
+    env.hold_depth_until(inflated, k - 3);
+    env.warp(k - 2 - env.slot);
     env.push_depth(PRICE, 1, inflated).expect("inflated, k*9000 - 2");
     env.warp(1);
-    env.push_depth(PRICE, 1, inflated).expect("inflated, k*9000 - 1: the pair -> one doubling");
-    assert_eq!(env.growth().depth_last_good_e6, 2 * real);
+    env.push_depth(PRICE, 1, inflated).expect("inflated, k*9000 - 1");
+    assert_eq!(env.growth().depth_last_good_e6, 2 * floor, "one doubling");
     env.warp(1);
     assert_eq!(env.clock_slot() % 9_000, 0, "a new calendar epoch");
     env.push_depth(PRICE, 1, inflated).expect("inflated, k*9000");
-    assert_eq!(env.growth().depth_last_good_e6, 2 * real, "D-L2: no second doubling one slot later");
+    assert_eq!(env.growth().depth_last_good_e6, 2 * floor, "D-L2: no second doubling across the boundary");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().rent_n_cap_q, 2 * real / 2 / 10, "κ cap 2x honest, not 4x");
-    // 9,000 slots after the rise: the next doubling
-    let rise = env.clock_slot() - 1;
-    env.warp(rise + 9_000 + 64 - env.slot);
+    assert_eq!(env.growth().rent_n_cap_q, 2 * floor / 2 / 10, "κ cap at the one doubling, not 4x");
+    // one window after the rise: the next doubling (held throughout)
+    let next = env.next_rise_slot();
+    env.hold_depth_until(inflated, next - 1);
+    env.warp(next - env.slot);
     env.push_depth(PRICE, 1, inflated).expect("one window later");
-    assert_eq!(env.growth().depth_last_good_e6, 4 * real);
+    assert_eq!(env.growth().depth_last_good_e6, 4 * floor);
 }
 
 /// Security review D-L1: growth markets refuse collateral with more than 12 decimals at
@@ -4318,4 +4353,59 @@ fn r3_item3_graded_stress_and_one_step_descent() {
     // (d) the h-lock: launch at once.
     env.poke_stress(None, None, Some(true), None);
     assert_eq!(one(&mut env), 500, "h-lock: 8x -> 5x in one call");
+}
+
+/// Round 3 item 4 (design GAP-5 / sims (g)): a flash of liquidity must be HELD over the whole
+/// time-weighted window (>= one full 750-slot bucket of keeper samples) to count at all. A
+/// market at a steady $8k (keeper pushes every 10 slots) whose rise window is open sees a whale
+/// at $50M for 1, 10 and 100 slots: the rate-limited depth does not move. Held for two whole
+/// buckets it doubles once (2x, never more). NEGATIVE CONTROL (file copy): fed the raw
+/// min-of-two (round 2), the 10- and 100-slot holds double at once.
+#[test]
+fn r3_item4_flash_must_be_held_over_the_window() {
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let honest = 8_000 * USD_E6;
+    let whale = 50_000_000 * USD_E6;
+    env.warp(1);
+    env.depth_twice(honest);
+    // climb to a steady honest reading (a few held windows), then open the rise window
+    for _ in 0..4 {
+        env.epoch_step(&lp, honest);
+    }
+    let base = env.growth().depth_last_good_e6;
+    assert!(base <= honest);
+    let step = |env: &mut Env, d: u64, slots: u64| {
+        let mut k = 0;
+        while k < slots {
+            env.warp(10.min(slots - k).max(1));
+            env.push_depth(PRICE, 1, d).expect("push");
+            k += 10;
+        }
+    };
+    let next = env.next_rise_slot();
+    env.hold_depth_until(honest, next + 2 * percolator_prog::growth_v19::DEPTH_TW_BUCKET_SLOTS);
+    let base = env.growth().depth_last_good_e6;
+    let next = env.next_rise_slot();
+    env.hold_depth_until(honest, next - 1);
+    env.warp(next - env.slot);
+    for hold in [1u64, 10, 100] {
+        let stamp = env.growth().depth_rise_slot64_le;
+        step(&mut env, whale, hold);
+        // checked DURING the flash (an honest pair afterwards would take a rise back down at once)
+        assert!(env.growth().depth_last_good_e6 <= base.max(honest), "a {hold}-slot flash buys nothing");
+        assert_eq!(env.growth().depth_rise_slot64_le, stamp, "no rise recorded for a {hold}-slot flash");
+        step(&mut env, honest, 20);
+    }
+    // held over two whole buckets: exactly one doubling
+    let before = env.growth().depth_last_good_e6;
+    let next = env.next_rise_slot();
+    if next > env.slot {
+        env.hold_depth_until(honest, next - 1);
+        env.warp(next - env.slot);
+    }
+    step(&mut env, whale, 2 * percolator_prog::growth_v19::DEPTH_TW_BUCKET_SLOTS + 20);
+    let after = env.growth().depth_last_good_e6;
+    assert!(after > before && after <= 2 * before, "held: one doubling ({before} -> {after})");
 }

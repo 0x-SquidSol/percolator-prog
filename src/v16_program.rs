@@ -7640,11 +7640,13 @@ pub mod state {
         pub kink_bps: u16, // 26..28
         /// Worst move between liquidation opportunities (bps), validated at InitMarket.
         pub r_gap_bps: u16, // 28..30
-        /// Phase-2 dials (Earn allocation, fee cushion); must be 0 in growth-1.
-        pub alloc_alpha_bps: u16, // 30..32
-        pub alloc_buffer_bps: u16,   // 32..34
-        pub cushion_target_bps: u16, // 34..36
-        pub cushion_share_bps: u16,  // 36..38
+        /// Round 3 item 4 (GAP-5): the time-weighted depth window, current bucket's minimum
+        /// fresh reading in WHOLE collateral tokens (u32 LE). Bytes 30..38 were the dead
+        /// growth-1 phase-2 dials (always validated 0; the real dials live in `VaultLpExtV19`),
+        /// so every pre-round-3 record reads "no window history" (bucket 0).
+        pub depth_tw_cur_le: [u8; 4], // 30..34
+        /// The previous adjacent bucket's minimum, or `u32::MAX` = absent (gap / first bucket).
+        pub depth_tw_prev_le: [u8; 4], // 34..38
         /// 0 = off, 1 = on.
         pub version: u8, // 38
         pub flags: u8,               // 39
@@ -7695,7 +7697,9 @@ pub mod state {
         /// (`growth_v19::depth_rise_window_open`). A byte array: a u32 at 114 would not be
         /// 4-aligned (Pod, no padding).
         pub depth_rise_slot64_le: [u8; 4], // 114..118
-        pub _reserved1: [u8; 2], // 118..120
+        /// Round 3 item 4: the window's bucket, `(slot / 750) % 65,535 + 1` (u16 LE); 0 = no
+        /// window history (then 30..38 must be 0).
+        pub depth_tw_bucket_le: [u8; 2], // 118..120
     }
     const _: () =
         assert!(core::mem::size_of::<AssetGrowthV19>() == crate::constants::ASSET_GROWTH_LEN);
@@ -7718,7 +7722,11 @@ pub mod state {
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, tier_threshold_usd) == 96);
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, tier_leverage_x100) == 108);
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_rise_slot64_le) == 114);
-    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, _reserved1) == 118);
+    // Round 3 item 4 allocation claims (SDK mirrors these).
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_tw_cur_le) == 30);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_tw_prev_le) == 34);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, version) == 38);
+    const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, depth_tw_bucket_le) == 118);
 
     impl AssetGrowthV19 {
         /// The graduation / depth fields (`growth_v19::GraduationFields`).
@@ -7734,7 +7742,33 @@ pub mod state {
                 depth_last_good_e6: self.depth_last_good_e6,
                 depth_last_good_slot: self.depth_last_good_slot,
                 depth_rise_slot64: u32::from_le_bytes(self.depth_rise_slot64_le),
+                depth_tw: self.depth_tw(),
             }
+        }
+
+        /// Round 3 item 4: the time-weighted depth window (bytes 30..38, 118..120).
+        pub fn depth_tw(&self) -> crate::growth_v19::DepthWindow {
+            crate::growth_v19::DepthWindow {
+                cur_tokens: u32::from_le_bytes(self.depth_tw_cur_le),
+                prev_tokens: u32::from_le_bytes(self.depth_tw_prev_le),
+                bucket_p1: u16::from_le_bytes(self.depth_tw_bucket_le),
+            }
+        }
+
+        pub fn set_depth_tw(&mut self, w: crate::growth_v19::DepthWindow) {
+            self.depth_tw_cur_le = w.cur_tokens.to_le_bytes();
+            self.depth_tw_prev_le = w.prev_tokens.to_le_bytes();
+            self.depth_tw_bucket_le = w.bucket_p1.to_le_bytes();
+        }
+
+        /// The window minimum in collateral atoms (`None` = no window history).
+        pub fn depth_tw_min_e6(&self) -> Option<u64> {
+            crate::growth_v19::depth_tw_min_atoms(self.depth_tw(), self.collateral_unit_atoms())
+        }
+
+        /// One whole collateral token in atoms (R2-L2 decimals).
+        pub fn collateral_unit_atoms(&self) -> u64 {
+            crate::growth_v19::whole_token_atoms(crate::growth_v19::collateral_decimals_of(self.collateral_decimals_p1))
         }
 
         /// The depth state (`growth_v19::DepthState`) the one depth writer updates.
@@ -7747,6 +7781,7 @@ pub mod state {
                 last_good_e6: self.depth_last_good_e6,
                 last_good_slot: self.depth_last_good_slot,
                 rise_slot64: u32::from_le_bytes(self.depth_rise_slot64_le),
+                tw: self.depth_tw(),
             }
         }
 
@@ -7758,6 +7793,7 @@ pub mod state {
             self.depth_last_good_e6 = d.last_good_e6;
             self.depth_last_good_slot = d.last_good_slot;
             self.depth_rise_slot64_le = d.rise_slot64.to_le_bytes();
+            self.set_depth_tw(d.tw);
         }
 
         /// R2.1 + R2-L2: the resolved thresholds in collateral ATOMS (whole tokens x
@@ -7789,6 +7825,7 @@ pub mod state {
             self.depth_last_good_e6 = f.depth_last_good_e6;
             self.depth_last_good_slot = f.depth_last_good_slot;
             self.depth_rise_slot64_le = f.depth_rise_slot64.to_le_bytes();
+            self.set_depth_tw(f.depth_tw);
         }
     }
 
@@ -7839,11 +7876,7 @@ pub mod state {
             || !crate::growth_v19::attested_max_tier_ok(g.attested_max_tier)
             || g.rent_kink_bps as u128 > crate::growth_v19::BPS
             || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
-            || g._reserved1 != [0u8; 2]
-            || g.alloc_alpha_bps != 0
-            || g.alloc_buffer_bps != 0
-            || g.cushion_target_bps != 0
-            || g.cushion_share_bps != 0
+            || !crate::growth_v19::depth_tw_window_ok(g.depth_tw())
             || g.l_launch_x100 < crate::growth_v19::LEVERAGE_X100_ONE
             || g.l_launch_x100 > g.l_tier_x100
             || g.l_tier_x100 > tier_max
@@ -28265,12 +28298,14 @@ pub mod processor {
         // cap means MAXIMUM rent on every open position of the market, so stopping pushes is
         // also a "max rent on every clamp market" action.
         let seed = g.depth_seed_e6();
+        let unit = g.collateral_unit_atoms();
         g.set_depth_state(growth_v19::depth_push_update(
             g.depth_state(),
             source,
             depth_e6,
             authenticated_slot,
             seed,
+            unit,
         ));
         let ctx = growth_g8_ctx_view(group, asset_index, &g, None)?;
         if ctx.clamp {
@@ -42868,7 +42903,9 @@ pub mod processor {
         let fresh = growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, now);
         // R2-M1: every reader uses min(fresh, rate-limited last_good): the depth rises <= 2x per
         // epoch and falls at once, for both sources.
-        let fresh = growth_v19::usable_depth_e6(fresh, g.depth_last_good_e6);
+        // Round 3 item 4: and never above the time-weighted window minimum (5-10 min).
+        let tw_min = g.depth_tw_min_e6();
+        let fresh = growth_v19::usable_depth_e6(fresh, g.depth_last_good_e6, tw_min);
         let thresholds = g.tier_thresholds_e6();
         let venue_tier =
             growth_v19::venue_tier(fresh.unwrap_or(0), g.depth_source, thresholds, g.attested_max_tier);
@@ -42883,6 +42920,7 @@ pub mod processor {
             g.depth_last_good_e6,
             g.depth_last_good_slot,
             now,
+            tw_min,
         );
         let market = group
             .markets
@@ -48979,6 +49017,7 @@ mod g8_kani_proofs {
         assert_eq!(r.ceil_slot, now);
         assert_eq!((r.depth_e6, r.depth_slot, r.depth_prev_e6, r.depth_source), (0, 0, 0, 0));
         assert_eq!((r.depth_last_good_e6, r.depth_last_good_slot), (0, 0));
+        assert_eq!(r.depth_tw, DepthWindow::default(), "round 3: the window is reset too");
         kani::cover!(la < lt, "launch below tier");
         kani::cover!(la > lt, "launch above tier clamps");
         kani::cover!(la == lt, "launch at tier");
@@ -49105,7 +49144,7 @@ mod g8_kani_proofs {
             if now < slot || now - slot > DEPTH_MAX_AGE_SLOTS {
                 let fr = fresh_depth_e6(depth, prev, slot, src, now);
                 assert_eq!(fr, None);
-                let cap = cap_depth_e6(src, fr, lg as u64, lgs as u64, now);
+                let cap = cap_depth_e6(src, fr, lg as u64, lgs as u64, now, None);
                 assert_eq!(cap.is_some(), depth_ever(src));
             }
         }
@@ -49162,7 +49201,9 @@ mod g8_kani_proofs {
         let n2: u32 = kani::any();
         let (lgs, n1, n2) = (lgs as u64, n1 as u64 * 64, n2 as u64 * 64);
         let ever = src | DEPTH_EVER;
-        let c = cap_depth_e6(ever, eff, lg, lgs, n1);
+        let twm: Option<u32> = kani::any();
+        let twm = twm.map(|t| t as u64);
+        let c = cap_depth_e6(ever, eff, lg, lgs, n1, twm);
         assert!(c.is_some(), "never uncapped once DEPTH_EVER");
         let tier: u8 = kani::any();
         let price: u16 = kani::any();
@@ -49173,10 +49214,14 @@ mod g8_kani_proofs {
             assert_eq!(c, eff);
         } else {
             assert!(c.unwrap() <= lg);
+            // round 3 item 4: never above the last window minimum (a zero in it: 0)
+            if let Some(t) = twm {
+                assert!(c.unwrap() <= t);
+            }
             let (a, b) = if n1 <= n2 { (n1, n2) } else { (n2, n1) };
             assert!(sticky_depth_e6(lg, lgs, a) >= sticky_depth_e6(lg, lgs, b));
         }
-        assert_eq!(cap_depth_e6(src & !DEPTH_EVER, None, lg, lgs, n1), None);
+        assert_eq!(cap_depth_e6(src & !DEPTH_EVER, None, lg, lgs, n1, twm), None);
         let k = n1.saturating_sub(lgs) / DEPTH_STICKY_EPOCH_SLOTS;
         kani::cover!(eff.is_some_and(|e| e > 0), "fresh depth");
         kani::cover!(eff == Some(0) && c == Some(0), "fresh real 0: cap 0");
@@ -49219,9 +49264,10 @@ mod g8_kani_proofs {
             last_good_e6: lg as u64,
             last_good_slot: lgs as u64,
             rise_slot64: re,
+            tw: DepthWindow::default(),
         };
         let seed: u32 = kani::any();
-        let o = depth_push_update(st, new_src, n, now, seed as u64);
+        let o = depth_push_update(st, new_src, n, now, seed as u64, 1);
         if s != 0 && now <= s {
             assert!(o.depth_e6 <= d && o.depth_e6 <= n);
             assert_eq!((o.depth_prev_e6, o.depth_slot), (p, s));
@@ -49235,16 +49281,25 @@ mod g8_kani_proofs {
         let fr = fresh_depth_e6(o.depth_e6, o.depth_prev_e6, o.depth_slot, o.depth_source, now);
         if let Some(f) = fr {
             assert!(depth_ever(o.depth_source));
-            // R2-M1: the rate-limited value of the fresh reading, stamped with the sample slot
-            assert_eq!((o.last_good_e6, o.rise_slot64), depth_rate_limited(ever, lg as u64, re, f, o.depth_slot, seed as u64));
-            assert_eq!(o.last_good_slot, o.depth_slot);
+            // R2-M1 + round 3 item 4: the rate-limited value of the WINDOW minimum (the window
+            // starts empty here, so the minimum is the fresh reading itself, floored to tokens
+            // at unit 1 and saturating below the absent marker)
+            let w2 = depth_tw_update(DepthWindow::default(), depth_tokens_floor(f, 1), o.depth_slot);
+            assert_eq!(o.tw, w2);
+            let w = core::cmp::min(depth_tw_min_atoms(w2, 1).unwrap(), f);
+            assert_eq!(
+                (o.last_good_e6, o.rise_slot64, o.last_good_slot),
+                depth_rate_limited(ever, lg as u64, lgs as u64, re, w, depth_tw_full(w2), o.depth_slot, seed as u64)
+            );
         } else {
             assert_eq!((o.last_good_e6, o.last_good_slot, o.rise_slot64), (lg as u64, lgs as u64, re));
+            assert_eq!(o.tw, DepthWindow::default(), "no fresh sample: the window is untouched");
             assert_eq!(depth_ever(o.depth_source), ever);
         }
         if !(s != 0 && now <= s) && n == 0 {
             assert_eq!(fr, Some(0), "a later-slot real 0 is fresh at once");
-            assert_eq!(o.last_good_e6, 0, "and the rate-limited depth falls to 0 at once");
+            // round 3 D2: last_good is HELD, but every reader reads 0 at once
+            assert_eq!(usable_depth_e6(fr, o.last_good_e6, depth_tw_min_atoms(o.tw, 1)), Some(0));
         }
         let eff = fr.unwrap_or(0);
         kani::cover!(s != 0 && now == s && n > d && o.depth_e6 == d, "same-slot raise refused");
@@ -49504,14 +49559,22 @@ mod g8_kani_proofs {
         // both scaled by 1,000 so `lg` can exceed the tier-0 seed (>= 5e9 atoms); with `lg` a raw u32
         // the "one doubling" cover was unreachable (run 2026-10-14: 5 of 6 covers).
         let (lg, r) = (lg as u64 * 1_000, r as u64 * 1_000);
-        let (out, stamp2) = depth_rate_limited(ever, lg, stamp, r, slot, seed);
-        assert!(out <= r, "never above the reading");
+        // round 3 item 4: `r` is the window minimum; `full` whether the window spans a full
+        // adjacent bucket pair; the last-good slot is the slot before (no staleness decay here:
+        // the decay of a value held through a zero is `kani_r3_item4_window_and_d2`'s job)
+        let full: bool = kani::any();
+        let (out, stamp2, _lgs2) = depth_rate_limited(ever, lg, slot.saturating_sub(1), stamp, r, full, slot, seed);
         if !ever {
-            assert!(out < th[0], "first reading below T1");
+            assert!(out <= r, "never above the reading");
+            assert!(out <= seed / DEPTH_BOOTSTRAP_DIV, "D-I1: first reading <= T1 / 16");
             assert_eq!(venue_tier(out, DEPTH_SOURCE_DEX, th, 3), 0, "first reading: tier 0");
+        } else if r == 0 {
+            assert_eq!((out, stamp2), (lg, stamp), "D2: a real zero holds last_good");
         } else if r <= lg {
             assert_eq!((out, stamp2), (r, stamp), "down at once");
         } else if out > lg {
+            assert!(out <= r, "never above the reading");
+            assert!(full, "a rise needs a full window");
             assert!(slot >= prev_rise + RATCHET_EPOCH_SLOTS, "a rise only >= 9,000 slots after the last one");
             assert!(out <= core::cmp::max(lg.saturating_mul(2), seed / DEPTH_BOOTSTRAP_DIV), "<= 2x");
             assert_eq!(stamp2, depth_rise_stamp(slot));
@@ -49521,16 +49584,20 @@ mod g8_kani_proofs {
         // the usable depth is min(fresh, last_good): never above either
         let fresh: Option<u32> = kani::any();
         let fresh = fresh.map(|f| f as u64);
-        let u = usable_depth_e6(fresh, out);
-        assert!(u.is_none_or(|x| x <= out && fresh.is_some_and(|f| x <= f)));
-        kani::cover!(!ever && r > seed && out == seed, "first reading clamped to the tier-0 level");
-        kani::cover!(ever && r > lg && lg > seed && out == lg * 2, "one doubling");
+        let twm: Option<u32> = kani::any();
+        let twm = twm.map(|t| t as u64);
+        let u = usable_depth_e6(fresh, out, twm);
+        assert!(u.is_none_or(|x| x <= out && fresh.is_some_and(|f| x <= f) && twm.is_none_or(|t| x <= t)));
+        kani::cover!(!ever && r > seed && out == seed / DEPTH_BOOTSTRAP_DIV, "first reading clamped to T1 / 16");
+        kani::cover!(ever && r == 0 && lg > 0 && out == lg, "a real zero holds last_good");
+        kani::cover!(ever && r > lg && !full && (dt as u64) >= RATCHET_EPOCH_SLOTS && out == lg, "no full window: no rise");
+        kani::cover!(ever && r > lg && lg > seed && full && out == lg * 2, "one doubling");
         kani::cover!(ever && r > lg && (dt as u64) < RATCHET_EPOCH_SLOTS && out == lg, "a rise inside the window refused");
         kani::cover!(
             ever && r > lg && slot / RATCHET_EPOCH_SLOTS > prev_rise / RATCHET_EPOCH_SLOTS && (dt as u64) < RATCHET_EPOCH_SLOTS && out == lg,
             "boundary straddle: a new calendar epoch, still refused"
         );
-        kani::cover!(ever && lg == 0 && r > 0 && out == core::cmp::min(r, seed / DEPTH_BOOTSTRAP_DIV), "bootstrap out of 0");
+        kani::cover!(ever && lg == 0 && r > 0 && full && out == core::cmp::min(r, seed / DEPTH_BOOTSTRAP_DIV), "bootstrap out of 0");
         kani::cover!(ever && r < lg && out == r, "falls at once");
     }
 }
@@ -49634,5 +49701,71 @@ mod r3_kani_proofs {
         kani::cover!(prev > tg + RATCHET_STEP_X100 && f == prev - RATCHET_STEP_X100, "one step");
         kani::cover!(prev > tg && prev <= tg + RATCHET_STEP_X100 && f == tg, "lands on target");
         kani::cover!(!hl && adl && dr && s == 2, "ADL outranks draw");
+    }
+
+    /// Item 4 (GAP-5, D-I1, D2): the two-bucket window. A fold keeps the minimum of its bucket;
+    /// the next bucket rotates (prev = the old bucket's min); any other bucket (a gap, or the
+    /// first sample) leaves prev absent; the window minimum is <= the newest sample and <= every
+    /// sample of both buckets; `full` iff prev is present; the validator accepts every state the
+    /// update produces from a valid one; the D2 limiter holds `last_good` on a zero and decays a
+    /// held value at the sticky rate.
+    /// Mutants: `max` for `min` in a bucket; rotate on every new bucket (no gap check); prev kept
+    /// across a gap; a full window with prev absent; zero not held (round 2: last_good = 0); the
+    /// held value not decayed (a long zero recovers to the old depth at once); ring off by one.
+    #[kani::proof]
+    fn kani_r3_item4_window_and_d2() {
+        let cur: u32 = kani::any();
+        let prev: u32 = kani::any();
+        let bk: u16 = kani::any();
+        let w = if bk == 0 {
+            DepthWindow::default()
+        } else {
+            DepthWindow { cur_tokens: cur, prev_tokens: prev, bucket_p1: bk }
+        };
+        kani::assume(depth_tw_window_ok(w));
+        let r: u32 = kani::any();
+        kani::assume(r != DEPTH_TW_ABSENT);
+        let slot: u32 = kani::any();
+        let slot = slot as u64;
+        let o = depth_tw_update(w, r, slot);
+        assert!(depth_tw_window_ok(o), "the update preserves validity");
+        let b = depth_tw_bucket_p1(slot);
+        assert_eq!(o.bucket_p1, b);
+        assert!(o.cur_tokens <= r);
+        if w.bucket_p1 == b {
+            assert_eq!(o.cur_tokens, core::cmp::min(cur, r));
+            assert_eq!(o.prev_tokens, w.prev_tokens);
+        } else {
+            assert_eq!(o.cur_tokens, r);
+            let adjacent = w.bucket_p1 != 0
+                && (b as u64 == w.bucket_p1 as u64 + 1 || (w.bucket_p1 as u64 == DEPTH_TW_BUCKET_RING && b == 1));
+            assert_eq!(o.prev_tokens, if adjacent { w.cur_tokens } else { DEPTH_TW_ABSENT });
+        }
+        let m = depth_tw_min_atoms(o, 1).unwrap();
+        assert!(m <= r as u64 && m <= o.cur_tokens as u64);
+        if o.prev_tokens != DEPTH_TW_ABSENT {
+            assert!(m <= o.prev_tokens as u64);
+        }
+        assert_eq!(depth_tw_full(o), o.prev_tokens != DEPTH_TW_ABSENT);
+        // D2 (the limiter on a zero window minimum): held, slot not refreshed
+        let lg: u32 = kani::any();
+        let lgs: u32 = kani::any();
+        let re: u32 = kani::any();
+        let (out, re2, s2) = depth_rate_limited(true, lg as u64, lgs as u64, re, 0, kani::any(), slot, kani::any());
+        assert_eq!((out, re2, s2), (lg as u64, re, lgs as u64));
+        // a positive minimum after a held value is measured against the DECAYED base
+        let wpos: u32 = kani::any();
+        kani::assume(wpos > 0);
+        let seed: u32 = kani::any();
+        let (o2, _, _) = depth_rate_limited(true, lg as u64, lgs as u64, re, wpos as u64, false, slot, seed as u64);
+        let base = sticky_depth_e6(lg as u64, lgs as u64, slot);
+        // no full window: never a rise; down at once to the minimum, else the (decayed) base
+        assert_eq!(o2, core::cmp::min(base, wpos as u64));
+        kani::cover!(w.bucket_p1 == b && r < cur, "same bucket: min");
+        kani::cover!(w.bucket_p1 != 0 && b as u64 == w.bucket_p1 as u64 + 1, "adjacent: rotate");
+        kani::cover!(w.bucket_p1 == 65_535 && b == 1, "ring wrap: rotate");
+        kani::cover!(w.bucket_p1 != 0 && w.bucket_p1 != b && o.prev_tokens == DEPTH_TW_ABSENT, "gap: prev absent");
+        kani::cover!(w.bucket_p1 == 0, "first sample");
+        kani::cover!(slot >= lgs as u64 + 2 * 9_000 && lg > 3 && base == (lg as u64) >> 2, "held value decays");
     }
 }

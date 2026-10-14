@@ -1049,6 +1049,8 @@ pub struct GraduationFields {
     pub depth_last_good_slot: u64,
     /// R2-M1 / D-L2: the last-rise stamp (`slot / 64`) of the rate-limited depth.
     pub depth_rise_slot64: u32,
+    /// Round 3 item 4: the time-weighted depth window (bytes 30..38, 118..120).
+    pub depth_tw: DepthWindow,
 }
 
 /// Security review I-1 (security-review-v21-combination §8): a restarted asset, a reused slot,
@@ -1075,6 +1077,7 @@ pub fn graduation_reset(l_launch_x100: u16, l_tier_x100: u16, now_slot: u64) -> 
         depth_last_good_e6: 0,
         depth_last_good_slot: 0,
         depth_rise_slot64: 0,
+        depth_tw: DepthWindow { cur_tokens: 0, prev_tokens: 0, bucket_p1: 0 },
     }
 }
 
@@ -1228,6 +1231,8 @@ pub struct DepthState {
     /// Security review R2-M1 + D-L2: the slot of the last RISE of `last_good_e6`, in units of
     /// `DEPTH_RISE_STAMP_SLOTS` (64) slots (`slot / 64`, bytes 114..118 of the record).
     pub rise_slot64: u32,
+    /// Round 3 item 4 (GAP-5): the time-weighted two-bucket window (bytes 30..38, 118..120).
+    pub tw: DepthWindow,
 }
 
 /// D-L2: the unit of the stored last-rise stamp. A u32 of 64-slot units wraps after 2^32 * 64 =
@@ -1252,55 +1257,161 @@ pub fn depth_rise_window_open(rise_slot64: u32, slot: u64) -> bool {
     rise_slot64 != u32::MAX && slot >= last.saturating_add(DEPTH_STICKY_EPOCH_SLOTS)
 }
 
-/// Security review R2-M1 ("up slowly, down at once" for the depth itself). The rate-limited
-/// depth `last_good` after a FRESH reading `r` (sample slot `slot`). `seed_e6` = the market's
-/// T1 in atoms minus 1 (the highest tier-0 depth). Returns `(last_good, rise_slot64)`:
-/// * the market's FIRST fresh reading (`DEPTH_EVER` not yet set): `min(r, seed)`, a rise -> it
-///   starts at tier 0 whatever the pool shows;
-/// * `r <= last_good`: `r` at once (down at once; a real 0 included); the rise clock is kept;
-/// * `r > last_good`, at least 9,000 slots after the last rise (`depth_rise_window_open`, D-L2):
-///   `min(r, max(2 * last_good, seed / 16))`, a rise -- at most one doubling per epoch (the
-///   `seed / 16` bootstrap floor only lets a market climb out of a real 0);
-/// * otherwise (a second rise in the same epoch): unchanged.
-///
-/// Two refinements of the proposed `max(last_good, seed) * 2^e` (e = epochs since the last
-/// rise), both closing a jump the rule would allow:
-/// * `2^e`: a market whose depth was steady for e epochs would accept one `2^e` jump at a
-///   single push -- exactly a flash-liquidity spike after a quiet period. Here a rise is one
-///   doubling per epoch whatever the gap.
-/// * `max(last_good, seed)`: a genuinely thin market ($2k, seed $25k) would jump 12.5x to the
-///   tier-0 ceiling in one push (its κ cap with it). Here it doubles per epoch like any other.
-///
-/// So a jump of more than 2x needs a fresh reading in each of several epochs, and any honest
-/// reading in between (the min-of-two of the real pool) takes it down at once.
+// ── v2.2 round 3 item 4 (design GAP-5, D-I1, D2): time-weighted depth minimum ──────────────────
+
+/// The time-weighted window's bucket: 750 slots (~5 min at 400 ms). The window is the current and
+/// the previous bucket, i.e. the minimum of every fresh sample over the last 5-10 minutes.
+pub const DEPTH_TW_BUCKET_SLOTS: u64 = 750;
+/// The stored bucket index is `(slot / 750) % DEPTH_TW_BUCKET_RING + 1` (u16; 0 = no window
+/// history yet). The ring wraps after 65,535 buckets (~49M slots, ~5.7 days); a wrapped false
+/// "same" / "adjacent" match only ever folds an OLDER minimum in (a min), never raises anything.
+pub const DEPTH_TW_BUCKET_RING: u64 = 65_535;
+/// `depth_tw_prev_tokens` value meaning "no previous bucket in the window" (a gap of more than
+/// one bucket, or the window's first bucket). Real readings saturate at `u32::MAX - 1`.
+pub const DEPTH_TW_ABSENT: u32 = u32::MAX;
+
+/// The stored time-weighted window (`AssetGrowthV19` bytes 30..34, 34..38, 118..120).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DepthWindow {
+    /// The minimum fresh reading in the current bucket, whole collateral tokens (floor).
+    pub cur_tokens: u32,
+    /// The minimum of the previous (adjacent) bucket, or `DEPTH_TW_ABSENT`.
+    pub prev_tokens: u32,
+    /// `bucket % ring + 1`; 0 = no window history (a record from before round 3, or reset).
+    pub bucket_p1: u16,
+}
+
+/// The stored bucket code of `slot`.
+pub fn depth_tw_bucket_p1(slot: u64) -> u16 {
+    ((slot / DEPTH_TW_BUCKET_SLOTS) % DEPTH_TW_BUCKET_RING + 1) as u16
+}
+
+/// Atoms -> whole tokens (floor), saturating at `u32::MAX - 1` (never the absent marker).
+pub fn depth_tokens_floor(depth_atoms: u64, unit_atoms: u64) -> u32 {
+    if unit_atoms == 0 {
+        return 0;
+    }
+    let t = depth_atoms / unit_atoms;
+    if t >= DEPTH_TW_ABSENT as u64 {
+        DEPTH_TW_ABSENT - 1
+    } else {
+        t as u32
+    }
+}
+
+/// Fold one FRESH sample (`r_tokens`, at `slot`) into the window:
+/// * same bucket: `cur = min(cur, r)`;
+/// * the next bucket: `prev = cur`, `cur = r`;
+/// * otherwise (the first sample, or a gap of more than one bucket): `prev = ABSENT`, `cur = r`.
+pub fn depth_tw_update(w: DepthWindow, r_tokens: u32, slot: u64) -> DepthWindow {
+    let b = depth_tw_bucket_p1(slot);
+    if w.bucket_p1 != 0 && b == w.bucket_p1 {
+        return DepthWindow {
+            cur_tokens: if r_tokens < w.cur_tokens { r_tokens } else { w.cur_tokens },
+            ..w
+        };
+    }
+    let next = if w.bucket_p1 == 0 {
+        0
+    } else if w.bucket_p1 as u64 == DEPTH_TW_BUCKET_RING {
+        1
+    } else {
+        w.bucket_p1 + 1
+    };
+    let prev = if w.bucket_p1 != 0 && b == next { w.cur_tokens } else { DEPTH_TW_ABSENT };
+    DepthWindow { cur_tokens: r_tokens, prev_tokens: prev, bucket_p1: b }
+}
+
+/// The window minimum in ATOMS: `min(cur, prev)` (absent prev ignored), `None` without history.
+/// Saturating multiply (a saturated value is an upper bound only ever min-ed with real ones).
+pub fn depth_tw_min_atoms(w: DepthWindow, unit_atoms: u64) -> Option<u64> {
+    if w.bucket_p1 == 0 {
+        return None;
+    }
+    let m = if w.prev_tokens < w.cur_tokens { w.prev_tokens } else { w.cur_tokens };
+    Some((m as u64).saturating_mul(unit_atoms))
+}
+
+/// Validator: no history (bucket 0) means an all-zero window (every pre-round-3 record: bytes
+/// 30..38 were validated 0); with history the current minimum is a real reading (never the
+/// absent marker) and the bucket code is in `1..=ring`.
+pub fn depth_tw_window_ok(w: DepthWindow) -> bool {
+    if w.bucket_p1 == 0 {
+        w.cur_tokens == 0 && w.prev_tokens == 0
+    } else {
+        w.cur_tokens != DEPTH_TW_ABSENT && (w.bucket_p1 as u64) <= DEPTH_TW_BUCKET_RING
+    }
+}
+
+/// Whether the window spans a full adjacent bucket pair (a RISE of the rate-limited depth needs
+/// it: liquidity must have been the minimum over >= one whole previous bucket, not one push).
+pub fn depth_tw_full(w: DepthWindow) -> bool {
+    w.bucket_p1 != 0 && w.prev_tokens != DEPTH_TW_ABSENT
+}
+
+/// Security review R2-M1 ("up slowly, down at once" for the depth itself) + round 3 item 4
+/// (GAP-5: fed the TIME-WEIGHTED window minimum `w`, D-I1, D2). The rate-limited depth
+/// `last_good` after a fresh sample folded into the window (sample slot `slot`). `seed_e6` = the
+/// market's T1 in atoms minus 1. `rise_ok` = the window spans a full adjacent bucket pair
+/// (`depth_tw_full`). Returns `(last_good, rise_slot64, last_good_slot)`:
+/// * the market's FIRST fresh reading (`DEPTH_EVER` not yet set): `min(w, seed / 16)` (D-I1:
+///   round 2 seeded `T1 - 1`, ~12x a $2k pool's honest κ cap on a first-pair flash), a rise;
+/// * `w == 0` (a REAL zero inside the window): `last_good` and its slot are HELD (D2). The zero
+///   still caps every reader at 0 at once through the window (`usable_depth_e6`,
+///   `cap_depth_e6`), and keeps doing so while it is inside the 5-10 min window, so a one-sample
+///   glitch no longer costs a deep market ~7 h of doublings from T1/16;
+/// * otherwise against `base = sticky_depth_e6(last_good, last_good_slot, slot)` (equal to
+///   `last_good` in steady state; a value held through a long zero decays at the sticky rate,
+///   halving per 9,000 slots of zero, so a zero lasting hours recovers only to `last_good / 2^k`):
+///   * `w <= base`: `w` at once (down at once); the rise clock is kept;
+///   * `w > base`, `rise_ok` and >= 9,000 slots after the last rise (`depth_rise_window_open`,
+///     D-L2): `min(w, max(2 * base, seed / 16))`, a rise -- at most one doubling per 9,000 slots;
+///   * otherwise: `base`.
+#[allow(clippy::too_many_arguments)]
 pub fn depth_rate_limited(
     ever: bool,
     last_good_e6: u64,
+    last_good_slot: u64,
     rise_slot64: u32,
-    r: u64,
+    w: u64,
+    rise_ok: bool,
     slot: u64,
     seed_e6: u64,
-) -> (u64, u32) {
+) -> (u64, u32, u64) {
     let e = depth_rise_stamp(slot);
+    let floor = seed_e6 / DEPTH_BOOTSTRAP_DIV;
     if !ever {
-        return (if r < seed_e6 { r } else { seed_e6 }, e);
+        return (if w < floor { w } else { floor }, e, slot);
     }
-    if r <= last_good_e6 {
-        return (r, rise_slot64);
+    if w == 0 {
+        return (last_good_e6, rise_slot64, last_good_slot);
     }
-    if depth_rise_window_open(rise_slot64, slot) {
-        let doubled = last_good_e6.saturating_mul(2);
-        let floor = seed_e6 / DEPTH_BOOTSTRAP_DIV;
+    let base = sticky_depth_e6(last_good_e6, last_good_slot, slot);
+    if w <= base {
+        return (w, rise_slot64, slot);
+    }
+    if rise_ok && depth_rise_window_open(rise_slot64, slot) {
+        let doubled = base.saturating_mul(2);
         let up = if doubled > floor { doubled } else { floor };
-        return (if r < up { r } else { up }, e);
+        return (if w < up { w } else { up }, e, slot);
     }
-    (last_good_e6, rise_slot64)
+    (base, rise_slot64, slot)
 }
 
 /// The depth every reader uses (tiers and the κ cap): `min(fresh reading, rate-limited
-/// last_good)`; `None` while there is no fresh reading (the sticky path then applies).
-pub fn usable_depth_e6(fresh: Option<u64>, last_good_e6: u64) -> Option<u64> {
-    fresh.map(|f| if f < last_good_e6 { f } else { last_good_e6 })
+/// last_good, time-weighted window minimum)`; `None` while there is no fresh reading (the
+/// sticky path then applies). `tw_min_e6` `None` = no window history (a pre-round-3 record):
+/// round 2's `min(fresh, last_good)` exactly.
+pub fn usable_depth_e6(fresh: Option<u64>, last_good_e6: u64, tw_min_e6: Option<u64>) -> Option<u64> {
+    let tw = tw_min_e6.unwrap_or(u64::MAX);
+    fresh.map(|f| {
+        let m = if f < last_good_e6 { f } else { last_good_e6 };
+        if m < tw {
+            m
+        } else {
+            tw
+        }
+    })
 }
 
 /// THE depth writer (every PushAuthMark form: 35 B, 44 B mode 0/1, and the on-chain DEX mode 2,
@@ -1330,6 +1441,7 @@ pub fn depth_push_update(
     new_depth_e6: u64,
     now_slot: u64,
     seed_e6: u64,
+    unit_atoms: u64,
 ) -> DepthState {
     let (source, new_depth_e6) = if source == DEPTH_SOURCE_NONE || source > DEPTH_SOURCE_DEX {
         (DEPTH_SOURCE_NONE, 0)
@@ -1365,15 +1477,32 @@ pub fn depth_push_update(
         last_good_e6: st.last_good_e6,
         last_good_slot: st.last_good_slot,
         rise_slot64: st.rise_slot64,
+        tw: st.tw,
     };
     if let Some(f) = fresh_depth_e6(d, prev, slot, out.depth_source, now_slot) {
-        // R2-M1: last_good is the RATE-LIMITED depth (rises <= 2x per epoch, falls at once).
-        let (lg, re) = depth_rate_limited(depth_ever(st.depth_source), st.last_good_e6, st.rise_slot64, f, slot, seed_e6);
+        // Round 3 item 4: the fresh reading enters the time-weighted window (whole tokens,
+        // floor); the rate limiter is fed the WINDOW minimum, so a rise needs liquidity held over
+        // the whole window (>= one full bucket), not two pushes.
+        out.tw = depth_tw_update(st.tw, depth_tokens_floor(f, unit_atoms), slot);
+        let w = depth_tw_min_atoms(out.tw, unit_atoms).unwrap_or(0);
+        let w = if w < f { w } else { f };
+        // R2-M1: last_good is the RATE-LIMITED depth (rises <= 2x per 9,000 slots, falls at
+        // once, a real zero held and gated through the window -- D2).
+        let (lg, re, lgs) = depth_rate_limited(
+            depth_ever(st.depth_source),
+            st.last_good_e6,
+            st.last_good_slot,
+            st.rise_slot64,
+            w,
+            depth_tw_full(out.tw),
+            slot,
+            seed_e6,
+        );
         out.depth_source |= DEPTH_EVER;
         out.last_good_e6 = lg;
-        // The sticky decay clock: the slot of the last FRESH sample (not the last rise, not
-        // the moment the reading went stale): the first halving is 9,000 slots after it.
-        out.last_good_slot = slot;
+        // The sticky decay clock: the slot of the last fresh POSITIVE sample (held through a
+        // real zero, D2): the first halving is 9,000 slots after it.
+        out.last_good_slot = lgs;
         out.rise_slot64 = re;
     }
     out
@@ -1404,11 +1533,16 @@ pub fn cap_depth_e6(
     last_good_e6: u64,
     last_good_slot: u64,
     now_slot: u64,
+    tw_min_e6: Option<u64>,
 ) -> Option<u64> {
     if fresh_depth_e6.is_some() {
         fresh_depth_e6
     } else if depth_ever(depth_source_byte) {
-        Some(sticky_depth_e6(last_good_e6, last_good_slot, now_slot))
+        // Round 3 item 4: never above the last window minimum either (a real zero still in the
+        // window keeps the sticky cap at 0: the fresh-zero ruling survives the held last_good).
+        let st = sticky_depth_e6(last_good_e6, last_good_slot, now_slot);
+        let tw = tw_min_e6.unwrap_or(u64::MAX);
+        Some(if st < tw { st } else { tw })
     } else {
         None
     }
@@ -2679,6 +2813,20 @@ mod tests {
         assert_eq!((attested_max_tier_eff(0), attested_max_tier_eff(2), attested_max_tier_eff(9)), (1, 2, 3));
     }
 
+    /// Round 3 item 4: the one depth writer at 6-decimal collateral.
+    fn up(st: DepthState, src: u8, d: u64, now: u64, seed: u64) -> DepthState {
+        depth_push_update(st, src, d, now, seed, USD_ATOMS)
+    }
+
+    /// Every reader's depth from a state at `now`.
+    fn usable_of(x: DepthState, now: u64) -> Option<u64> {
+        usable_depth_e6(
+            fresh_depth_e6(x.depth_e6, x.depth_prev_e6, x.depth_slot, x.depth_source, now),
+            x.last_good_e6,
+            depth_tw_min_atoms(x.tw, USD_ATOMS),
+        )
+    }
+
     #[test]
     fn g8_wl2_same_slot_push_is_not_a_second_sample() {
         let t1 = DEPTH_TIER1_E6;
@@ -2686,146 +2834,208 @@ mod tests {
         let st = |d, p, s| DepthState { depth_e6: d, depth_prev_e6: p, depth_slot: s, depth_source: if d == 0 { 0 } else { a }, ..Default::default() };
         let tri = |x: DepthState| (x.depth_e6, x.depth_prev_e6, x.depth_slot);
         // later slot: rotate
-        assert_eq!(tri(depth_push_update(st(t1, 0, 10), a, 2 * t1, 11, u64::MAX)), (2 * t1, t1, 11));
+        assert_eq!(tri(up(st(t1, 0, 10), a, 2 * t1, 11, u64::MAX)), (2 * t1, t1, 11));
         // first ever push (slot 0 = never): rotate
-        assert_eq!(tri(depth_push_update(st(0, 0, 0), a, t1, 5, u64::MAX)), (t1, 0, 5));
+        assert_eq!(tri(up(st(0, 0, 0), a, t1, 5, u64::MAX)), (t1, 0, 5));
         // same slot: prev kept, depth can only fall
-        assert_eq!(tri(depth_push_update(st(t1, 0, 10), a, 2 * t1, 10, u64::MAX)), (t1, 0, 10), "cannot raise");
-        assert_eq!(tri(depth_push_update(st(2 * t1, 7, 10), a, t1, 10, u64::MAX)), (t1, 7, 10), "can fall");
-        assert_eq!(tri(depth_push_update(st(2 * t1, 7, 10), 0, 0, 10, u64::MAX)), (0, 7, 10), "35 B in the same slot zeroes");
+        assert_eq!(tri(up(st(t1, 0, 10), a, 2 * t1, 10, u64::MAX)), (t1, 0, 10), "cannot raise");
+        assert_eq!(tri(up(st(2 * t1, 7, 10), a, t1, 10, u64::MAX)), (t1, 7, 10), "can fall");
+        assert_eq!(tri(up(st(2 * t1, 7, 10), 0, 0, 10, u64::MAX)), (0, 7, 10), "35 B in the same slot zeroes");
         // a same-slot DEX push that does not lower the value keeps the attested label
-        let x = depth_push_update(st(t1, 7, 10), DEPTH_SOURCE_DEX, 2 * t1, 10, u64::MAX);
+        let x = up(st(t1, 7, 10), DEPTH_SOURCE_DEX, 2 * t1, 10, u64::MAX);
         assert_eq!(depth_source_of(x.depth_source), a);
-        let x = depth_push_update(st(2 * t1, 7, 10), DEPTH_SOURCE_DEX, t1, 10, u64::MAX);
+        let x = up(st(2 * t1, 7, 10), DEPTH_SOURCE_DEX, t1, 10, u64::MAX);
         assert_eq!(depth_source_of(x.depth_source), DEPTH_SOURCE_DEX);
         // two same-slot attested pushes from nothing: still one sample -> effective 0
-        let s = depth_push_update(st(0, 0, 0), a, 5 * t1, 20, u64::MAX);
-        let s = depth_push_update(s, a, 5 * t1, 20, u64::MAX);
+        let s = up(st(0, 0, 0), a, 5 * t1, 20, u64::MAX);
+        let s = up(s, a, 5 * t1, 20, u64::MAX);
         assert_eq!(effective_depth_e6(s.depth_e6, s.depth_prev_e6, s.depth_slot, 20), 0, "W-L2: one slot is one sample");
         assert!(!depth_ever(s.depth_source), "no fresh depth yet");
-        let s = depth_push_update(s, a, 5 * t1, 21, u64::MAX);
+        assert_eq!(s.tw, DepthWindow::default(), "no fresh sample: the window is untouched");
+        let s = up(s, a, 5 * t1, 21, u64::MAX);
         assert_eq!(effective_depth_e6(s.depth_e6, s.depth_prev_e6, s.depth_slot, 21), 5 * t1, "two slots: effective");
         // regression stamp: fall only
-        assert_eq!(tri(depth_push_update(st(t1, 3, 10), a, 2 * t1, 9, u64::MAX)), (t1, 3, 10));
+        assert_eq!(tri(up(st(t1, 3, 10), a, 2 * t1, 9, u64::MAX)), (t1, 3, 10));
         // unknown source stores nothing
-        assert_eq!(tri(depth_push_update(st(t1, 3, 10), 3, 2 * t1, 11, u64::MAX)), (0, t1, 11));
+        assert_eq!(tri(up(st(t1, 3, 10), 3, 2 * t1, 11, u64::MAX)), (0, t1, 11));
+    }
+
+    /// Round 3 item 4: the two-bucket window primitives.
+    #[test]
+    fn r3_item4_window_primitives() {
+        let b = DEPTH_TW_BUCKET_SLOTS;
+        let w0 = DepthWindow::default();
+        assert_eq!(depth_tw_min_atoms(w0, USD_ATOMS), None, "no history");
+        assert!(!depth_tw_full(w0) && depth_tw_window_ok(w0));
+        // first sample: prev absent, min = the sample
+        let w = depth_tw_update(w0, 100, 5);
+        assert_eq!(w, DepthWindow { cur_tokens: 100, prev_tokens: DEPTH_TW_ABSENT, bucket_p1: 1 });
+        assert_eq!(depth_tw_min_atoms(w, USD_ATOMS), Some(100 * USD_ATOMS));
+        assert!(!depth_tw_full(w));
+        // same bucket: min
+        let w = depth_tw_update(w, 300, b - 1);
+        assert_eq!(w.cur_tokens, 100);
+        let w = depth_tw_update(w, 40, b - 1);
+        assert_eq!(w.cur_tokens, 40);
+        // the next bucket rotates: prev = 40, cur = the new sample
+        let w = depth_tw_update(w, 500, b);
+        assert_eq!((w.cur_tokens, w.prev_tokens, w.bucket_p1), (500, 40, 2));
+        assert!(depth_tw_full(w));
+        assert_eq!(depth_tw_min_atoms(w, USD_ATOMS), Some(40 * USD_ATOMS), "the older bucket's min still binds");
+        // a gap of more than one bucket: prev absent again
+        let g = depth_tw_update(w, 700, 3 * b);
+        assert_eq!((g.cur_tokens, g.prev_tokens), (700, DEPTH_TW_ABSENT));
+        // ring wrap: bucket 65,535 -> 1 is adjacent
+        let r = DepthWindow { cur_tokens: 9, prev_tokens: DEPTH_TW_ABSENT, bucket_p1: 65_535 };
+        let r2 = depth_tw_update(r, 11, 65_535 * b);
+        assert_eq!((r2.bucket_p1, r2.prev_tokens), (1, 9));
+        // tokens: floor, saturating below the absent marker
+        assert_eq!(depth_tokens_floor(1_999_999, USD_ATOMS), 1);
+        assert_eq!(depth_tokens_floor(u64::MAX, 1), DEPTH_TW_ABSENT - 1);
+        // validator
+        assert!(!depth_tw_window_ok(DepthWindow { cur_tokens: 1, prev_tokens: 0, bucket_p1: 0 }));
+        assert!(!depth_tw_window_ok(DepthWindow { cur_tokens: DEPTH_TW_ABSENT, prev_tokens: 0, bucket_p1: 3 }));
+        assert!(depth_tw_window_ok(DepthWindow { cur_tokens: 0, prev_tokens: DEPTH_TW_ABSENT, bucket_p1: 3 }));
     }
 
     #[test]
     fn r2_sticky_depth_cap_w_m1() {
         let t1 = DEPTH_TIER1_E6;
         let a = DEPTH_SOURCE_ATTESTED;
-        // two later-slot pushes: fresh -> DEPTH_EVER + last good
-        let s = depth_push_update(DepthState::default(), a, 4 * t1, 100, u64::MAX);
-        let s = depth_push_update(s, a, 2 * t1, 101, u64::MAX);
+        // two later-slot pushes: fresh -> DEPTH_EVER + last good (seed MAX: no D-I1 clamp here)
+        let s = up(DepthState::default(), a, 4 * t1, 100, u64::MAX);
+        let s = up(s, a, 2 * t1, 101, u64::MAX);
         assert!(depth_ever(s.depth_source));
         assert_eq!((s.last_good_e6, s.last_good_slot), (2 * t1, 101));
-        // 35 B push: depth 0, DEPTH_EVER and last good kept
-        let z = depth_push_update(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
+        // 35 B push: depth 0, DEPTH_EVER, last good and the window kept
+        let z = up(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
         assert_eq!(z.depth_e6, 0);
         assert_eq!(z.depth_source, DEPTH_EVER | DEPTH_PREV_REAL, "absent current, real previous");
-        assert_eq!((z.last_good_e6, z.last_good_slot), (2 * t1, 101));
+        assert_eq!((z.last_good_e6, z.last_good_slot, z.tw), (2 * t1, 101, s.tw));
         // first push of a new pair (prev 0): effective 0, sticky stays
-        let f = depth_push_update(z, a, 9 * t1, 103, u64::MAX);
+        let f = up(z, a, 9 * t1, 103, u64::MAX);
         assert_eq!(effective_depth_e6(f.depth_e6, f.depth_prev_e6, f.depth_slot, 103), 0);
         assert_eq!(f.last_good_e6, 2 * t1);
         // next pair: a LOWER fresh reading replaces it
-        let g = depth_push_update(f, a, t1, 104, u64::MAX);
+        let g = up(f, a, t1, 104, u64::MAX);
         assert_eq!((g.last_good_e6, g.last_good_slot), (t1, 104), "fresh replaces, lower too");
-        // cap depth: fresh -> eff; absent + ever -> last_good >> k; never -> None
-        assert_eq!(cap_depth_e6(a, Some(7), 0, 0, 0), Some(7));
-        assert_eq!(cap_depth_e6(a | DEPTH_EVER, Some(0), 1_000, 0, 0), Some(0), "a fresh real 0 caps at 0");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 8_999), Some(1_000));
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 9_000), Some(500), "halves per epoch");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 18_000), Some(250));
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, u64::MAX, 0, 64 * 9_000), Some(0), "k >= 64 -> 0");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 500, 100), Some(1_000), "future stamp: no decay, still capped");
-        assert_eq!(cap_depth_e6(0, None, 1_000, 100, 200), None, "never had depth: no cap");
+        // cap depth: fresh -> eff; absent + ever -> min(last_good >> k, window min); never -> None
+        assert_eq!(cap_depth_e6(a, Some(7), 0, 0, 0, None), Some(7));
+        assert_eq!(cap_depth_e6(a | DEPTH_EVER, Some(0), 1_000, 0, 0, None), Some(0), "a fresh real 0 caps at 0");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 8_999, None), Some(1_000));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 9_000, None), Some(500), "halves per epoch");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 18_000, None), Some(250));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, u64::MAX, 0, 64 * 9_000, None), Some(0), "k >= 64 -> 0");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 500, 100, None), Some(1_000), "future stamp: no decay, still capped");
+        assert_eq!(cap_depth_e6(0, None, 1_000, 100, 200, None), None, "never had depth: no cap");
+        // round 3: the sticky cap is never above the last window minimum (a zero in it: 0)
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 200, Some(300)), Some(300));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 200, Some(0)), Some(0));
         // N_cap at the sticky depth, tier 0 (κ 0.5): never uncapped, 0 closes opens
         let c_m = 1_000_000_000_000u128;
         assert_eq!(n_cap_g8_q(true, c_m, 10_000, 0, Some(100_000_000), 1_000_000, PS), Some(50_000_000));
         assert_eq!(n_cap_g8_q(true, c_m, 10_000, 0, Some(0), 1_000_000, PS), Some(0));
         assert_eq!(growth_matcher_caps_g8(false, true, c_m, 10_000, 0, Some(0), 1_000_000, PS, u128::MAX), (0, 0));
-        // I-1 reset clears the sticky state
+        // I-1 reset clears the sticky state and the window
         let r = graduation_reset(500, 2_000, 9);
         assert_eq!((r.depth_source, r.depth_last_good_e6, r.depth_last_good_slot), (0, 0, 0));
+        assert_eq!(r.depth_tw, DepthWindow::default());
         // MUTANT (round-1 rule: absent depth = no cap): the market goes uncapped
         let mutant = |eff: u64| if eff > 0 { Some(eff) } else { None };
         assert_eq!(depth_cap_q(0, mutant(0), 1_000_000, PS), u128::MAX, "mutant: uncapped");
-        assert_ne!(depth_cap_q(0, cap_depth_e6(DEPTH_EVER, None, 1, 0, 0), 1_000_000, PS), u128::MAX);
+        assert_ne!(depth_cap_q(0, cap_depth_e6(DEPTH_EVER, None, 1, 0, 0, None), 1_000_000, PS), u128::MAX);
     }
 
+    /// R2-M1 + D-L2 kept, plus round 3 item 4 (GAP-5, D-I1, D2): the rate-limited depth rises
+    /// at most 2x per 9,000 slots and ONLY on liquidity held over a full window (>= one whole
+    /// 750-slot bucket), falls at once, starts at T1 / 16, and a real zero glitch recovers in
+    /// one window instead of ~7 h.
     #[test]
     fn r2m1_depth_rises_at_most_2x_per_epoch_and_falls_at_once() {
         let th = tier_thresholds([0; 3], 6);
         let seed = th[0] - 1; // $24,999.999999
+        let floor = seed / DEPTH_BOOTSTRAP_DIV; // ~$1,562.5
         let a = DEPTH_SOURCE_DEX;
-        let usable = |x: DepthState, now: u64| usable_depth_e6(fresh_depth_e6(x.depth_e6, x.depth_prev_e6, x.depth_slot, x.depth_source, now), x.last_good_e6);
-        // The reviewer's flash-liquidity scenario: real $2k, a $51M-per-side whale held for two
-        // adjacent-slot DEX reads. Round 2 (no limiter) read tier 3 at once.
+        let b = DEPTH_TW_BUCKET_SLOTS;
         let real = 2_000 * USD_ATOMS;
         let inflated = 500_000_000 * USD_ATOMS;
-        let s0 = depth_push_update(DepthState::default(), a, real, 1_000, seed);
-        let s1 = depth_push_update(s0, a, real, 1_001, seed);
-        assert_eq!(usable(s1, 1_001), Some(real));
-        let w1 = depth_push_update(s1, a, inflated, 1_014, seed);
-        let w2 = depth_push_update(w1, a, inflated, 1_015, seed);
-        let u = usable(w2, 1_015).unwrap();
-        assert_eq!(u, real, "same epoch as the last rise: the spike adds nothing");
-        assert_eq!(venue_tier(u, w2.depth_source, th, 0), 0, "tier 0, not 3");
-        // the whale withdraws: the next honest pair takes it down at once
-        let h1 = depth_push_update(w2, a, real, 1_016, seed);
-        assert_eq!(usable(h1, 1_016), Some(real), "min(real, inflated) and min with last_good");
-        assert_eq!(h1.last_good_e6, real);
-        // a following 35 B push: sticky at the RATE-LIMITED value, not the inflated one
-        let z = depth_push_update(h1, DEPTH_SOURCE_NONE, 0, 1_017, seed);
-        assert_eq!(cap_depth_e6(z.depth_source, None, z.last_good_e6, z.last_good_slot, 1_200), Some(real));
-        // Repeating the spike once per epoch: one doubling per epoch at most (above the seed).
-        let mut st = depth_push_update(DepthState::default(), a, inflated, 9_000, seed);
-        st = depth_push_update(st, a, inflated, 9_001, seed);
-        assert_eq!(st.last_good_e6, seed, "first reading: tier-0 level");
+        // D-I1: a market's FIRST reading is min(r, T1/16): a first-pair flash of $500M reads
+        // ~$1,562 (round 2: T1 - 1, ~12x a $2k pool), tier 0.
+        let f0 = up(up(DepthState::default(), a, inflated, 1_000, seed), a, inflated, 1_001, seed);
+        assert_eq!(f0.last_good_e6, floor);
+        assert_eq!(venue_tier(usable_of(f0, 1_001).unwrap(), f0.depth_source, th, 0), 0);
+        // The reviewer's flash scenario on a real $2k pool: two adjacent-slot inflated reads in
+        // the same bucket add nothing (the window minimum is still the real $2k and a rise needs
+        // a full window anyway).
+        let s1 = up(up(DepthState::default(), a, real, 1_000, seed), a, real, 1_001, seed);
+        assert_eq!(s1.last_good_e6, floor, "first reading: T1/16");
+        let w2 = up(up(s1, a, inflated, 1_014, seed), a, inflated, 1_015, seed);
+        assert_eq!(usable_of(w2, 1_015), Some(floor), "the spike adds nothing");
+        assert_eq!(depth_tw_min_atoms(w2.tw, USD_ATOMS), Some(real), "the window keeps the real min");
+        // A whale must HOLD the liquidity over a whole bucket pair AND wait 9,000 slots per
+        // doubling: pushes every 10 slots from the window opening through the next bucket.
+        let mut st = s1;
+        // the first rise window opens at stamp(1,001) * 64 + 63 + 9,000 = 10,023
+        let mut s = 10_100u64;
+        let hold = |mut st: DepthState, from: u64, to: u64, d: u64| {
+            let mut x = from;
+            while x <= to {
+                st = up(st, a, d, x, seed);
+                x += 10;
+            }
+            st
+        };
         let mut prev = st.last_good_e6;
-        for k in 1..=6u64 {
-            let s = 9_000 + 9_100 * k; // D-L2: >= 9,000 slots after the previous rise
-            st = depth_push_update(st, a, inflated, s, seed);
-            st = depth_push_update(st, a, inflated, s + 1, seed);
-            assert_eq!(st.last_good_e6, prev * 2, "epoch {k}: exactly one doubling");
-            // a second spike in the same epoch adds nothing
-            let again = depth_push_update(st, a, inflated, s + 2, seed);
-            assert_eq!(again.last_good_e6, st.last_good_e6, "epoch {k}: no second rise");
-            st = again;
+        for k in 1..=4u64 {
+            // fill the window with the held liquidity BEFORE the rise window opens (the first
+            // sample of a new window is min-of-two with the previous, honest-or-not, sample)
+            st = hold(st, s - 2 * b, s - 80, inflated);
+            assert_eq!(st.last_good_e6, prev, "window {k}: no rise before 9,000 slots");
+            st = hold(st, s, s + 2 * b, inflated);
+            assert_eq!(st.last_good_e6, prev * 2, "window {k}: exactly one doubling");
+            // more held liquidity inside the same 9,000 slots adds nothing
+            st = hold(st, s + 2 * b + 10, s + 4_000, inflated);
+            assert_eq!(st.last_good_e6, prev * 2, "window {k}: no second rise");
             prev = st.last_good_e6;
+            // the rise was stamped at `s`: the next window opens at <= s + 9,063
+            s += 9_064;
         }
-        // tier 3 ($500k) from the seed ($25k) needs >= 5 epochs of continuous presence
-        assert!(prev >= th[2] && prev / 64 < th[2]);
-        // a real 0 takes it to 0 at once; recovery restarts at the tier-0 level
-        let zr = depth_push_update(st, a, 0, 9_000 * 9, seed);
-        assert_eq!(zr.last_good_e6, 0);
-        let p1 = depth_push_update(zr, a, inflated, 9_000 * 9 + 1, seed);
-        let p2 = depth_push_update(p1, a, inflated, 9_000 * 9 + 2, seed);
-        assert_eq!(p2.last_good_e6, seed / DEPTH_BOOTSTRAP_DIV, "out of a real 0: the bootstrap floor");
-        // a thin market cannot jump to the tier-0 ceiling: $2k doubles to $4k one epoch later
-        let (t, _) = depth_rate_limited(true, real, 0, inflated, 63 + 9_000, seed);
-        assert_eq!(t, 2 * real);
-        // MUTANT (the proposed 2^e for e quiet epochs): a steady market accepts one huge jump
-        let mutant = |lg: u64, e: u32| lg.saturating_mul(1u64 << e.min(63));
-        assert!(mutant(seed, 20) >= th[2], "2^e: tier 3 from one push after 20 quiet epochs");
-        let (one, _) = depth_rate_limited(true, seed, 0, inflated, 9_000 * 21, seed);
-        // D-L2 straddle: a rise at slot 8,999 (stamp 140), then 8,999 -> 9,000 crosses a calendar
-        // boundary; round 2 doubled again there. Now the window opens at 140 * 64 + 63 + 9,000.
-        let (a1, s1) = depth_rate_limited(true, seed, 0, inflated, 63 + 9_000, seed);
+        // an honest reading takes it down at once (min-of-two, then the window)
+        let h = up(up(st, a, real, s, seed), a, real, s + 1, seed);
+        assert_eq!(usable_of(h, s + 1), Some(real));
+        assert_eq!(h.last_good_e6, real, "down at once");
+        // D2: a real 0 caps at 0 AT ONCE but last_good is HELD (not zeroed) ...
+        let deep = 150_000 * USD_ATOMS;
+        let mut d = DepthState { last_good_e6: deep, last_good_slot: 50_000, rise_slot64: 0, depth_source: DEPTH_EVER | a | DEPTH_PREV_REAL, depth_e6: deep, depth_prev_e6: deep, depth_slot: 50_000, tw: DepthWindow { cur_tokens: 150_000, prev_tokens: 150_000, bucket_p1: depth_tw_bucket_p1(50_000) } };
+        d = up(d, a, 0, 50_010, seed);
+        assert_eq!(usable_of(d, 50_010), Some(0), "fresh-zero: 0 at once");
+        assert_eq!((d.last_good_e6, d.last_good_slot), (deep, 50_000), "held through the zero");
+        assert_eq!(cap_depth_e6(d.depth_source, None, d.last_good_e6, d.last_good_slot, 50_300, depth_tw_min_atoms(d.tw, USD_ATOMS)), Some(0), "stale after a zero: still 0");
+        // ... honest readings again: 0 while the zero is inside the window, then the full depth
+        let r1 = hold(d, 50_020, 50_020 + 300, deep);
+        assert_eq!(usable_of(r1, 50_320), Some(0), "the zero is still in the window");
+        let r2 = hold(r1, 50_330, 50_000 + 3 * b, deep);
+        assert_eq!(usable_of(r2, r2.depth_slot), Some(deep), "D2: recovered within ~10 min, not ~7 h");
+        // round-2 rule (MUTANT): last_good = 0 at the zero, then T1/16 doubling per 9,000 slots
+        assert!(floor * 32 < deep, "round 2 needed > 6 doublings (~7 h) to get back");
+        // a zero lasting k epochs recovers only to last_good >> k (the held value decays)
+        let long = hold(d, 50_020, 50_000 + 9_000 * 2 + 500, 0);
+        let back = hold(long, 50_000 + 9_000 * 2 + 510, 50_000 + 9_000 * 2 + 510 + 3 * b, deep);
+        assert_eq!(back.last_good_e6, (deep >> 2) * 2, "two epochs of zero: back to a quarter, then one doubling (rise window open)");
+        // direct limiter checks (D-L2 kept): one doubling per 9,000 slots
+        // (last_good_slot = the slot before: no staleness decay)
+        let (a1, s1_, _) = depth_rate_limited(true, seed, 9_062, 0, inflated, true, 63 + 9_000, seed);
         assert_eq!(a1, 2 * seed);
-        let (a2, _) = depth_rate_limited(true, a1, s1, inflated, 63 + 9_001, seed);
+        let (a2, _, _) = depth_rate_limited(true, a1, 63 + 9_000, s1_, inflated, true, 63 + 9_001, seed);
         assert_eq!(a2, a1, "one slot later: no second doubling");
-        let calendar_mutant = |re_slot: u64, slot: u64| slot / 9_000 > re_slot / 9_000;
-        assert!(calendar_mutant(8_999, 9_000), "the round-2 gate would allow it");
+        let (a3, _, _) = depth_rate_limited(true, seed, 9_062, 0, inflated, false, 63 + 9_000, seed);
+        assert_eq!(a3, seed, "no full window: no rise");
         assert!(!depth_rise_window_open(depth_rise_stamp(8_999), 9_000));
         assert!(depth_rise_window_open(depth_rise_stamp(8_999), 8_999 / 64 * 64 + 63 + 9_000));
         // D-L1 belt and braces: a saturated threshold is never met
         assert_eq!(depth_tier_for(u64::MAX, [u64::MAX; 3]), 0);
         assert_eq!(depth_tier_for(u64::MAX, [1, 2, u64::MAX]), 2);
         assert_eq!(tier_thresholds([0; 3], 12)[2], 500_000 * 1_000_000_000_000);
-        assert_eq!(one, seed * 2, "here: one doubling only");
         // 6 and 9 decimals (R2-L2): thresholds are whole collateral tokens
         assert_eq!(tier_thresholds([0; 3], 9)[0], 25_000 * 1_000_000_000);
         assert_eq!(tier_thresholds([5_000, 20_000, 100_000], 6), [5_000_000_000, 20_000_000_000, 100_000_000_000]);
@@ -2845,45 +3055,39 @@ mod tests {
         let a = DEPTH_SOURCE_ATTESTED;
         let fresh = |x: DepthState, now: u64| fresh_depth_e6(x.depth_e6, x.depth_prev_e6, x.depth_slot, x.depth_source, now);
         // a healthy pair, then an attested 0: fresh Some(0) AT ONCE (no second sample needed)
-        let s = depth_push_update(DepthState::default(), a, 4 * t1, 100, u64::MAX);
-        let s = depth_push_update(s, a, 4 * t1, 101, u64::MAX);
+        let s = up(DepthState::default(), a, 4 * t1, 100, u64::MAX);
+        let s = up(s, a, 4 * t1, 101, u64::MAX);
         assert_eq!(fresh(s, 101), Some(4 * t1));
-        let z = depth_push_update(s, a, 0, 102, u64::MAX);
+        let z = up(s, a, 0, 102, u64::MAX);
         assert_eq!(fresh(z, 102), Some(0), "a real 0 takes effect at once");
-        assert_eq!((z.last_good_e6, z.last_good_slot), (0, 102), "last_good = 0");
-        assert_eq!(cap_depth_e6(z.depth_source, fresh(z, 102), z.last_good_e6, z.last_good_slot, 102), Some(0));
+        assert_eq!(usable_of(z, 102), Some(0));
+        assert_eq!((z.last_good_e6, z.last_good_slot), (4 * t1, 101), "round 3 D2: last_good held");
+        assert_eq!(cap_depth_e6(z.depth_source, usable_of(z, 102), z.last_good_e6, z.last_good_slot, 102, depth_tw_min_atoms(z.tw, USD_ATOMS)), Some(0));
         assert_eq!(venue_tier(0, z.depth_source, tier_thresholds([0; 3], 6), 3), 0);
         // DEX 0 too, and from a market that never had depth (sets DEPTH_EVER)
-        let d = depth_push_update(DepthState::default(), DEPTH_SOURCE_DEX, 0, 7, u64::MAX);
+        let d = up(DepthState::default(), DEPTH_SOURCE_DEX, 0, 7, u64::MAX);
         assert_eq!((fresh(d, 7), depth_ever(d.depth_source)), (Some(0), true));
         // a later positive reading: its previous sample is the real 0 -> min stays 0
-        let p1 = depth_push_update(z, a, 4 * t1, 103, u64::MAX);
+        let p1 = up(z, a, 4 * t1, 103, u64::MAX);
         assert_eq!(fresh(p1, 103), Some(0), "positive after a real 0: min(4t1, 0) = 0");
-        let p2 = depth_push_update(p1, a, 4 * t1, 104, u64::MAX);
+        let p2 = up(p1, a, 4 * t1, 104, u64::MAX);
         assert_eq!(fresh(p2, 104), Some(4 * t1), "its own min-of-two restores the fresh reading");
-        // R2-M1: the rate-limited depth does not rise again in the epoch of its last rise
-        assert_eq!(p2.last_good_e6, 0);
-        assert_eq!(usable_depth_e6(fresh(p2, 104), p2.last_good_e6), Some(0));
-        // D-L2: the window is 9,000 slots after the last rise (slot 101, stamp 1 -> 64..127)
-        let p3 = depth_push_update(p2, a, 4 * t1, 127 + 9_000 - 1, t1 - 1);
-        assert_eq!(p3.last_good_e6, 0, "one slot before the window: no rise");
-        let p3 = depth_push_update(p2, a, 4 * t1, 127 + 9_000, t1 - 1);
-        assert_eq!(p3.last_good_e6, (t1 - 1) / DEPTH_BOOTSTRAP_DIV, "window open: the bootstrap floor");
+        assert_eq!(usable_of(p2, 104), Some(0), "but the zero is still inside the window");
         // contrast: absent samples (35 B / mode 0) are NOT zero readings -> sticky last good
-        let ab = depth_push_update(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
+        let ab = up(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
         assert_eq!(fresh(ab, 102), None);
         assert_eq!(ab.last_good_e6, 4 * t1);
-        let ab2 = depth_push_update(ab, a, 4 * t1, 103, u64::MAX);
+        let ab2 = up(ab, a, 4 * t1, 103, u64::MAX);
         assert_eq!(fresh(ab2, 103), None, "first real sample after an absent one: one sample");
         // same slot: a real 0 beats an absent 0 (more conservative); an absent push cannot
         // undo a real 0 in the same slot
-        let x = depth_push_update(ab, a, 0, 102, u64::MAX);
+        let x = up(ab, a, 0, 102, u64::MAX);
         assert_eq!(fresh(x, 102), Some(0));
-        let y = depth_push_update(z, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
+        let y = up(z, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
         assert_eq!(fresh(y, 102), Some(0), "same-slot absent keeps the real 0");
-        // stale real 0 -> absent (sticky at last_good 0 -> still 0)
+        // stale real 0 -> absent; the sticky cap is still 0 (the window holds the zero)
         assert_eq!(fresh(z, 102 + DEPTH_MAX_AGE_SLOTS + 1), None);
-        assert_eq!(cap_depth_e6(z.depth_source, None, z.last_good_e6, z.last_good_slot, 102 + 200), Some(0));
+        assert_eq!(cap_depth_e6(z.depth_source, None, z.last_good_e6, z.last_good_slot, 102 + 200, depth_tw_min_atoms(z.tw, USD_ATOMS)), Some(0));
         // validator: bit 2 allowed, bits 3-6 not
         assert!(depth_source_byte_ok(DEPTH_EVER | DEPTH_PREV_REAL | DEPTH_SOURCE_DEX));
         assert!(!depth_source_byte_ok(0x08));
