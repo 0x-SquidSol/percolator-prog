@@ -2836,7 +2836,9 @@ fn g8_kappa_depth_cap_clips_n_cap_only_when_fresh() {
     env.warp(1); // W-L2: the second sample must be in a later slot
     env.push_depth(PRICE, 1, 600 * USD as u64).expect("second 44 B push");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "fresh $600 at κ 0.5 -> 300 units");
+    // Round 3 item 7: the GATE uses the instant N_cap (300 units, the trades below), while the
+    // rent snapshot (rent on open positions) falls at most 2x per 900 slots: 1,000 -> 500 now.
+    assert_eq!(env.growth().rent_n_cap_q, 500 * Q as u64, "fresh $600 at κ 0.5 -> 300 units; the rent snapshot halves toward it");
     let taker = env.trader(1_000 * USD);
     // 301 units: the TradeCpi clip and the gate share the 300-unit N_cap, so the request is
     // either clipped to the room or refused; never more than 300 units fill.
@@ -2857,7 +2859,7 @@ fn g8_kappa_depth_cap_clips_n_cap_only_when_fresh() {
     let g = env.growth();
     assert_eq!((g.depth_e6, g.depth_source & DEPTH_EVER), (0, DEPTH_EVER));
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "absent depth: the sticky cap stays");
+    assert_eq!(env.growth().rent_n_cap_q, 500 * Q as u64, "absent depth: the sticky cap stays (the snapshot holds inside its 900-slot window)");
     let t2 = env.trader(1_000 * USD);
     let r = env.trade_cpi(&t2.0, t2.1, &lp, 100 * Q);
     assert_eq!(env.pos(t2.1), 0, "absent depth: the side stays full at the sticky cap: {r:?}");
@@ -2912,7 +2914,12 @@ fn g8_wl2_two_same_slot_pushes_are_one_sample() {
     let g = env.growth();
     assert_eq!((g.depth_e6, g.depth_prev_e6), (600 * USD as u64, 400 * USD as u64));
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().rent_n_cap_q, 200 * Q as u64, "two slots: min $400 at κ 0.5 -> 200 units");
+    // Round 3 item 7: the rent snapshot halves toward the instant 200 units (1,000 -> 500)
+    assert_eq!(env.growth().rent_n_cap_q, 500 * Q as u64, "two slots: min $400 at κ 0.5 -> 200 units; snapshot halves");
+    env.warp(1_000);
+    env.depth_twice(600 * USD as u64);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 250 * Q as u64, "one 900-slot window later: one more halving");
 }
 
 // ---------------------------------------------------------------------------
@@ -3047,7 +3054,12 @@ fn r2_sticky_cap_stale_first_push_of_pair_and_decay_to_zero() {
     env.warp(1); // W-L2: the 35 B push and the first attested push must not share a slot
     env.depth_twice(600 * USD_E6);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "fresh $600, κ 0.5");
+    // Round 3 item 7: the snapshot halves toward the instant 300 units per 900-slot window
+    assert_eq!(env.growth().rent_n_cap_q, 500 * Q as u64, "fresh $600, κ 0.5: snapshot 1,000 -> 500");
+    env.warp(1_000);
+    env.depth_twice(600 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "one window later: max(300, 250) = the instant cap");
     // stale: the stamp 151 slots old (no push since)
     let now = env.clock_slot();
     env.poke_growth(|g| g.depth_slot = now - 151);
@@ -3349,22 +3361,31 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
             continue;
         }
         assert_eq!((g.depth_e6, g.depth_last_good_e6, g.depth_source & DEPTH_EVER), (0, 600 * USD_E6, DEPTH_EVER), "D2: last good held");
-        // the κ cap is 0 at once; R2-L1: the rent snapshot is 1 (u = infinity: maximum rent)
-        assert_eq!(env.growth().rent_n_cap_q, 1, "a real 0: cap 0 at once, rent at the maximum");
+        // the κ cap is 0 at once (the gate below); R2-L1 + round 3 item 7: the rent snapshot heads
+        // for 1 (u = infinity: maximum rent) at most 2x per 900 slots: 300 -> 150 now, and one
+        // window later 75 <= the 100 units open (u >= 1: maximum rent) -- never 0, never a cliff
+        assert_eq!(env.growth().rent_n_cap_q, 150 * Q as u64, "a real 0: the rent snapshot halves toward max rent");
         let t2 = env.trader(1_000 * USD);
         let r = env.trade_cpi(&t2.0, t2.1, &lp, 10 * Q);
         assert_eq!(env.pos(t2.1), 0, "cap 0: no open: {r:?}");
         env.trade_cpi(&taker.0, taker.1, &lp, -50 * Q).expect("a reduce at cap 0");
+        env.warp(1_000);
+        env.push_depth(PRICE, 1, 0).expect("attested 0 again");
+        env.crank_current(taker.1);
+        env.crank_current(lp.account);
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        assert_eq!(env.growth().rent_n_cap_q, 75 * Q as u64, "one window later: 75 > the 50 units open... halving on: no cliff");
+        let held = env.growth().rent_n_cap_q;
         // a positive reading: min with the real 0 -> still 0
         env.warp(1);
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("positive after 0");
         env.settle_rent(lp.account, lp.account).expect("tag 106");
-        assert_eq!(env.growth().rent_n_cap_q, 1, "first positive sample after a real 0: still cap 0");
+        assert_eq!(env.growth().rent_n_cap_q, held, "first positive sample after a real 0: still cap 0 (snapshot held at max rent)");
         // its own min-of-two: fresh again, but the zero is still inside the window
         env.warp(1);
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("second positive");
         env.settle_rent(lp.account, lp.account).expect("tag 106");
-        assert_eq!(env.growth().rent_n_cap_q, 1, "the zero is still in the 5-10 min window: cap 0");
+        assert_eq!(env.growth().rent_n_cap_q, held, "the zero is still in the 5-10 min window: cap 0 (snapshot held)");
         // D2: honest readings held across the window -> back to the held $600 within ~10 min
         let z = env.clock_slot();
         let until = z + 2 * percolator_prog::growth_v19::DEPTH_TW_BUCKET_SLOTS + 10;
@@ -3456,7 +3477,9 @@ fn r2m1_flash_liquidity_is_rate_limited() {
 }
 
 /// Security review R2-L1: at a depth cap of 0 the rent is the MAXIMUM (u = OI / 0 = infinity),
-/// not 0: the snapshot is 1 and an open book pays `rent_max` per slot. And a band-pinned (D-1
+/// not 0: the snapshot heads for 1 and an open book pays `rent_max` per slot -- round 3 item 7:
+/// reached by halving the snapshot at most once per 900-slot window (no cliff on open positions),
+/// here six halvings from 10,000 to <= the 200 units open. And a band-pinned (D-1
 /// duration-pinned, no-move) accrual still charges NO rent, so a stuck price (e.g. a keeper
 /// outage pinning the band) never bills holders.
 #[test]
@@ -3466,7 +3489,23 @@ fn r2l1_rent_is_max_at_cap_zero_and_zero_while_duration_pinned() {
     env.warp(1);
     env.push_depth(PRICE, 1, 0).expect("attested 0");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().rent_n_cap_q, 1, "cap 0: rent snapshot 1 (max rent)");
+    let mut snap = env.growth().rent_n_cap_q;
+    assert_eq!(snap, 5_000 * Q as u64, "cap 0: the snapshot halves at once (10,000 -> 5,000), no cliff");
+    let mut windows = 0;
+    while snap > 200 * Q as u64 {
+        env.warp(1_000);
+        env.push_depth(PRICE, 1, 0).expect("attested 0 (held)");
+        for who in [long.1, short.1, lp.account] {
+            env.crank_current(who);
+        }
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        let n = env.growth().rent_n_cap_q;
+        assert!(n * 2 >= snap && n < snap, "exactly one halving per 900-slot window: {snap} -> {n}");
+        snap = n;
+        windows += 1;
+        assert!(windows <= 6);
+    }
+    assert_eq!(windows, 5, "max rent (u >= 1) after five more windows (~50 min)");
     let i0 = env.engine_asset().rent_index_long_num;
     env.warp(1);
     env.push(PRICE);
@@ -4508,4 +4547,46 @@ fn r3_item6_legacy_c_launch_record_migrates_on_push() {
     let g = env.growth();
     assert_eq!(g.flags, percolator_prog::growth_v19::GROWTH_FLAG_R3_LAYOUT | percolator_prog::growth_v19::GROWTH_FLAG_VOL_DATA);
     assert_eq!(g.vol_var_x100(), percolator_prog::growth_v19::VOL_VAR_SEED_X100, "migrated, seeded by the first (calm) sample");
+}
+
+/// Round 3 item 7 (design GAP-15 / D6): the keeper's tag-5 crank of the bound vault LP is a
+/// ratchet site. 20x band market, depth held at tier 3, the LP holding inventory (a small long
+/// against it), NO further fill and NO tag 106 / 103 / 78: each certified keeper crank of the LP
+/// is a writer, so the ceiling climbs +1x per epoch. CONTROL: pushes alone (the fall-only writer)
+/// never raise it. (A FLAT LP whose asset is already accrued gets the engine's NoAction -- an
+/// error that reverts -- so that crank cannot carry the ratchet; tag 106 is the writer there.)
+#[test]
+fn r3_item7_keeper_crank_ratchets_the_ceiling() {
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    env.auth_mark();
+    env.set_tiers([5_000, 20_000, 100_000], [0; 3], 3).expect("UA tier table");
+    let lp = env.lp(150_000 * USD);
+    let tier3 = 150_000 * USD_E6;
+    env.depth_twice(tier3);
+    let t = env.trader(1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("a small long: the LP holds inventory");
+    // control: depth held through many epochs, pushes only -> no rise
+    for _ in 0..3 {
+        let next = env.slot + 9_100;
+        env.hold_depth_until(tier3, next);
+    }
+    assert_eq!(env.growth().ceil_x100, 500, "control: pushes alone never raise the ceiling");
+    // keeper cranks of the LP (and of the trader, as a keeper sweep does): +1x per epoch
+    let mut c = 500u16;
+    let mut epochs = 0;
+    while c < 2_000 {
+        let due = core::cmp::max(env.growth().ceil_slot + 9_000, env.next_rise_slot());
+        let hold_to = core::cmp::max(due.saturating_sub(1), env.slot + 2 * percolator_prog::growth_v19::DEPTH_TW_BUCKET_SLOTS + 10);
+        env.hold_depth_until(tier3, hold_to);
+        let to = core::cmp::max(due, env.slot + 1) - env.slot;
+        env.warp(to.max(1));
+        env.depth_twice(tier3);
+        env.crank_current(t.1);
+        env.crank_current(lp.account);
+        let n = env.growth().ceil_x100;
+        assert!(n == c || n == c + 100, "<= +1x per epoch: {c} -> {n}");
+        c = n;
+        epochs += 1;
+        assert!(epochs <= 40, "stuck at {c}");
+    }
 }

@@ -3173,3 +3173,101 @@ fn r3_gap8_alpha_capped_at_50_on_a_band_market_until_f3_proven() {
     assert_eq!(a, c / 2, "the alpha room binds (the buffer room is 70% of C here)");
     env.assert_conserved("gap8 alpha");
 }
+
+impl Env {
+    /// Tag 63, 44 B attested form (PushAuthMarkDepth), price unchanged.
+    fn push_depth_attested(&mut self, depth_e6: u64) -> Result<(), String> {
+        let admin = self.admin.insecure_clone();
+        let px = self.market_state().1.assets[0].effective_price;
+        let seq = self.oracle_seq() + 1;
+        let (m, slot) = (self.market, self.slot);
+        self.send(
+            ProgInstruction::PushAuthMarkDepth { market_id: 1, asset_index: 0, now_slot: slot, mark_e6: px, observation_sequence: seq, depth_mode: 1, depth_e6 },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+}
+
+/// Round 3 item 7 (design GAP-13c): tag 94's bind-time guard. On a clamp-enforced band market
+/// that already has a measured depth, one minimum band leg must fit in the tier-0 depth capacity
+/// (κ0 = 0.5 x the usable depth), else the bind is refused (GrowthInvalidConfig) instead of
+/// creating a market that can never open a leg. This harness's collateral has 0 decimals, so T1
+/// = 25,000 atoms and a first reading is clamped to T1/16 = 1,562 atoms (D-I1); the minimum leg
+/// is set to 600 atoms (STATE POKE of the engine config). A 1,000-atom pool (capacity 500) is
+/// refused; a 5,000-atom pool (usable 1,562 -> capacity 781) binds. CONTROL: no depth measured
+/// yet binds.
+#[test]
+fn r3_item7_bind_guard_min_leg_fits_tier0_depth() {
+    let p = Params { band: Some(100), ..growth_params() };
+    let poke_min_leg = |env: &mut Env| {
+        let mut acc = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, g) = state::market_view_mut(&mut acc.data).unwrap();
+            g.header.config.band_min_leg_notional = percolator::V16PodU64::new(600);
+        }
+        env.svm.set_account(env.market, acc).unwrap();
+    };
+    for (depth, ok) in [(1_000u64, false), (5_000, true)] {
+        let mut env = Env::new(p);
+        poke_min_leg(&mut env);
+        let d = env.new_depositor();
+        env.earn_deposit(&d, 1_000 * U, None).expect("75 senior");
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        env.push_depth_attested(depth).expect("push 1");
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        env.push_depth_attested(depth).expect("push 2 (a fresh pair)");
+        let admin = env.admin.insecure_clone();
+        let m = env.matcher;
+        let r = env.init_vault_lp_full(&admin, 2_000, m, &[]);
+        if ok {
+            r.expect("usable 1,562 atoms: 781 of capacity fits a 600-atom leg");
+        } else {
+            err_has(&r.map(|l| l.portfolio), PercolatorError::GrowthInvalidConfig);
+            assert!(env.svm.get_account(&env.vault_lp).map(|a| a.data.is_empty()).unwrap_or(true), "the bind reverted");
+        }
+    }
+    // control: never measured -> binds
+    let mut env = Env::new(p);
+    poke_min_leg(&mut env);
+    let admin = env.admin.insecure_clone();
+    let m = env.matcher;
+    env.init_vault_lp_full(&admin, 2_000, m, &[]).expect("no depth yet: binds");
+}
+
+/// Round 3 item 7 (GAP-15): tag 78 with the ext tail (vault LP at [8]) is a ratchet site. A
+/// band market (L_tier 10x, launch 5x) whose stored ceiling sits above its live target
+/// (STATE POKE: 8x stored, target = launch at tier 0) is lowered ONE step (8x -> 7x) by the fee
+/// crank alone. CONTROL: the same crank without the ext tail (no LP account) does not touch it.
+#[test]
+fn r3_item7_fee_crank_is_a_ratchet_site() {
+    let p = Params { band: Some(100), growth: Some((400, 500)), fee_bps: 100, ..growth_params() };
+    for with_lp in [true, false] {
+        let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+        let admin = env.admin.insecure_clone();
+        if with_lp {
+            env.set_p2b_dials(&admin, [5_000, 3_000, 0, 0]).expect("ext");
+        }
+        let t = env.new_trader(5_000 * U);
+        env.trade_signing_fee(&t, &lp, 100 * UQ, GROWTH_FEE).expect("open");
+        env.trade_signing_fee(&t, &lp, -100 * UQ, GROWTH_FEE).expect("close");
+        {
+            let mut acc = env.svm.get_account(&env.market).unwrap();
+            let mut g = state::read_asset_growth(&acc.data, 0, 1_000).unwrap().expect("growth on");
+            assert_eq!((g.l_launch_x100, g.l_tier_x100), (500, 1_000));
+            g.ceil_x100 = 800;
+            state::write_asset_growth(&mut acc.data, 0, &g, 1_000).unwrap();
+            env.svm.set_account(env.market, acc).unwrap();
+        }
+        let r = if with_lp { env.crank_fees_ext(lp.portfolio) } else { env.crank_fees(true) };
+        r.expect("78");
+        let c = state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, 1_000).unwrap().unwrap().ceil_x100;
+        if with_lp {
+            assert_eq!(c, 700, "78 with the LP: one step toward the target");
+        } else {
+            assert_eq!(c, 800, "control: no LP account, no ratchet");
+        }
+    }
+}

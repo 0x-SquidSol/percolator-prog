@@ -2446,6 +2446,53 @@ pub fn rent_snapshot_n_cap_q(n_cap_q: u128, depth_cap_zero: bool) -> u64 {
     u64::try_from(n_cap_q).unwrap_or(u64::MAX)
 }
 
+/// Round 3 item 7 (design GAP-10): the rent `N_cap` snapshot may FALL (rent rises on open
+/// positions) at most 2x per this many slots since its last applied fall.
+pub const RENT_SNAPSHOT_FALL_SLOTS: u64 = 900;
+
+/// Round 3 item 7 (GAP-10, "never cliff-edge on open positions"): the snapshot a writer stores.
+/// `stamp64` = `slot / 64 + 1` of the last applied FALL (bytes 4..8; 0 = never -- the `+ 1` keeps a
+/// fall in slots 0..63 distinguishable from "never").
+/// * a rise (rent falls) or a first measurement (`prev == 0`): `new` at once, stamp kept;
+/// * a fall: `max(new, prev >> k)` with `k` = whole 900-slot windows since the latest slot the
+///   stamp can stand for (`(stamp - 1) * 64 + 63`; a never-stamped snapshot gets one halving at once),
+///   stamped `now`; `k == 0` holds `prev`.
+///
+/// So rent on open positions climbs at most 2x per 900 slots (~6 min) toward the new rate --
+/// a real 0 depth (snapshot 1 = maximum rent, R2-L1) is still reached, in about log2(N_cap / OI)
+/// windows. The capacity GATE still uses the instant `N_cap` (opens are refused at once).
+pub fn rent_snapshot_smooth(prev: u64, stamp64: u32, new: u64, now_slot: u64) -> (u64, u32) {
+    if prev == 0 || new >= prev {
+        return (new, stamp64);
+    }
+    let k = if stamp64 == 0 {
+        1
+    } else {
+        let last = ((stamp64 - 1) as u64).saturating_mul(DEPTH_RISE_STAMP_SLOTS).saturating_add(DEPTH_RISE_STAMP_SLOTS - 1);
+        now_slot.saturating_sub(last) / RENT_SNAPSHOT_FALL_SLOTS
+    };
+    if k == 0 {
+        return (prev, stamp64);
+    }
+    let floor = if k >= 64 { 0 } else { prev >> k };
+    (if new > floor { new } else { floor }, rent_stamp64_of(now_slot))
+}
+
+/// The rent stamp of `slot`: `slot / 64 + 1`, saturating (never 0).
+pub fn rent_stamp64_of(slot: u64) -> u32 {
+    depth_rise_stamp(slot).saturating_add(1)
+}
+
+/// Round 3 item 7 (design GAP-13c): the bind-time guard -- on a clamp-enforced market with a
+/// measured depth, one minimum band leg must fit in the tier-0 depth capacity:
+/// `band_min_leg_notional <= floor(κ0 * cap_depth)`. `None` (never measured) passes.
+pub fn band_min_leg_fits_depth(band_min_leg_notional: u64, cap_depth_e6: Option<u64>) -> bool {
+    match cap_depth_e6 {
+        None => true,
+        Some(d) => (band_min_leg_notional as u128) <= (d as u128) * (KAPPA_TABLE_BPS[0] as u128) / BPS,
+    }
+}
+
 /// v2.2 item 2 (design §2.1): the per-side holding-fee rent rate, e9 of notional per slot.
 ///
 /// ```text
@@ -2720,6 +2767,32 @@ mod tests {
     use super::*;
 
     const PS: u128 = 1_000_000;
+
+    /// Round 3 item 7 (GAP-10, GAP-13c).
+    #[test]
+    fn r3_item7_rent_snapshot_and_min_leg() {
+        // rises at once; a first measurement at once
+        assert_eq!(rent_snapshot_smooth(100, 0, 500, 10), (500, 0));
+        assert_eq!(rent_snapshot_smooth(0, 0, 1, 10), (1, 0));
+        // a never-stamped fall: one halving at once, stamped slot/64 + 1
+        assert_eq!(rent_snapshot_smooth(1_000, 0, 1, 6_400), (500, 101));
+        // a fall in slots 0..63 is stamped 1, not "never": the next call holds
+        assert_eq!(rent_snapshot_smooth(1_000, 0, 1, 5), (500, 1));
+        assert_eq!(rent_snapshot_smooth(500, 1, 1, 6), (500, 1));
+        // inside 900 slots of the last fall (stamp 101 = slots 6,400..6,463): held
+        assert_eq!(rent_snapshot_smooth(500, 101, 1, 6_463 + 899), (500, 101));
+        // one window later: one more halving; three windows: an eighth
+        assert_eq!(rent_snapshot_smooth(500, 101, 1, 6_463 + 900), (250, rent_stamp64_of(6_463 + 900)));
+        assert_eq!(rent_snapshot_smooth(800, 101, 1, 6_463 + 2_700), (100, rent_stamp64_of(6_463 + 2_700)));
+        // never below the new value
+        assert_eq!(rent_snapshot_smooth(800, 101, 300, 6_463 + 2_700).0, 300);
+        // k >= 64: straight to the new value
+        assert_eq!(rent_snapshot_smooth(u64::MAX, 1, 1, 64 * 900 + 200).0, 1);
+        // min leg guard: 10 tokens fit in 0.5 x $40 = $20; not in 0.5 x $10
+        assert!(band_min_leg_fits_depth(10_000_000, Some(40_000_000)));
+        assert!(!band_min_leg_fits_depth(10_000_000, Some(10_000_000)));
+        assert!(band_min_leg_fits_depth(10_000_000, None), "never measured: passes");
+    }
 
     /// Round 3 item 6 (GAP-6): the volatility term.
     #[test]

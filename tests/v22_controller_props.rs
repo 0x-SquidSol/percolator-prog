@@ -319,3 +319,57 @@ fn r3_item6_mutants_are_caught() {
     let seeded = gv::l_vol_x100(500, gv::sigma_h_bps(gv::VOL_VAR_SEED_X100, 1_200), 50);
     assert!(calm > seeded, "mutant witness: {calm} > {seeded}");
 }
+
+// ── item 7 (GAP-10, GAP-13c) ─────────────────────────────────────────────────────────────────
+
+/// MUTANT (round 2): the rent snapshot takes the new N_cap at once.
+fn rent_snapshot_mutant_round2(_prev: u64, st: u32, new: u64, _now: u64) -> (u64, u32) {
+    (new, st)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+    /// The rent snapshot: rises at once; a fall is never below max(new, prev >> k) for the whole
+    /// 900-slot windows k since the stamp (a never-stamped one: one halving), never below the new
+    /// value, never above prev; a sequence of writes falls at most 2x per 900 slots.
+    #[test]
+    fn item7_rent_snapshot(prev in any::<u64>(), st in any::<u32>(), new in any::<u64>(), now in any::<u64>()) {
+        let (v, st2) = gv::rent_snapshot_smooth(prev, st, new, now);
+        if prev == 0 || new >= prev { prop_assert_eq!((v, st2), (new, st)); return Ok(()); }
+        prop_assert!(v >= new && v <= prev);
+        let k = if st == 0 { 1 } else { now.saturating_sub(((st - 1) as u64).saturating_mul(64).saturating_add(63)) / 900 };
+        let floor = if k >= 64 { 0 } else { prev >> k };
+        prop_assert_eq!(v, new.max(floor).min(prev));
+    }
+
+    #[test]
+    fn item7_rent_sequence(start in 1u64..u64::MAX, steps in prop::collection::vec((0u64..2_000, any::<u64>()), 1..30)) {
+        let (mut v, mut st, mut now) = (start, 0u32, 10_000u64);
+        let mut last_fall_slot: Option<u64> = None;
+        for (dt, new) in steps {
+            now += dt;
+            let (n, s2) = gv::rent_snapshot_smooth(v, st, new, now);
+            if n < v {
+                prop_assert!(n >= v / 2 || last_fall_slot.is_none_or(|l| now >= l + 900) || st == 0, "<= 2x per 900 slots");
+                if let Some(l) = last_fall_slot {
+                    let k = (now - l) / 900;
+                    prop_assert!(k >= 1 || st == 0);
+                    if k < 64 { prop_assert!(n >= v >> k); }
+                }
+                last_fall_slot = Some(now);
+            }
+            v = n; st = s2;
+        }
+    }
+}
+
+#[test]
+fn r3_item7_mutants_are_caught() {
+    // a real 0 depth: round 2 jumped every open position to max rent at once (snapshot 1)
+    assert_eq!(rent_snapshot_mutant_round2(1_000_000, 0, 1, 10).0, 1);
+    assert_eq!(gv::rent_snapshot_smooth(1_000_000, 0, 1, 10), (500_000, 1), "one halving, stamped (never 0)");
+    assert_eq!(gv::rent_snapshot_smooth(500_000, 1, 1, 11).0, 500_000, "and held in its window");
+    // min leg: a thin market whose kappa_0 capacity cannot hold one minimum leg is refused
+    assert!(!gv::band_min_leg_fits_depth(100_000_000, Some(150_000_000)));
+}

@@ -7781,6 +7781,12 @@ pub mod state {
             }
         }
 
+        /// Round 3 item 7: store the rent stamp (migrating first).
+        pub fn set_rent_stamp64(&mut self, stamp64: u32) {
+            self.migrate_r3_layout();
+            self.rent_stamp64_le = stamp64.to_le_bytes();
+        }
+
         /// Round 3: take ownership of bytes 0..8 (zero the retired `c_launch`, set bit 0).
         pub fn migrate_r3_layout(&mut self) {
             if self.flags & crate::growth_v19::GROWTH_FLAG_R3_LAYOUT == 0 {
@@ -15955,6 +15961,7 @@ pub mod processor {
             } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
             Instruction::InitVaultLp { junior_floor_bps } => {
                 handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)?;
+                init_vault_lp_min_leg_guard(program_id, accounts)?;
                 init_vault_lp_pin_ext_if_passed(program_id, accounts)
             }
             Instruction::InitVaultLpV19 {
@@ -15962,6 +15969,7 @@ pub mod processor {
                 l_launch_x100,
             } => {
                 handle_init_vault_lp(program_id, accounts, junior_floor_bps, Some(l_launch_x100))?;
+                init_vault_lp_min_leg_guard(program_id, accounts)?;
                 init_vault_lp_pin_ext_if_passed(program_id, accounts)
             }
             Instruction::InitVaultLpV22Tiers {
@@ -15975,6 +15983,7 @@ pub mod processor {
                 // Out of line so the pinned `handle_init_vault_lp` frame does not grow.
                 handle_init_vault_lp(program_id, accounts, junior_floor_bps, Some(l_launch_x100))?;
                 init_vault_lp_apply_tier_block(program_id, accounts, tiers)?;
+                init_vault_lp_min_leg_guard(program_id, accounts)?;
                 init_vault_lp_pin_ext_if_passed(program_id, accounts)
             }
             Instruction::VaultLpSetMatcher {
@@ -29873,6 +29882,11 @@ pub mod processor {
                 )?;
             }
         }
+        // Round 3 item 7 (GAP-15): every successful crank step on the bound vault LP (a refresh,
+        // an accrual-only step, the F1 follow-on) is a ratchet site -- the keeper cranks the LP
+        // every sweep. The helper ratchets only on a CURRENT vault-LP valuation and is a no-op
+        // for any other portfolio.
+        growth_ratchet_touch(program_id, market_ai, portfolio_ai)?;
         Ok(())
     }
 
@@ -33311,7 +33325,13 @@ pub mod processor {
             .senior_fee_credited_atoms
             .checked_add(senior_part)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)
+        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        // Round 3 item 7 (GAP-15): tag 78 is a ratchet site too, when the ext tail carries the
+        // vault LP at [8] (no-op otherwise, or on a stale LP valuation).
+        if let Some(lp_ai) = accounts.get(8) {
+            growth_ratchet_touch(program_id, account(accounts, 1)?, lp_ai)?;
+        }
+        Ok(())
     }
 
     /// Phase 4 item 3: take the capacity-bond coupon off the TOP of one harvested LP fee leg
@@ -45178,6 +45198,100 @@ pub mod processor {
         Ok(())
     }
 
+    /// Round 3 item 7 (design GAP-15): the graduation RATCHET alone (no rent routing, no rent
+    /// snapshot) at a site that has just certified the bound vault LP: the keeper's tag-5 crank
+    /// of the vault LP (after its refresh) and tag 78 (the fee crank, LP passed read-only). Before
+    /// round 3 the ceiling climbed only when the LP was touched by a fill / 103 / 106 (D6). A
+    /// no-op unless `lp_ai` IS the bound vault LP of a clamp-enforced growth asset; the same
+    /// writer rule as `vault_lp_rent_route_and_snapshot_view` (rise <= +1x per epoch, fall <= 1x
+    /// per call, the h-lock at once).
+    #[inline(never)]
+    fn growth_ratchet_touch(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'_>,
+        lp_ai: &AccountInfo<'_>,
+    ) -> ProgramResult {
+        if lp_ai.owner != program_id || !market_ai.is_writable {
+            return Ok(());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        if group.header.config.band_bps.get() == 0 || group.header.mode != 0 {
+            return Ok(());
+        }
+        let Some(i) = market_bound_vault_asset(&group)? else {
+            return Ok(());
+        };
+        if group.markets[i].wrapper[constants::ASSET_GROWTH_OFF + state::ASSET_GROWTH_VERSION_FIELD_OFF] == 0 {
+            return Ok(());
+        }
+        if read_asset_vault_lp_from_view(&group, i)?.vault_lp_portfolio != lp_ai.key.to_bytes() {
+            return Ok(());
+        }
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let Some(mut g) = state::asset_growth_from_wrapper_bytes(&group.markets[i].wrapper[..], engine_imr)? else {
+            return Ok(());
+        };
+        // Only on a CURRENT vault-LP valuation (the fee waterfall's gate): a stale certificate
+        // with inventory could overstate C_m, and C_m feeds the book tier. Stale: no ratchet.
+        if with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h)).is_err() {
+            return Ok(());
+        }
+        let c_m = with_portfolio_header_ro(lp_ai, |h| {
+            vault_lp_v18::conservative_equity(h.capital.get(), h.pnl.get(), h.fee_credits.get())
+                .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+        })?;
+        let ctx = growth_g8_ctx_view(&group, i, &g, Some(c_m))?;
+        if !ctx.clamp {
+            return Ok(());
+        }
+        let (ceil, slot) = growth_v19::graduation_ratchet(
+            g.ceil_x100,
+            g.ceil_slot,
+            ctx.graduation,
+            ctx.stress,
+            g.l_launch_x100,
+            g.l_tier_x100,
+            ctx.dials.l_signal_x100,
+            ctx.stress_cap(),
+            ctx.now,
+        );
+        if (ceil, slot) != (g.ceil_x100, g.ceil_slot) {
+            g.ceil_x100 = ceil;
+            g.ceil_slot = slot;
+            let market = group.markets.get_mut(i).ok_or(PercolatorError::InvalidInstruction)?;
+            state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+        }
+        Ok(())
+    }
+
+    /// Round 3 item 7 (design GAP-13c): tag 94's bind-time guard -- on a clamp-enforced growth
+    /// asset that already has a measured depth (fresh or sticky), one minimum band leg must fit
+    /// in its tier-0 depth capacity (`band_min_leg_notional <= κ0 * depth`), else the bind is
+    /// refused (`GrowthInvalidConfig`) instead of creating a market that can never open a leg.
+    /// No depth measured yet: passes (the capital rule alone applies until the first reading).
+    #[inline(never)]
+    fn init_vault_lp_min_leg_guard<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
+        let market_ai = account(accounts, 1)?;
+        expect_owner(market_ai, program_id)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        let Some(i) = market_bound_vault_asset(&group)? else {
+            return Ok(());
+        };
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let Some(g) = state::asset_growth_from_wrapper_bytes(&group.markets[i].wrapper[..], engine_imr)? else {
+            return Ok(());
+        };
+        let ctx = growth_g8_ctx_view(&group, i, &g, None)?;
+        if ctx.clamp
+            && !growth_v19::band_min_leg_fits_depth(group.header.config.band_min_leg_notional.get(), ctx.cap_depth_e6)
+        {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        Ok(())
+    }
+
     /// v2.2 item 2: route `asset_index`'s unrouted rent from insurance to the bound vault LP
     /// `lp` (the caller has the LP's portfolio in hand) and refresh the growth record's rent
     /// `N_cap` snapshot from the LP's conservative equity. A no-op unless `lp_key` IS the
@@ -45251,8 +45365,13 @@ pub mod processor {
             let depth_cap_zero = ctx.clamp
                 && growth_v19::depth_cap_q_kappa(ctx.dials.kappa_bps, ctx.cap_depth_e6, price, percolator::POS_SCALE) == 0;
             let n_cap = growth_v19::rent_snapshot_n_cap_q(n_cap, depth_cap_zero);
-            if g.rent_n_cap_q != n_cap {
-                g.rent_n_cap_q = n_cap;
+            // Round 3 item 7 (GAP-10): the snapshot (rent on OPEN positions) falls at most 2x per
+            // 900 slots toward the new N_cap; it rises at once. The gate keeps the instant N_cap.
+            let now = authenticated_market_slot_or_fallback_view(group);
+            let (n2, st2) = growth_v19::rent_snapshot_smooth(g.rent_n_cap_q, g.rent_stamp64(), n_cap, now);
+            if (n2, st2) != (g.rent_n_cap_q, g.rent_stamp64()) {
+                g.rent_n_cap_q = n2;
+                g.set_rent_stamp64(st2);
                 dirty = true;
             }
         }
@@ -49926,5 +50045,44 @@ mod r3_kani_proofs {
         kani::cover!(has && x < var && v2 < var, "decays toward calm");
         kani::cover!(lb < la, "more volatility, less leverage");
         kani::cover!(smp.is_some_and(|v| v > 0), "a real move");
+    }
+
+    /// Item 7 (GAP-10): the rent snapshot rises at once, and a fall is exactly
+    /// `max(new, prev >> k)` (k = whole 900-slot windows since the stamp's latest slot; a
+    /// never-stamped one: 1) -- at most 2x per window, never below the new value, never above
+    /// prev; GAP-13c: the min-leg guard is exactly `leg <= floor(0.5 * depth)` and passes with no
+    /// depth.
+    /// Mutants: take `new` at once (round 2); `k` from the stamp's earliest slot (shortens the
+    /// window); `min` for `max`; a never-stamped fall taken in full; stamp `slot / 64` without the
+    /// `+ 1` (a fall in slots 0..63 reads "never" and halves again every call); guard with κ 1.
+    #[kani::proof]
+    fn kani_r3_item7_rent_snapshot_and_min_leg() {
+        let prev: u32 = kani::any();
+        let st: u16 = kani::any();
+        let new: u32 = kani::any();
+        let now: u32 = kani::any();
+        let (v, st2) = rent_snapshot_smooth(prev as u64, st as u32, new as u64, now as u64);
+        if prev == 0 || new >= prev {
+            assert_eq!((v, st2), (new as u64, st as u32));
+        } else {
+            let k = if st == 0 { 1 } else { (now as u64).saturating_sub((st as u64 - 1) * 64 + 63) / 900 };
+            let floor = if k >= 64 { 0 } else { (prev as u64) >> k };
+            assert_eq!(v, core::cmp::max(new as u64, floor));
+            assert!(v <= prev as u64 && v >= new as u64);
+            if k == 0 {
+                assert_eq!((v, st2), (prev as u64, st as u32));
+            }
+        }
+        let leg: u32 = kani::any();
+        let d: Option<u32> = kani::any();
+        assert_eq!(band_min_leg_fits_depth(leg as u64, d.map(|x| x as u64)), d.is_none_or(|x| (leg as u64) <= (x as u64) / 2));
+        // the stamp is never 0 after a fall (0 = never)
+        if v < prev as u64 {
+            assert!(st2 != 0);
+        }
+        kani::cover!(prev > new && st == 0 && v == (prev as u64) / 2 && new < (prev / 2), "first fall: one halving");
+        kani::cover!(prev > new && st != 0 && v == prev as u64, "inside the window: held");
+        kani::cover!(prev > new && v == new as u64 && st != 0, "decayed down to the new value");
+        kani::cover!(d.is_some() && !band_min_leg_fits_depth(leg as u64, d.map(|x| x as u64)), "guard refuses");
     }
 }
