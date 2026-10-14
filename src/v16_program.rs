@@ -6913,12 +6913,16 @@ pub mod state {
         Ok(())
     }
 
-    /// The record a fresh ext starts from: alpha 50%, buffer 30%, cushion OFF.
+    /// The record a fresh ext starts from: alpha 50%, buffer 30%, and (v2.2 round 3, GAP-8) the
+    /// G6 cushion ON at the protocol defaults (`vault_lp_v18::CUSHION_*_DEFAULT_BPS`: target 20%
+    /// of C_eff, 50% of the LP fee leg). Tag 94 creates the ext at the bind when [11] is passed.
     pub fn default_vault_lp_ext(market_group: [u8; 32], bump: u8) -> VaultLpExtV19 {
         VaultLpExtV19 {
             market_group,
             alloc_alpha_bps: crate::vault_lp_v18::ALLOC_ALPHA_DEFAULT_BPS,
             alloc_buffer_bps: crate::vault_lp_v18::ALLOC_BUFFER_DEFAULT_BPS,
+            cushion_target_bps: crate::vault_lp_v18::CUSHION_TARGET_DEFAULT_BPS,
+            cushion_share_bps: crate::vault_lp_v18::CUSHION_SHARE_DEFAULT_BPS,
             version: crate::constants::VAULT_LP_EXT_VERSION,
             bump,
             ..VaultLpExtV19::default()
@@ -15862,12 +15866,16 @@ pub mod processor {
                 authority_epoch,
             } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
             Instruction::InitVaultLp { junior_floor_bps } => {
-                handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)
+                handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)?;
+                init_vault_lp_pin_ext_if_passed(program_id, accounts)
             }
             Instruction::InitVaultLpV19 {
                 junior_floor_bps,
                 l_launch_x100,
-            } => handle_init_vault_lp(program_id, accounts, junior_floor_bps, Some(l_launch_x100)),
+            } => {
+                handle_init_vault_lp(program_id, accounts, junior_floor_bps, Some(l_launch_x100))?;
+                init_vault_lp_pin_ext_if_passed(program_id, accounts)
+            }
             Instruction::InitVaultLpV22Tiers {
                 junior_floor_bps,
                 l_launch_x100,
@@ -15878,7 +15886,8 @@ pub mod processor {
                 // reverts the whole bind -- the creator's tier block on the asset just bound.
                 // Out of line so the pinned `handle_init_vault_lp` frame does not grow.
                 handle_init_vault_lp(program_id, accounts, junior_floor_bps, Some(l_launch_x100))?;
-                init_vault_lp_apply_tier_block(program_id, accounts, tiers)
+                init_vault_lp_apply_tier_block(program_id, accounts, tiers)?;
+                init_vault_lp_pin_ext_if_passed(program_id, accounts)
             }
             Instruction::VaultLpSetMatcher {
                 expected_sequence,
@@ -35788,7 +35797,9 @@ pub mod processor {
     /// pre-created by the client exactly as for InitPortfolio) · 5 system_program ·
     /// 6 own ledger · 7 sibling ledger · 8 matcher_program (== CANONICAL_VAULT_LP_MATCHER_PROGRAM)
     /// · 9 matcher_ctx [w] (pre-created, owner = matcher program, zeroed) · 10 matcher_delegate
-    /// (`["matcher", market, lp_portfolio, registry, matcher_program, matcher_ctx]`).
+    /// (`["matcher", market, lp_portfolio, registry, matcher_program, matcher_ctx]`) · 11
+    /// OPTIONAL vault_lp_ext [w] (`["vault_lp_ext", market]`, round 3: created at the bind with
+    /// the cushion on, `init_vault_lp_pin_ext_if_passed`; any other key there is ignored).
     ///
     /// AUTO-PIN (2026-09-30): the program itself approves the canonical matcher, keeps the 1x
     /// vault-LP exposure default, and initialises the matcher context with the protocol's
@@ -36937,7 +36948,7 @@ pub mod processor {
     }
 
     /// Load the ext, creating it (payer funds rent; protocol defaults: alpha 50%, buffer 30%,
-    /// cushion off) and raising the registry flag when it does not exist yet. The registry must
+    /// cushion on at 20% / 50%) and raising the registry flag when it does not exist yet. The registry must
     /// be passed writable whenever creation can happen.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
@@ -37173,7 +37184,9 @@ pub mod processor {
             c_eff,
             allocated,
             drawable,
-            x.alloc_alpha_bps,
+            // Round 3 (GAP-8): never above the protocol cap in force (50% until F3 is proven),
+            // whatever the stored dial (a pre-round-3 band record may hold up to 70%).
+            growth_v19::alloc_alpha_in_force_bps(x.alloc_alpha_bps),
             x.alloc_buffer_bps,
         )
         .ok_or(PercolatorError::VaultLpAllocateRefused)?;
@@ -40358,7 +40371,8 @@ pub mod processor {
         // v2.2: alpha above 50% only on a band market (up to 70%). v2.2 growth overnight §1.1:
         // only on a CLAMP-ENFORCED one (band on AND the bound asset's stored r_gap == G(d)); a
         // band market with no growth record on its bound asset, or with no bound asset, keeps
-        // the growth-1 50% (fail closed).
+        // the growth-1 50% (fail closed). Round 3 (GAP-8): 50% on EVERY market until
+        // `growth_v19::F3_PROVEN` (the backing top-up draw is proven); the UA cannot exceed it.
         let clamp = market_bound_asset_clamp_enforced(&mut market_ai.try_borrow_mut_data()?)?;
         if alpha > growth_v19::alloc_alpha_max_bps(clamp)
             || !(vault_lp_v18::ALLOC_BUFFER_MIN_BPS..=10_000).contains(&buffer)
@@ -43720,6 +43734,50 @@ pub mod processor {
         g.tier_threshold_usd = merged.threshold_usd;
         g.tier_leverage_x100 = merged.leverage_x100;
         state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)
+    }
+
+    /// v2.2 round 3 (GAP-8, "cushion on at the tag-94 auto-pin"): tag 94 accepts an OPTIONAL
+    /// trailing account [11] = the market's `VaultLpExtV19` PDA (`["vault_lp_ext", market]`, w).
+    /// When passed, the ext is created at the bind with the protocol defaults (alpha 50%, buffer
+    /// 30%, cushion ON 20% / 50%), the bind's marketauth [0] paying rent through [5]
+    /// system_program, so the fee cushion forms from the very first harvest (tag 78), not only
+    /// after the first allocation (103) creates the ext. Not passed: today's 11-account bind,
+    /// and 99 / 103 / 107 create the ext (with the same defaults) when it is first needed. The
+    /// account counts only when its KEY is the canonical ext PDA: any other trailing account is
+    /// ignored exactly as before (the path-B removal guarantee: an old client's trailing tail
+    /// never breaks the bind). The canonical PDA passed non-writable or non-empty refuses (the
+    /// bind reverts). Runs after every bind check passed (out of line: the pinned
+    /// `handle_init_vault_lp` frame is unchanged).
+    #[inline(never)]
+    fn init_vault_lp_pin_ext_if_passed<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        if accounts.len() <= 11 {
+            return Ok(());
+        }
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let system_program_ai = account(accounts, 5)?;
+        let ext_ai = account(accounts, 11)?;
+        if ext_ai.key != &state::derive_vault_lp_ext(program_id, market_ai.key).0 {
+            return Ok(());
+        }
+        let mut registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        if registry.market_group != market_ai.key.to_bytes() || !state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        load_or_create_vault_lp_ext(
+            program_id,
+            admin,
+            system_program_ai,
+            market_ai.key,
+            registry_ai,
+            &mut registry,
+            ext_ai,
+        )?;
+        Ok(())
     }
 
     fn side_oi_snapshot_view(
@@ -49414,5 +49472,58 @@ mod g8_kani_proofs {
         );
         kani::cover!(ever && lg == 0 && r > 0 && out == core::cmp::min(r, seed / DEPTH_BOOTSTRAP_DIV), "bootstrap out of 0");
         kani::cover!(ever && r < lg && out == r, "falls at once");
+    }
+}
+
+/// v2.2 round 3 (2026-10-14, adaptive-controller design §4) Kani harnesses, one group per item,
+/// on the new PURE functions in `growth_v19` / `vault_lp_v18`. WRITTEN, NOT RUN (Khubair runs
+/// them once): `cargo kani --features devnet --harness kani_r3_<name>`. Every harness carries a
+/// `kani::cover!` per branch (a verdict counts only with every cover SATISFIED); inputs are
+/// bounded (u8 / u16 / u32 cast up). Each doc lists the mutants the harness must refute.
+#[cfg(kani)]
+mod r3_kani_proofs {
+    use crate::growth_v19::*;
+    use crate::vault_lp_v18 as vl;
+
+    /// Item 1 (GAP-8): the alpha dial ceiling is 50% on every market unless F3 is proven AND the
+    /// market is clamp-enforced; the alpha in force is `min(stored, 50%)` until F3 is proven and
+    /// the stored dial after; the allocation limit at the in-force alpha never takes the
+    /// allocated counter above floor(50% * C_eff) while unproven.
+    /// Mutants: band max without the F3 switch (round 2); `max` for `min` in force; in-force
+    /// ignoring the switch (always the stored dial); cap 5,001.
+    #[kani::proof]
+    fn kani_r3_gap8_alpha_cap() {
+        let proven: bool = kani::any();
+        let band: bool = kani::any();
+        let stored: u16 = kani::any();
+        let m = alloc_alpha_max_bps_for(proven, band);
+        if proven && band {
+            assert_eq!(m, ALLOC_ALPHA_MAX_BAND_BPS);
+        } else {
+            assert_eq!(m, 5_000);
+        }
+        let a = alloc_alpha_in_force_bps_for(proven, stored);
+        assert!(a <= stored);
+        if !proven {
+            assert!(a <= 5_000);
+            assert_eq!(a, if stored < 5_000 { stored } else { 5_000 });
+        } else {
+            assert_eq!(a, stored);
+        }
+        let c: u32 = kani::any();
+        let alloc: u32 = kani::any();
+        let draw: u32 = kani::any();
+        if !proven && stored <= ALLOC_ALPHA_MAX_BAND_BPS {
+            if let Some(lim) = vl::vault_lp_alloc_limit(c as u128, alloc as u128, draw as u128, a, vl::ALLOC_BUFFER_MIN_BPS) {
+                let half = (c as u128) * 5_000 / 10_000;
+                assert!((alloc as u128) + lim <= core::cmp::max(half, alloc as u128));
+            }
+        }
+        kani::cover!(!proven && band && m == 5_000, "band market capped at 50% while unproven");
+        kani::cover!(proven && band && m == ALLOC_ALPHA_MAX_BAND_BPS, "band max once proven");
+        kani::cover!(!band && m == 5_000, "off-band 50%");
+        kani::cover!(!proven && stored > 5_000 && a == 5_000, "a 70% record allocates at 50%");
+        kani::cover!(!proven && stored < 5_000 && a == stored, "a lower dial is kept");
+        kani::cover!(proven && stored > 5_000 && a == stored, "after the flip: the stored dial");
     }
 }

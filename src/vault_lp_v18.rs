@@ -902,6 +902,28 @@ pub fn cushion_split(
     Some((available - cushion, cushion))
 }
 
+/// v2.2 round 3 (adaptive-controller design GAP-8 / LP-plan audit §4 item 8): the G6 cushion is
+/// ON by default on every new `VaultLpExtV19` (`default_vault_lp_ext`, which tag 94 now creates
+/// at the bind, and 99 / 103 / 107 create when absent). Conservative values, Earn-first:
+/// * target 2,000 bps of `C_eff`: the junior (the creator's deposit + the cushion) is topped up
+///   from fees until it can absorb a 20% loss of Earn's claim before any senior loss. With alpha
+///   capped at 50% (`growth_v19::F3_PROVEN`), Earn capital in the LP is <= 0.5 C_eff, so a 20%
+///   junior covers 40% of everything Earn can have lent the LP; F6 saw the 10-20% junior wiped by
+///   +30-45% moves against a full crowd. It is never above the vault's own floor range (junior
+///   floor 10-100% of the LP), so a well-capitalised creator diverts nothing.
+/// * share 5,000 bps of the LP fee leg: half of the seniors' fee income builds the cushion while
+///   it is below target (100% would zero Earn's yield for the build-up; less builds it too slowly
+///   at today's fee volume, ~1.2%/day of notional). Above target the seniors get the whole leg.
+///
+/// Costs (copy must say so): creator fees vest only once the junior is at the target
+/// (`creator_fee_vested`), and the cushion part is locked against junior withdrawal (97) up to
+/// the target (`cushion_locked`). The upgrade authority can still change or switch it off (99).
+pub const CUSHION_TARGET_DEFAULT_BPS: u16 = 2_000;
+pub const CUSHION_SHARE_DEFAULT_BPS: u16 = 5_000;
+// The validator requires both-or-neither and <= 100%.
+const _: () = assert!(CUSHION_TARGET_DEFAULT_BPS != 0 && CUSHION_SHARE_DEFAULT_BPS != 0);
+const _: () = assert!(CUSHION_TARGET_DEFAULT_BPS as u128 <= BPS && CUSHION_SHARE_DEFAULT_BPS as u128 <= BPS);
+
 /// The cushion the junior may not withdraw (97): `min(accrued, ceil(target * C_eff))`.
 pub fn cushion_locked(cushion_accrued: u128, c_eff: u128, cushion_target_bps: u16) -> Option<u128> {
     let target = bps_ceil(c_eff, cushion_target_bps)?;

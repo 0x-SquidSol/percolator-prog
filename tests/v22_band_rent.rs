@@ -1158,9 +1158,12 @@ fn v22_growth_pure_band_gates() {
     assert!(gv::growth_dials_ok_for(Some((1_000, 938)), 49_019, 10_000));
     assert!(!gv::growth_dials_ok_for(Some((1_000, 938)), 49_020, 10_000), "above band_lambda_max");
     assert!(!gv::growth_dials_ok_for(None, 10_001, 0), "off-band box unchanged");
-    // alpha: 50% off-band, 70% on a band market.
+    // alpha: 50% off-band, 70% on a band market ONCE F3 IS PROVEN (round 3, GAP-8); until then
+    // 50% on every market.
     assert_eq!(gv::alloc_alpha_max_bps(false), 5_000);
-    assert_eq!(gv::alloc_alpha_max_bps(true), 7_000);
+    assert_eq!(gv::alloc_alpha_max_bps_for(true, true), 7_000);
+    assert_eq!(gv::alloc_alpha_max_bps_for(false, true), 5_000);
+    assert_eq!(gv::alloc_alpha_max_bps(true), if gv::F3_PROVEN { 7_000 } else { 5_000 });
     // I-1: c_launch never below $1,000.
     assert_eq!(gv::c_launch_atoms_for(1), gv::MIN_C_LAUNCH_ATOMS);
     assert_eq!(gv::c_launch_atoms_for(5 * gv::MIN_C_LAUNCH_ATOMS), 5 * gv::MIN_C_LAUNCH_ATOMS);
@@ -1657,7 +1660,8 @@ fn v22_band_lambda_and_alpha_caps_follow_the_build() {
         assert_eq!(gv::ALLOC_ALPHA_MAX_BAND_BPS, 6_000);
     }
     assert!(gv::band_lambda_max_bps(500, 1).unwrap() <= gv::BAND_LAMBDA_CAP_BPS);
-    assert_eq!(gv::alloc_alpha_max_bps(true), gv::ALLOC_ALPHA_MAX_BAND_BPS);
+    assert_eq!(gv::alloc_alpha_max_bps_for(true, true), gv::ALLOC_ALPHA_MAX_BAND_BPS);
+    assert_eq!(gv::alloc_alpha_max_bps(true), if gv::F3_PROVEN { gv::ALLOC_ALPHA_MAX_BAND_BPS } else { 5_000 });
     assert!(!gv::graduation_allowed(100, 0), "graduation stays closed until depth tiers exist");
 }
 

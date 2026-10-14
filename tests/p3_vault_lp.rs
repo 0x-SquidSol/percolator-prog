@@ -5277,3 +5277,98 @@ fn r2_tag93_ua_tier_trailer_bounds_auth_and_backward_compat() {
     let g = growth_rec(&env).unwrap();
     assert_eq!((g.lambda_bps, g.tier_threshold_usd, g.attested_max_tier), (9_000, good.threshold_usd, 3));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// v2.2 round 3, item 1 (adaptive-controller design GAP-8 / LP-plan audit §4 item 8): the G6
+// fee cushion is ON by default, pinned at the tag-94 bind (optional [11] = the ext PDA).
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    /// The bind (tag 94, floor 10%) with an optional trailing account [11].
+    fn bind_with_tail(&mut self, tail: &[AccountMeta]) -> Result<Lp, String> {
+        let admin = self.admin.insecure_clone();
+        let m = self.matcher;
+        let lp = self.init_vault_lp_full(&admin, 1_000, m, tail)?;
+        let a = admin.pubkey();
+        self.set_program_data_authority(&a);
+        Ok(lp)
+    }
+}
+
+/// GAP-8: tag 94 with [11] = the canonical `["vault_lp_ext", market]` PDA creates the ext at the
+/// bind with the protocol defaults (alpha 50%, buffer 30%, cushion 20% of C_eff / 50% of the LP
+/// fee leg), so the very first harvest (78) builds the junior cushion and creator fees vest only
+/// at the target. Controls: no [11] -> no ext (today's bind, unchanged); [11] = any other key ->
+/// ignored (the path-B "trailing accounts ignored" guarantee); [11] = the PDA read-only -> the
+/// bind reverts (nothing created). The harvest itself: senior + cushion == the whole leg, the
+/// cushion is <= 50% of it, and the cushion-off world (a UA-set ext with 0/0) credits it all to C.
+#[test]
+fn r3_gap8_tag94_pins_the_cushion_on_at_bind() {
+    use percolator_prog::vault_lp_v18 as vl;
+    // (a) no [11]: no ext.
+    {
+        let mut env = Env::new(Params::default());
+        env.bind_with_tail(&[]).expect("bind without [11]");
+        assert!(env.ext().is_none(), "control: no ext without [11]");
+    }
+    // (b) [11] = some other key: ignored, bind lands, no ext.
+    {
+        let mut env = Env::new(Params::default());
+        let other = Pubkey::new_unique();
+        env.bind_with_tail(&[AccountMeta::new(other, false)]).expect("trailing non-ext key ignored");
+        assert!(env.ext().is_none(), "a non-PDA [11] creates nothing");
+    }
+    // (c) the PDA read-only: refused, the whole bind reverts.
+    {
+        let mut env = Env::new(Params::default());
+        let ext = env.ext_key();
+        assert!(env.bind_with_tail(&[AccountMeta::new_readonly(ext, false)]).is_err(), "read-only ext refused");
+        assert!(env.svm.get_account(&env.vault_lp).map(|a| a.data.is_empty()).unwrap_or(true), "bind reverted");
+        assert!(env.ext().is_none());
+    }
+    // (d) the PDA writable: created with the defaults; the harvest builds the cushion.
+    let run = |pin: bool| -> (u128, u128, u8) {
+        let p = Params { fee_bps: 100, ..Params::default() };
+        let mut env = Env::new(p);
+        let d = env.new_depositor();
+        env.earn_deposit(&d, 10_000 * U, None).expect("senior 10,000");
+        let ext = env.ext_key();
+        let lp = env.bind_with_tail(&[AccountMeta::new(ext, false)]).expect("bind with [11] ext");
+        let x = env.ext().expect("ext created at the bind");
+        assert_eq!(
+            (x.alloc_alpha_bps, x.alloc_buffer_bps, x.cushion_target_bps, x.cushion_share_bps),
+            (vl::ALLOC_ALPHA_DEFAULT_BPS, vl::ALLOC_BUFFER_DEFAULT_BPS, vl::CUSHION_TARGET_DEFAULT_BPS, vl::CUSHION_SHARE_DEFAULT_BPS),
+        );
+        assert_eq!((x.cushion_target_bps, x.cushion_share_bps), (2_000, 5_000));
+        assert_eq!(env.registry_state()._reserved[percolator_prog::constants::VAULT_LP_REGISTRY_EXT_FLAG_IDX], 1, "registry ext flag raised");
+        let admin = env.admin.insecure_clone();
+        // junior 1,000 < 20% of C (2,000): the cushion accrues.
+        env.junior_deposit_as(&admin, lp.portfolio, 1_000 * U).expect("junior 1,000");
+        if !pin {
+            // Control: the UA switches the cushion off (99 with 0/0).
+            env.set_p2b_dials(&admin, [5_000, 3_000, 0, 0]).expect("cushion off");
+        }
+        let t = env.new_trader(5_000 * U);
+        for _ in 0..4 {
+            env.trade(&t, &lp, 1_000 * UQ).expect("open");
+            env.trade(&t, &lp, -1_000 * UQ).expect("close");
+        }
+        let c_before = env.vlp().senior_claim_atoms;
+        let _ = env.crank(lp.portfolio);
+        env.crank_fees_ext(lp.portfolio).expect("78");
+        let credited = env.vlp().senior_claim_atoms - c_before;
+        let k = env.ext().unwrap().cushion_accrued_atoms;
+        let vest = env.asset_rec().p2b_flags & state::ASSET_VAULT_LP_P2B_CREATOR_FEE_VESTING;
+        env.assert_conserved("gap8");
+        (credited, k, vest)
+    };
+    let (c_off, k_off, vest_off) = run(false);
+    let (c_on, k_on, vest_on) = run(true);
+    eprintln!("GAP-8: C credit off {c_off} on {c_on}; cushion {k_on}");
+    assert!(c_off > 0, "fees harvested (vacuity)");
+    assert_eq!((k_off, vest_off), (0, 0), "control: cushion off, nothing diverted, vested");
+    assert!(k_on > 0, "the default cushion accrues from the first harvest");
+    assert!(k_on <= c_off / 2 + 1, "at most the 50% share: {k_on} of {c_off}");
+    assert_eq!(c_on + k_on, c_off, "senior + cushion == the whole leg");
+    assert_eq!(vest_on, state::ASSET_VAULT_LP_P2B_CREATOR_FEE_VESTING, "creator fees vest only at target");
+}

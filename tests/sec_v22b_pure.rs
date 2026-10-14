@@ -93,7 +93,10 @@ fn sec_band_caps_by_build() {
             assert!(band_lambda_max_bps(mmr, g as u64).unwrap() <= lambda);
         }
     }
-    assert_eq!(gv::alloc_alpha_max_bps(true), alpha);
+    // Round 3 (GAP-8): the band maximum applies only once F3 is proven; until then 50% on every
+    // market (the band constant is the post-F3 cap and still follows the build).
+    assert_eq!(gv::alloc_alpha_max_bps_for(true, true), alpha);
+    assert_eq!(gv::alloc_alpha_max_bps(true), if gv::F3_PROVEN { alpha } else { 5_000 });
     use percolator_prog::vault_lp_v18::{vault_lp_alloc_limit, ALLOC_BUFFER_MIN_BPS};
     assert!(vault_lp_alloc_limit(1_000_000, 0, 1_000_000, alpha, ALLOC_BUFFER_MIN_BPS).is_some());
     assert!(

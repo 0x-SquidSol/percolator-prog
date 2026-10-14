@@ -900,14 +900,54 @@ pub fn growth_dials_ok_for(band: Option<(u64, u64)>, lambda_bps: u32, kink_bps: 
 pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 7_000;
 #[cfg(not(feature = "devnet"))]
 pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 6_000;
-/// v2.2 growth overnight §1.1: `band_on` is the per-market CLAMP predicate (`clamp_enforced`),
-/// not the band alone (callers: tag 99's dial trailer).
-pub fn alloc_alpha_max_bps(band_on: bool) -> u16 {
-    if band_on {
+/// v2.2 round 3 (adaptive-controller design GAP-8 / LP-plan audit §4 item 8): the backing top-up
+/// draw (F3) is what lets Earn take a loss in the designed order (junior, bonds, seniors) BEFORE
+/// winners are stuck. Until it is PROVEN (Kani on the draw rule + the +90% / +100% / cascade sims
+/// show every layer moving money), Earn allocation stays at the growth-1 50% on EVERY market,
+/// band or not: a protocol cap neither the creator nor the upgrade authority can exceed. Flipping
+/// this to `true` (a code change, reviewed) restores the band maximum `ALLOC_ALPHA_MAX_BAND_BPS`.
+pub const F3_PROVEN: bool = false;
+/// The protocol alpha cap while `F3_PROVEN` is false (the growth-1 / off-band 50%).
+pub const ALLOC_ALPHA_MAX_UNPROVEN_BPS: u16 = 5_000;
+const _: () = assert!(ALLOC_ALPHA_MAX_UNPROVEN_BPS == crate::vault_lp_v18::ALLOC_ALPHA_MAX_BPS);
+const _: () = assert!(ALLOC_ALPHA_MAX_UNPROVEN_BPS <= ALLOC_ALPHA_MAX_BAND_BPS);
+
+/// The alpha dial ceiling (pure core, both values of the switch; Kani / proptest target):
+/// band (clamp-enforced) markets may go to `ALLOC_ALPHA_MAX_BAND_BPS` only once `f3_proven`;
+/// every other case is the 50% cap.
+pub fn alloc_alpha_max_bps_for(f3_proven: bool, band_on: bool) -> u16 {
+    if band_on && f3_proven {
         ALLOC_ALPHA_MAX_BAND_BPS
+    } else if band_on {
+        ALLOC_ALPHA_MAX_UNPROVEN_BPS
     } else {
         crate::vault_lp_v18::ALLOC_ALPHA_MAX_BPS
     }
+}
+
+/// v2.2 growth overnight §1.1: `band_on` is the per-market CLAMP predicate (`clamp_enforced`),
+/// not the band alone (callers: tag 99's dial trailer). Round 3: capped at 50% everywhere until
+/// `F3_PROVEN`.
+pub fn alloc_alpha_max_bps(band_on: bool) -> u16 {
+    alloc_alpha_max_bps_for(F3_PROVEN, band_on)
+}
+
+/// Round 3: the alpha tag 103 actually allocates with: the stored dial, capped by the protocol
+/// cap in force (`min(stored, 50%)` until `F3_PROVEN`). A record written before round 3 with a
+/// band alpha above 50% stays VALID (the validator's ceiling is the band maximum, so no read
+/// fails) but cannot allocate past 50%. After the flip the stored dial is used as written (the
+/// setter already bounded it per market).
+pub fn alloc_alpha_in_force_bps_for(f3_proven: bool, stored_alpha_bps: u16) -> u16 {
+    if f3_proven || stored_alpha_bps <= ALLOC_ALPHA_MAX_UNPROVEN_BPS {
+        stored_alpha_bps
+    } else {
+        ALLOC_ALPHA_MAX_UNPROVEN_BPS
+    }
+}
+
+/// `alloc_alpha_in_force_bps_for` at the program's `F3_PROVEN`.
+pub fn alloc_alpha_in_force_bps(stored_alpha_bps: u16) -> u16 {
+    alloc_alpha_in_force_bps_for(F3_PROVEN, stored_alpha_bps)
 }
 
 /// v2.2 (security review I-1): the graduation reference `c_launch` is never below $1,000 of
@@ -2204,6 +2244,21 @@ mod tests {
     use super::*;
 
     const PS: u128 = 1_000_000;
+
+    /// Round 3 item 1 (GAP-8): alpha <= 50% on every market until F3 is proven.
+    #[test]
+    fn r3_gap8_alpha_cap_truth_table() {
+        for band in [false, true] {
+            assert_eq!(alloc_alpha_max_bps_for(false, band), 5_000);
+        }
+        assert_eq!(alloc_alpha_max_bps_for(true, false), 5_000);
+        assert_eq!(alloc_alpha_max_bps_for(true, true), ALLOC_ALPHA_MAX_BAND_BPS);
+        assert_eq!(alloc_alpha_max_bps(true), 5_000, "F3 not proven in this round");
+        assert_eq!(alloc_alpha_in_force_bps(7_000), 5_000);
+        assert_eq!(alloc_alpha_in_force_bps(5_000), 5_000);
+        assert_eq!(alloc_alpha_in_force_bps(1), 1);
+        assert_eq!(alloc_alpha_in_force_bps_for(true, 7_000), 7_000);
+    }
 
     #[test]
     fn leverage_imr_roundtrip_never_looser() {

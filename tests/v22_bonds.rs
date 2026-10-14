@@ -2781,17 +2781,21 @@ fn sec_c1_impaired_bond_earns_no_coupon() {
             cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
         };
         let c0 = env.vlp().senior_claim_atoms;
+        let k0 = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0);
         env.crank_fees_bond(lp.portfolio).expect("78");
         let coupon = env.tranche().c_b_atoms - tr0.c_b_atoms;
         let senior = env.vlp().senior_claim_atoms - c0;
-        eprintln!("SEC-C1 impaired={impaired}: leg {avail} coupon {coupon} senior-credit {senior}");
-        (avail, coupon, senior)
+        // Round 3 (GAP-8): the bond tranche's ext carries the default cushion (20% / 50%), so the
+        // Earn side of the leg is seniors + the junior cushion.
+        let cushion = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0) - k0;
+        eprintln!("SEC-C1 impaired={impaired}: leg {avail} coupon {coupon} senior-credit {senior} cushion {cushion}");
+        (avail, coupon, senior + cushion)
     };
     let (leg_i, coupon_i, senior_i) = run(true);
     let (leg_w, coupon_w, senior_w) = run(false);
     assert!(leg_i > 0 && leg_w > 0, "vacuity: fee legs");
     assert_eq!(coupon_i, 0, "M-1: an impaired tranche earns nothing");
-    assert_eq!(senior_i, leg_i, "the whole leg goes to Earn");
+    assert_eq!(senior_i, leg_i, "the whole leg goes to Earn's side (seniors + junior cushion), none to bonds");
     assert!(coupon_w > 0, "control: a whole tranche earns its coupon");
     assert_eq!(coupon_w + senior_w, leg_w);
 }
@@ -3061,9 +3065,12 @@ fn bond_coupon_gate_uses_the_lag_worse_value_like_108_110() {
         let c0 = env.vlp().senior_claim_atoms;
         let (cfg, _) = env.market_state();
         let leg = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+        let k0 = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0);
         env.crank_fees_bond(lp.portfolio).expect("78");
         let coupon = env.tranche().c_b_atoms - cb0;
-        assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0), leg);
+        // Round 3 (GAP-8): + the default junior cushion's share.
+        let cushion = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0) - k0;
+        assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0) + cushion, leg);
         let h2 = env.new_bond_holder();
         let r108 = env.bond_deposit(&h2, lp.portfolio, U, 1);
         eprintln!("LAG-WORSE lag={lag}: leg {leg} coupon {coupon} 108 -> {:?}", r108.as_ref().map_err(|e| e.chars().take(70).collect::<String>()));
@@ -3119,4 +3126,50 @@ fn wl1_band_bond_lock_uses_lambda_eff_not_the_stored_lambda() {
     let paid = env.bond_execute(&attacker, lp.portfolio, 0).expect("exit once nothing is open");
     assert_eq!(paid, 1_000 * U, "par (coupon 0)");
     env.assert_conserved("wl1");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// v2.2 round 3, item 1 (adaptive-controller design GAP-8 / LP-plan audit §4 item 8): Earn
+// allocation alpha <= 50% on EVERY market (band or not) until F3 is proven -- a protocol cap the
+// upgrade authority cannot exceed.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// GAP-8 on a CLAMP-ENFORCED band market (where round 2 let the UA set up to 70% on devnet):
+/// tag 99 refuses alpha 50.01% and 70% (InvalidInstruction) and accepts 50%. A record written
+/// before round 3 that already holds 70% (STATE POKE: the value the round-2 setter accepted)
+/// still validates (no read fails) but tag 103 allocates at most floor(50% * C_eff). Negative
+/// control (file copy): without `alloc_alpha_in_force_bps` the same allocate moves 7,000 (70%).
+#[test]
+fn r3_gap8_alpha_capped_at_50_on_a_band_market_until_f3_proven() {
+    use percolator_prog::growth_v19 as gv;
+    assert_eq!(gv::alloc_alpha_max_bps(true), 5_000, "F3 is not proven in this round");
+    let p = Params { band: Some(100), ..growth_params() };
+    let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+    {
+        let acc = env.svm.get_account(&env.market).unwrap();
+        let g = state::read_asset_growth(&acc.data, 0, 1_000).unwrap().expect("growth on");
+        assert_eq!(Some(g.r_gap_bps), gv::band_r_gap_bps(100), "clamp-enforced band market");
+    }
+    let admin = env.admin.insecure_clone();
+    err_has(&env.set_p2b_dials(&admin, [5_001, 3_000, 2_000, 5_000]), PercolatorError::InvalidInstruction);
+    err_has(&env.set_p2b_dials(&admin, [7_000, 3_000, 2_000, 5_000]), PercolatorError::InvalidInstruction);
+    env.set_p2b_dials(&admin, [5_000, 3_000, 2_000, 5_000]).expect("50% accepted on a band market");
+    // STATE POKE: the pre-round-3 band record at 70%.
+    {
+        let key = env.ext_key();
+        let mut acc = env.svm.get_account(&key).unwrap();
+        let mut x = state::read_vault_lp_ext(&acc.data).unwrap();
+        x.alloc_alpha_bps = 7_000;
+        state::write_vault_lp_ext(&mut acc.data, &x).unwrap();
+        env.svm.set_account(key, acc).unwrap();
+        assert_eq!(env.ext().unwrap().alloc_alpha_bps, 7_000, "a 70% record still validates");
+    }
+    let c = env.vlp().senior_claim_atoms;
+    env.allocate(lp.portfolio, u128::MAX).expect("103");
+    let a = env.allocated();
+    eprintln!("GAP-8: C {c} allocated {a}");
+    assert!(a > 0, "vacuity: something allocated");
+    assert!(a <= c / 2, "alpha in force is 50%: allocated {a} of C {c}");
+    assert_eq!(a, c / 2, "the alpha room binds (the buffer room is 70% of C here)");
+    env.assert_conserved("gap8 alpha");
 }
