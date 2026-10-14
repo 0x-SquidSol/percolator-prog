@@ -1668,8 +1668,33 @@ fn adv_many_one_unit_trades_no_rounding_accumulation() {
 // domain split, NOT the operative guarantee. The StockRecon identity keeps engine
 // vault == SPL vault throughout.
 // ===========================================================================
+// v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a tag-5 crank whose refresh leaves an
+// account materially below maintenance now continues into ONE engine Liquidate step in the same
+// instruction. The scenario is therefore run in two arms, with the SAME assertions:
+//   * `JumpIntoBankruptcy` (the original attack): the mark walk is settled through the LP's crank
+//     only, so the weak short is first touched already bankrupt (loss 300 > deposit 250). Its
+//     first crank re-certifies AND liquidates (F1); the toxic leg must close in full, the
+//     attacker must not net-extract, insurance outside the loss domain must stay untouched.
+//     (Before F1 the first crank only certified and a second crank liquidated; the explicit
+//     liquidation below now runs only if the leg is still open, it is never skipped silently:
+//     the EXECUTED-GUARD `leg == 0` is unchanged.)
+//   * `KeeperWalk`: the weak short is also cranked at every price checkpoint, as a keeper does.
+//     F1 then partially liquidates it at each crossing (engine-sized minimal close), so it never
+//     reaches bankruptcy. Executed guard: the toxic leg strictly shrank; the anti-extraction,
+//     insurance and vault-sync assertions are the same.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AdvWalk {
+    JumpIntoBankruptcy,
+    KeeperWalk,
+}
+
 #[test]
 fn adv_self_liquidation_backstop_no_insurance_siphon() {
+    adv_self_liquidation_backstop_no_insurance_siphon_arm(AdvWalk::JumpIntoBankruptcy);
+    adv_self_liquidation_backstop_no_insurance_siphon_arm(AdvWalk::KeeperWalk);
+}
+
+fn adv_self_liquidation_backstop_no_insurance_siphon_arm(walk: AdvWalk) {
     let mut env = Env::new(0);
     let weak = Keypair::new(); // weak short, thin collateral
     let lp = Keypair::new(); // strong long LP
@@ -1699,29 +1724,49 @@ fn adv_self_liquidation_backstop_no_insurance_siphon() {
     for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
         env.warp(slot);
         let _ = env.accrue_mark(ASSET, slot, price);
-        let _ = env.crank_catchup(wa, slot);
+        if walk == AdvWalk::KeeperWalk {
+            let _ = env.crank_catchup(wa, slot);
+        }
         let _ = env.crank_catchup(la, slot);
     }
+    if walk == AdvWalk::JumpIntoBankruptcy {
+        // Non-vacuity of the attack: the short was never touched during the walk, so it still
+        // holds the whole toxic leg going into its first crank at the bankrupt mark.
+        assert_eq!(
+            env.leg_size(wa).unsigned_abs(),
+            weak_pos_before,
+            "fixture: the weak short must reach the bankrupt mark untouched"
+        );
+    }
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the engine's plan selector
-    // needs a current certificate before Liquidate is selectable (engine v16.rs:15163) -- the
-    // first call re-certifies `wa` against the fully-accrued (400) price (discovering the
-    // deficit), the second liquidates.
+    // needs a current certificate before Liquidate is selectable (engine v16.rs:15163). Since
+    // v2.2 F1 the first crank re-certifies AND (the account being below maintenance) liquidates in
+    // the same instruction; the explicit second crank is sent only if the leg is still open.
     //
     // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair:
     // `try_liquidate_catchup` first (bounded, mirrors a real keeper) so the first call
     // below genuinely reaches dispatch instead of an early return.
     let _ = env.try_liquidate_catchup(wa, 30);
-    env.try_liquidate(wa, 30)
-        .expect("liquidation of the bankrupt short must succeed");
+    if walk == AdvWalk::JumpIntoBankruptcy && env.leg_size(wa) != 0 {
+        env.try_liquidate(wa, 30)
+            .expect("liquidation of the bankrupt short must succeed");
+    }
 
-    // EXECUTED-GUARD (load-bearing): the liquidation actually fired — the toxic
-    // leg is CLOSED (not merely "not grown"). Without this a silent no-op would
-    // pass the bounds below.
-    assert_eq!(
-        env.leg_size(wa),
-        0,
-        "liquidation must close the toxic leg (it did not fire)"
-    );
+    match walk {
+        // EXECUTED-GUARD (load-bearing): the liquidation actually fired — the toxic
+        // leg is CLOSED (not merely "not grown"). Without this a silent no-op would
+        // pass the bounds below.
+        AdvWalk::JumpIntoBankruptcy => assert_eq!(
+            env.leg_size(wa),
+            0,
+            "liquidation must close the toxic leg (it did not fire)"
+        ),
+        // EXECUTED-GUARD (F1 keeper walk): the partial liquidations at each crossing fired.
+        AdvWalk::KeeperWalk => assert!(
+            env.leg_size(wa).unsigned_abs() < weak_pos_before,
+            "keeper walk: the crossings must have partially liquidated the toxic leg"
+        ),
+    }
     assert!(
         env.leg_size(wa).unsigned_abs() <= weak_pos_before,
         "liquidation increased toxic exposure"
@@ -1732,7 +1777,7 @@ fn adv_self_liquidation_backstop_no_insurance_siphon() {
     let wealth = env.equity(wa) + env.equity(la);
     assert!(
         wealth <= initial + TOL,
-        "self-liquidation extracted net value: {wealth} > {initial}"
+        "{walk:?}: self-liquidation extracted net value: {wealth} > {initial}"
     );
     assert_eq!(
         env.group().vault as u64,
@@ -1756,8 +1801,14 @@ fn adv_self_liquidation_backstop_no_insurance_siphon() {
 // via the source-credit haircut / ADL path (v16.rs:6674-6782), never minted.
 // SourceCreditLienAggregateProofV16 bounds the winner's support by posted backing.
 // ===========================================================================
+// v2.2 F1: same two arms as SCENARIO 2 (see `AdvWalk`), same assertions.
 #[test]
 fn adv_zero_insurance_self_liquidation_no_net_extraction() {
+    adv_zero_insurance_self_liquidation_no_net_extraction_arm(AdvWalk::JumpIntoBankruptcy);
+    adv_zero_insurance_self_liquidation_no_net_extraction_arm(AdvWalk::KeeperWalk);
+}
+
+fn adv_zero_insurance_self_liquidation_no_net_extraction_arm(walk: AdvWalk) {
     let mut env = Env::new(0);
     let weak = Keypair::new();
     let lp = Keypair::new();
@@ -1783,46 +1834,66 @@ fn adv_zero_insurance_self_liquidation_no_net_extraction() {
     // Push the mark up past the short's collateral (bankruptcy) over bounded steps.
     // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: use
     // `crank_catchup` so each price checkpoint is actually settled before the next.
+    // v2.2 F1: in the JumpIntoBankruptcy arm only the LP is cranked during the walk (see `AdvWalk`).
     for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
         env.warp(slot);
         let _ = env.accrue_mark(ASSET, slot, price);
-        let _ = env.crank_catchup(wa, slot);
+        if walk == AdvWalk::KeeperWalk {
+            let _ = env.crank_catchup(wa, slot);
+        }
         let _ = env.crank_catchup(la, slot);
+    }
+    if walk == AdvWalk::JumpIntoBankruptcy {
+        assert_eq!(
+            env.leg_size(wa).unsigned_abs(),
+            weak_pos_before,
+            "fixture: the weak short must reach the bankrupt mark untouched"
+        );
     }
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the engine's plan selector
     // needs a current certificate before Liquidate is selectable (engine v16.rs:15163). Crank in
     // a bounded loop (re-certify, then liquidate -- possibly across more than one bounded step
     // under the zero-insurance source-credit/ADL socialization path) until the toxic leg closes.
+    // v2.2 F1: the first crank re-certifies AND liquidates in one instruction.
     //
     // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair:
     // `try_liquidate_catchup` first (bounded, mirrors a real keeper) so the loop below
     // starts from a state where calls genuinely reach dispatch.
     let _ = env.try_liquidate_catchup(wa, 30);
-    let mut closed = env.leg_size(wa) == 0;
-    for _ in 0..6 {
-        if closed {
-            break;
+    if walk == AdvWalk::JumpIntoBankruptcy {
+        let mut closed = env.leg_size(wa) == 0;
+        for _ in 0..6 {
+            if closed {
+                break;
+            }
+            let _ = env.try_liquidate(wa, 30);
+            if env.leg_size(wa) == 0 {
+                closed = true;
+                break;
+            }
         }
-        let _ = env.try_liquidate(wa, 30);
-        if env.leg_size(wa) == 0 {
-            closed = true;
-            break;
-        }
+        assert!(
+            closed,
+            "liquidation of the bankrupt short must close the toxic leg within a small bounded \
+             number of calls"
+        );
     }
-    assert!(
-        closed,
-        "liquidation of the bankrupt short must close the toxic leg within a small bounded \
-         number of calls"
-    );
 
-    // EXECUTED-GUARD: liquidation fired — toxic leg CLOSED. With zero insurance the
+    // EXECUTED-GUARD: liquidation fired — toxic leg CLOSED (bankrupt arm) / strictly reduced
+    // by the F1 partial liquidations (keeper walk). With zero insurance the
     // uncovered loss is socialized via the source-credit haircut / ADL path (never
     // minted, never an insurance siphon — insurance stays exactly 0).
-    assert_eq!(
-        env.leg_size(wa),
-        0,
-        "liquidation must close the toxic leg (it did not fire)"
-    );
+    match walk {
+        AdvWalk::JumpIntoBankruptcy => assert_eq!(
+            env.leg_size(wa),
+            0,
+            "liquidation must close the toxic leg (it did not fire)"
+        ),
+        AdvWalk::KeeperWalk => assert!(
+            env.leg_size(wa).unsigned_abs() < weak_pos_before,
+            "keeper walk: the crossings must have partially liquidated the toxic leg"
+        ),
+    }
     assert!(
         env.leg_size(wa).unsigned_abs() <= weak_pos_before,
         "liquidation increased toxic exposure"
@@ -1835,7 +1906,7 @@ fn adv_zero_insurance_self_liquidation_no_net_extraction() {
     let wealth = env.equity(wa) + env.equity(la);
     assert!(
         wealth <= initial + TOL,
-        "zero-insurance self-liquidation extracted net value: {wealth} > {initial}"
+        "{walk:?}: zero-insurance self-liquidation extracted net value: {wealth} > {initial}"
     );
     assert_eq!(
         env.group().vault as u64,

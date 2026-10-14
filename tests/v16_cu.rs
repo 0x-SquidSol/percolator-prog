@@ -5713,20 +5713,17 @@ ProgInstruction::PermissionlessCrank {
 
     env.svm.warp_to_slot(7);
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): `short_account` has not been
-    // cranked at all yet, so its cert is uncertified going into slot 7 -- the first call
-    // re-certifies (engine v16.rs:15163 requires a current cert before Liquidate is
-    // selectable) and the second liquidates.
-    env.crank(
-        short_account,
-        ProgInstruction::PermissionlessCrank {
-            now_slot: 7,
-            observations: vec![CrankObservationHint {
-                asset_index: 3,
-                oracle_accounts: 0,
-            }],
-        },
-    );
-    env.svm.expire_blockhash();
+    // cranked at all yet, so its cert is uncertified going into slot 7 -- engine v16.rs:15163
+    // requires a current cert before Liquidate is selectable.
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): that first crank re-certifies AND,
+    // the account being materially below maintenance, continues into the engine's Liquidate step
+    // in the SAME instruction (before F1 a second crank liquidated; it would now find nothing).
+    // So the liquidation measured below is the refresh-triggered one; every domain assertion is
+    // unchanged, plus an executed guard that this crank really reduced the toxic leg.
+    let short_q_before = active_leg_for_asset(&env.portfolio_state(short_account), 3)
+        .basis_pos_q
+        .unsigned_abs();
+    assert!(short_q_before > 0, "fixture: the short must hold its asset-3 leg before the crank");
     let liq_cu = env.crank(
         short_account,
         ProgInstruction::PermissionlessCrank {
@@ -5738,6 +5735,12 @@ ProgInstruction::PermissionlessCrank {
         },
     );
     println!("v16 permissionless malicious-oracle liquidation CU: {liq_cu}");
+    let short_after = env.portfolio_state(short_account);
+    assert!(
+        !has_active_leg_for_asset(&short_after, 3)
+            || active_leg_for_asset(&short_after, 3).basis_pos_q.unsigned_abs() < short_q_before,
+        "EXECUTED-GUARD (F1): the crank must have liquidated the toxic asset-3 leg"
+    );
 
     let (_, after_liq) = env.market_state();
     let own_domain_spent = after_liq.insurance_domain_spent[6];
@@ -9185,7 +9188,9 @@ ProgInstruction::PermissionlessCrank {
     // funding-basis accounting a real multi-step price crash would additionally exercise -- not
     // this regression's subject), and asserts Liquidate(1) still succeeds and fully closes the
     // leg instead of being permanently blocked. ----
-    {
+    // v2.2 F1: phase 3 runs twice -- a control WITHOUT the injected bankruptcy debt (the crank
+    // must leave the leg open) and the real case WITH it.
+    for inject_bankruptcy_debt in [false, true] {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             max_portfolio_assets: 1,
             public_b_chunk_atoms: CHUNK_ATOMS,
@@ -9283,39 +9288,28 @@ ProgInstruction::PermissionlessCrank {
         // test). `BANKRUPTCY_DEBT_B` is scaled so the realized loss (`loss_weight * delta_b /
         // SOCIAL_LOSS_DEN`) is comfortably larger than the account's ~1_000_000-atom deposit.
         const BANKRUPTCY_DEBT_B: u128 = 10 * 1_000_000_000_000_000_000_000; // 10 * SOCIAL_LOSS_DEN
-        env.mutate_market(|_cfg, group| {
+        if inject_bankruptcy_debt { env.mutate_market(|_cfg, group| {
             group.assets[0].b_short_num = group.assets[0]
                 .b_short_num
                 .checked_add(BANKRUPTCY_DEBT_B)
                 .expect("test setup: BANKRUPTCY_DEBT_B must not overflow b_short_num");
-        });
+        }); }
         let liq_slot = drain_calls + 1;
         env.svm.warp_to_slot(liq_slot);
-        env.crank(
-            short_account,
-ProgInstruction::PermissionlessCrank {
-                now_slot: liq_slot,
-                observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-            },
-        );
-        assert!(
-            env.portfolio_state(short_account)
-                .health_cert
-                .certified_equity
-                < 0,
-            "test setup: settling BANKRUPTCY_DEBT_B must certify as genuinely bankrupt"
-        );
         assert!(
             !percolator::active_bitmap_is_empty(env.portfolio_state(short_account).active_bitmap),
             "victim must still hold the short leg going into liquidation"
         );
-
-        // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): identical instruction
-        // data/accounts to the crank just above -- needs a fresh blockhash or LiteSVM rejects it
-        // as a duplicate transaction before reaching the program.
+        // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): ONE crank now settles the injected
+        // B debt, certifies the account (genuinely bankrupt) AND continues into the engine's
+        // Liquidate step in the same instruction. Before F1 the first crank only certified
+        // (`certified_equity < 0` was asserted between the two calls) and a second crank
+        // liquidated. The property -- once the backlog has drained, a genuinely bankrupt account
+        // CAN be liquidated, fully, with no livelock -- is asserted on that one crank; the control
+        // arm (no injected debt) shows the debt is what makes it liquidatable.
         env.svm.expire_blockhash();
         let liq_result = env.send(
-ProgInstruction::PermissionlessCrank {
+            ProgInstruction::PermissionlessCrank {
                 now_slot: liq_slot,
                 observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
             },
@@ -9328,14 +9322,23 @@ ProgInstruction::PermissionlessCrank {
         );
         assert!(
             liq_result.is_ok(),
-            "a liquidatable account CAN be liquidated: Liquidate(1) on a now-current, \
-             genuinely bankrupt account must succeed -- got {liq_result:?}"
+            "inject_bankruptcy_debt={inject_bankruptcy_debt}: the crank on the drained account \
+             must succeed -- got {liq_result:?}"
         );
-        assert!(
-            percolator::active_bitmap_is_empty(env.portfolio_state(short_account).active_bitmap),
-            "a genuinely bankrupt account must be fully closed by the liquidation, not left \
-             with a dangling partial position"
-        );
+        if inject_bankruptcy_debt {
+            assert!(
+                percolator::active_bitmap_is_empty(env.portfolio_state(short_account).active_bitmap),
+                "a genuinely bankrupt account must be fully closed by the liquidation, not left \
+                 with a dangling partial position"
+            );
+        } else {
+            let st = env.portfolio_state(short_account);
+            assert!(
+                !percolator::active_bitmap_is_empty(st.active_bitmap),
+                "control: without the injected debt the account is healthy and must keep its leg"
+            );
+            assert_eq!(st.health_cert.certified_liq_deficit, 0, "control: no deficit");
+        }
     }
 }
 
@@ -11621,6 +11624,50 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
 // OLD `close.is_err()` assertion trivially — there is no error path left to check — while being a
 // strictly worse bug. That is what this helper exists to catch.
 #[track_caller]
+/// v2.2 F1 test helper: accrue asset 0 to the pushed mark at `slot` by cranking an account that
+/// stays healthy (the counterparty), so the account under test is NOT refreshed by a tag-5 crank
+/// (since F1 that refresh would continue into liquidation in the same instruction).
+fn f1_accrue_mark_via_crank(env: &mut V16CuEnv, healthy: Pubkey, slot: u64) {
+    env.svm.warp_to_slot(slot);
+    env.svm.expire_blockhash();
+    let legs_before = env.portfolio_state(healthy).legs[0].basis_pos_q;
+    env.crank(
+        healthy,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: slot,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+        },
+    );
+    assert_eq!(
+        env.portfolio_state(healthy).legs[0].basis_pos_q,
+        legs_before,
+        "f1_accrue_mark_via_crank: the counterparty must stay healthy (not liquidated)"
+    );
+}
+
+/// v2.2 F1 test helper: certify BOTH sides of an asset-0 position by a 1-unit strict reduction
+/// (`long` sells 1 unit back to `short`) at `price`. A trade touches and re-certifies both
+/// accounts, and a strict reduction is admitted for a liquidatable / bankrupt counterparty, so
+/// this reaches "current certificate with a deficit, leg still open" without a tag-5 crank.
+fn f1_certify_by_one_unit_reduction(
+    env: &mut V16CuEnv,
+    long_owner: &Keypair,
+    long: Pubkey,
+    short_owner: &Keypair,
+    short: Pubkey,
+    price: u64,
+) {
+    env.svm.expire_blockhash();
+    env.try_trade_asset_with_cu(0, long_owner, long, short_owner, short, -(POS_SCALE as i128), price, 0)
+        .expect("f1_certify_by_one_unit_reduction: the 1-unit strict reduction must be admitted");
+    env.svm.expire_blockhash();
+    for acct in [long, short] {
+        let st = env.portfolio_state(acct);
+        assert!(st.health_cert.valid, "f1_certify_by_one_unit_reduction: {acct} not certified");
+        assert!(has_active_leg_for_asset(&st, 0), "f1_certify_by_one_unit_reduction: {acct} leg closed");
+    }
+}
+
 fn assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
     env: &V16CuEnv,
     probe: Pubkey,
@@ -11701,21 +11748,15 @@ fn v16_bpf_tradenocpi_closes_liquidatable_counterparty_without_forgiving_debt_or
 
     env.svm.warp_to_slot(2);
     env.push_auth_mark_with_cu(2, 300);
-    env.crank(
-        probe,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 2,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
-    env.svm.warp_to_slot(3);
-    env.crank(
-        probe,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 3,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a tag-5 crank of the probe would now
+    // re-certify AND liquidate it in one instruction, so the probe is no longer cranked here. The
+    // mark is accrued through the healthy counterparty's crank, and the probe is certified by a
+    // 1-unit strict reduction (`f1_certify_by_one_unit_reduction`), a live path F1 does not touch:
+    // the close below then meets the same state as before F1 (current certificate with a deficit,
+    // leg still open), asserted unchanged.
+    f1_accrue_mark_via_crank(&mut env, extractor, 2);
+    f1_accrue_mark_via_crank(&mut env, extractor, 3);
+    f1_certify_by_one_unit_reduction(&mut env, &extractor_owner, extractor, &probe_owner, probe, 300);
     let before_market = env.svm.get_account(&env.market).unwrap();
     let (_, before_group) = state::read_market(&before_market.data).unwrap();
     assert_eq!(before_group.insurance, 1_000_000);
@@ -11732,7 +11773,7 @@ ProgInstruction::PermissionlessCrank {
         extractor,
         &probe_owner,
         probe,
-        -((10 * POS_SCALE) as i128),
+        -((9 * POS_SCALE) as i128),
         500,
         0,
     );
@@ -11778,21 +11819,15 @@ fn v16_bpf_tradecpi_closes_liquidatable_counterparty_without_forgiving_debt_or_d
 
     env.svm.warp_to_slot(2);
     env.push_auth_mark_with_cu(2, 300);
-    env.crank(
-        probe,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 2,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
-    env.svm.warp_to_slot(3);
-    env.crank(
-        probe,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 3,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a tag-5 crank of the probe would now
+    // re-certify AND liquidate it in one instruction, so the probe is no longer cranked here. The
+    // mark is accrued through the healthy counterparty's crank, and the probe is certified by a
+    // 1-unit strict reduction (`f1_certify_by_one_unit_reduction`), a live path F1 does not touch:
+    // the close below then meets the same state as before F1 (current certificate with a deficit,
+    // leg still open), asserted unchanged.
+    f1_accrue_mark_via_crank(&mut env, extractor, 2);
+    f1_accrue_mark_via_crank(&mut env, extractor, 3);
+    f1_certify_by_one_unit_reduction(&mut env, &extractor_owner, extractor, &probe_owner, probe, 300);
     let (matcher_ctx, matcher_delegate, _) = env.init_matcher_context_with_passive_spread(
         &extractor_owner,
         matcher_program,
@@ -11824,7 +11859,7 @@ ProgInstruction::PermissionlessCrank {
         matcher_ctx,
         matcher_delegate,
         0,
-        (10 * POS_SCALE) as i128,
+        (9 * POS_SCALE) as i128,
         0,
     );
     assert!(
@@ -11863,13 +11898,12 @@ fn v16_bpf_tradenocpi_closes_bankrupt_counterparty_without_forgiving_debt_or_dan
         0,
     );
     env.force_portfolio_bankruptcy_for_security_test(probe, 500);
-    env.crank(
-        probe,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 1,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a tag-5 crank of the bankrupt probe
+    // would now re-certify AND liquidate it in one instruction (insurance absorbs the loss), so the
+    // probe is certified by a 1-unit strict reduction (`f1_certify_by_one_unit_reduction`), a live
+    // path F1 does not touch: the close below meets the same state as before F1 (current
+    // certificate with negative equity, leg still open), asserted unchanged.
+    f1_certify_by_one_unit_reduction(&mut env, &extractor_owner, extractor, &probe_owner, probe, 100);
 
     let before_market = env.svm.get_account(&env.market).unwrap();
     let (_, before_group) = state::read_market(&before_market.data).unwrap();
@@ -11892,7 +11926,7 @@ ProgInstruction::PermissionlessCrank {
         extractor,
         &probe_owner,
         probe,
-        -((10 * POS_SCALE) as i128),
+        -((9 * POS_SCALE) as i128),
         500,
         0,
     );
@@ -11934,13 +11968,12 @@ fn v16_bpf_tradecpi_closes_bankrupt_counterparty_without_forgiving_debt_or_dangl
         0,
     );
     env.force_portfolio_bankruptcy_for_security_test(probe, 500);
-    env.crank(
-        probe,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 1,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a tag-5 crank of the bankrupt probe
+    // would now re-certify AND liquidate it in one instruction (insurance absorbs the loss), so the
+    // probe is certified by a 1-unit strict reduction (`f1_certify_by_one_unit_reduction`), a live
+    // path F1 does not touch: the close below meets the same state as before F1 (current
+    // certificate with negative equity, leg still open), asserted unchanged.
+    f1_certify_by_one_unit_reduction(&mut env, &extractor_owner, extractor, &probe_owner, probe, 100);
     let (matcher_ctx, matcher_delegate, _) = env.init_matcher_context_with_passive_spread(
         &extractor_owner,
         matcher_program,
@@ -11979,7 +12012,7 @@ ProgInstruction::PermissionlessCrank {
         matcher_ctx,
         matcher_delegate,
         0,
-        (10 * POS_SCALE) as i128,
+        (9 * POS_SCALE) as i128,
         0,
     );
     assert!(
@@ -12020,20 +12053,12 @@ fn v16_bpf_tradenocpi_closes_both_bankrupt_counterparties_without_forgiving_debt
     );
     env.force_portfolio_bankruptcy_for_security_test(long_account, 500);
     env.force_portfolio_bankruptcy_for_security_test(short_account, 500);
-    env.crank(
-        long_account,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 1,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
-    env.crank(
-        short_account,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 1,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a tag-5 crank of either bankrupt account
+    // would now re-certify AND liquidate it in one instruction (insurance absorbs the loss), so the
+    // pair is certified by a 1-unit strict reduction (`f1_certify_by_one_unit_reduction`), a live
+    // path F1 does not touch: the close below meets the same state as before F1 (current
+    // certificate with negative equity, leg still open), asserted unchanged.
+    f1_certify_by_one_unit_reduction(&mut env, &long_owner, long_account, &short_owner, short_account, 100);
 
     let before_market = env.svm.get_account(&env.market).unwrap();
     let (_, before_group) = state::read_market(&before_market.data).unwrap();
@@ -12052,7 +12077,7 @@ ProgInstruction::PermissionlessCrank {
         long_account,
         &short_owner,
         short_account,
-        -((10 * POS_SCALE) as i128),
+        -((9 * POS_SCALE) as i128),
         100,
         0,
     );
@@ -12156,21 +12181,15 @@ fn v16_bpf_liquidatable_solvent_account_can_risk_reduce_without_insurance_drain(
 
     env.svm.warp_to_slot(2);
     env.push_auth_mark_with_cu(2, 300);
-    env.crank(
-        short_account,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 2,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
-    env.svm.warp_to_slot(3);
-    env.crank(
-        short_account,
-ProgInstruction::PermissionlessCrank {
-            now_slot: 3,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-    );
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a tag-5 crank of the short would now
+    // re-certify AND liquidate it in one instruction, so the short is no longer cranked here. The
+    // mark is accrued through the healthy counterparty's crank, and the short is certified by a
+    // 1-unit strict reduction (`f1_certify_by_one_unit_reduction`), a live path F1 does not touch:
+    // the close below then meets the same state as before F1 (current certificate with a deficit,
+    // leg still open), asserted unchanged.
+    f1_accrue_mark_via_crank(&mut env, long_account, 2);
+    f1_accrue_mark_via_crank(&mut env, long_account, 3);
+    f1_certify_by_one_unit_reduction(&mut env, &long_owner, long_account, &short_owner, short_account, 300);
 
     let (_, before_group) = env.market_state();
     let before_short = env.portfolio_state(short_account);
@@ -12189,7 +12208,7 @@ ProgInstruction::PermissionlessCrank {
         long_account,
         &short_owner,
         short_account,
-        -((10 * POS_SCALE) as i128),
+        -((9 * POS_SCALE) as i128),
         500,
         0,
     );
@@ -14678,37 +14697,24 @@ ProgInstruction::PermissionlessCrank {
         "effective price should be clamp-lagged by one 24 bps slot"
     );
 
-    let lagged_long = env.portfolio_state(long_portfolio);
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): the crank above re-certified the
+    // long AND -- the lag-driven deficit being material -- continued into the engine's Liquidate
+    // step in the SAME instruction (before F1 the deficit sat in the certificate until a second
+    // crank). The property is checked at that point instead:
+    //  (a) the lag penalty is what made the long liquidatable: without it the long is exactly AT
+    //      maintenance (100% margin, equity == notional at the effective price), and F1 never
+    //      liquidates at maintenance (Kani `kani_f1_never_at_or_above_maintenance`), so a
+    //      liquidation in this crank is only possible with the adverse target/effective lag
+    //      penalty counted in the requirement;
+    //  (b) the post-liquidation certificate still prices the lag: its requirement exceeds the
+    //      remaining position's plain notional at the effective price;
+    //  (c) the E3 assertions below are unchanged (bounded partial close that fully resolves the
+    //      deficit).
+    let liquidated_long = env.portfolio_state(long_portfolio);
     assert!(
-        lagged_long.health_cert.valid,
+        liquidated_long.health_cert.valid,
         "refresh must write a health certificate"
     );
-    assert!(
-        lagged_long.health_cert.certified_maintenance_req > INITIAL_MARK as u128,
-        "maintenance must include the adverse target/effective lag penalty"
-    );
-    assert!(
-        lagged_long.health_cert.certified_liq_deficit > 0,
-        "lagged adverse AuthMark target must make the under-margined long liquidatable"
-    );
-
-    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): this second crank has
-    // identical instruction data and accounts to the one above -- without a fresh blockhash it
-    // is rejected as a duplicate transaction (`AlreadyProcessed`) before ever reaching the
-    // program, unrelated to the wire/engine change itself but only surfaced once the account's
-    // first crank stopped being a caller-forced no-op-tolerant Refresh.
-    env.svm.expire_blockhash();
-    env.crank(
-        long_portfolio,
-        ProgInstruction::PermissionlessCrank {
-            now_slot: 2,
-            observations: vec![CrankObservationHint {
-                asset_index: 0,
-                oracle_accounts: 0,
-            }],
-        },
-    );
-    let liquidated_long = env.portfolio_state(long_portfolio);
     // FIX E3 (upstream #92) fixture repair: the original assertion here was
     // `!has_active_leg_for_asset(...)` (leg fully closed). That property is
     // mathematically unreachable for this fixture without shrinking the
@@ -14720,21 +14726,8 @@ ProgInstruction::PermissionlessCrank {
     // mark_e6 == 0). The bankrupt-account early exit in
     // `liquidation_engine_close_request_q` (certified_equity < 0) can
     // therefore never trigger here, at any lag magnitude -- only a genuine
-    // partial-close search runs, and this fixture's lag-driven deficit
-    // (9.52M short against a 109.52M requirement, ~8.7% of the position) is
-    // well inside what a healthy partial close can resolve, so
-    // engine-selected sizing (E3) correctly picks that smaller close over a
-    // full one. Asserting full closure here would be asserting an
-    // unreachable, not merely a "changed", outcome.
-    //
-    // The repaired assertions verify the SAME underlying claim the test
-    // exists to make -- that the lag-driven deficit is genuinely actionable
-    // by permissionless liquidation -- at the precision E3 actually
-    // guarantees: liquidation must close enough of the position to fully
-    // resolve the certified deficit (not partially, not zero), while still
-    // strictly reducing the position (proving liquidation had a bounded,
-    // real effect rather than either no-op'ing or over-liquidating to a
-    // full close it didn't need).
+    // partial-close search runs, and engine-selected sizing (E3) correctly
+    // picks that smaller close over a full one.
     assert!(
         has_active_leg_for_asset(&liquidated_long, 0),
         "engine-selected liquidation sizing (E3) must select the minimal healthy partial \
@@ -14745,8 +14738,16 @@ ProgInstruction::PermissionlessCrank {
     let remaining_abs_q = closed_leg.basis_pos_q.unsigned_abs();
     assert!(
         remaining_abs_q > 0 && remaining_abs_q < POS_SCALE,
-        "liquidation must strictly reduce a lag-liquidatable position (bounded, non-vacuous \
-         close): remaining={remaining_abs_q}, original={POS_SCALE}"
+        "(a) the lag-driven deficit must have been liquidated by the refresh crank (bounded, \
+         non-vacuous close): remaining={remaining_abs_q}, original={POS_SCALE}"
+    );
+    let remaining_plain_req =
+        remaining_abs_q * EXPECTED_EFFECTIVE_AFTER_ONE_SLOT as u128 / POS_SCALE;
+    assert!(
+        liquidated_long.health_cert.certified_maintenance_req > remaining_plain_req,
+        "(b) maintenance must include the adverse target/effective lag penalty: req={} plain={}",
+        liquidated_long.health_cert.certified_maintenance_req,
+        remaining_plain_req
     );
     assert_eq!(
         liquidated_long.health_cert.certified_liq_deficit, 0,
@@ -24779,6 +24780,9 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
     );
 
     // Now hint BOTH active legs -- the complete observation set d63c4dc9's gate requires.
+    let asset0_size_before = active_leg_for_asset(&env.portfolio_state(victim), 0)
+        .basis_pos_q
+        .unsigned_abs();
     env.svm.expire_blockhash();
     env.send(
         ProgInstruction::PermissionlessCrank {
@@ -24802,10 +24806,21 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
         &[],
     )
     .expect("a complete observation set (both active legs hinted) must be accepted");
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): the complete-observation crank's
+    // refresh now continues into the engine's Liquidate step in the SAME instruction when it leaves
+    // the account materially below maintenance. So after this call the victim is EITHER still
+    // certified liquidatable (the follow-on did not apply) OR its toxic asset-0 leg was already
+    // reduced by the follow-on -- never neither (that would mean the complete set re-certified it
+    // healthy, i.e. the scenario is vacuous).
+    let after_complete = env.portfolio_state(victim);
+    let reduced_in_this_call = active_leg_for_asset(&after_complete, 0)
+        .basis_pos_q
+        .unsigned_abs()
+        < asset0_size_before;
     assert!(
-        env.portfolio_state(victim).health_cert.certified_liq_deficit > 0,
+        after_complete.health_cert.certified_liq_deficit > 0 || reduced_in_this_call,
         "victim must now be certified as genuinely liquidatable after the complete-observation \
-         re-certification"
+         re-certification (or, since F1, already liquidated by it)"
     );
 
     // Further engine-selected steps (Liquidate, now that the cert is current with a real
@@ -24816,11 +24831,11 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
     // smallest partial close that restores solvency when one exists within its search bound,
     // rather than always fully closing the leg -- so this checks the asset-0 leg's exposure
     // strictly shrank and the deficit cleared, not that the leg closed outright.
-    let asset0_size_before = active_leg_for_asset(&env.portfolio_state(victim), 0)
-        .basis_pos_q
-        .unsigned_abs();
-    let mut resolved = false;
+    let mut resolved = env.portfolio_state(victim).health_cert.certified_liq_deficit == 0;
     for slot in 3..=10u64 {
+        if resolved {
+            break;
+        }
         env.svm.warp_to_slot(slot);
         env.svm.expire_blockhash();
         env.send(
@@ -24888,8 +24903,13 @@ fn v16_w2_autocrank_hint_crank_drives_engine_selected_plan() {
     // selector has nothing to do BUT RefreshAccount (no deficit exists yet). The wire
     // payload is identical in shape to every other crank call in this test (a bare hint,
     // no action byte) -- what runs is entirely the engine's own choice.
+    //
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): call 1 now runs BEFORE the adverse
+    // price push. Since F1 a refresh that leaves an account materially below maintenance continues
+    // into Liquidate in the same instruction, so with the push first (the pre-F1 order) call 1
+    // would refresh AND liquidate and the engine's RefreshAccount choice could not be observed on
+    // its own. Every assertion is unchanged.
     env.svm.warp_to_slot(1);
-    env.push_ewma_mark_with_cu(1, 999_999);
     env.crank(
         victim,
         ProgInstruction::PermissionlessCrank {
@@ -24916,6 +24936,8 @@ fn v16_w2_autocrank_hint_crank_drives_engine_selected_plan() {
     // above) using the IDENTICAL wire shape -- one hint, no action field -- for every
     // call. The engine's OWN plan selector is what decides, call by call, whether that
     // means "refresh" or "liquidate": nothing on the wire ever says which.
+    env.svm.warp_to_slot(2);
+    env.push_ewma_mark_with_cu(2, 999_999);
     let mut closed = false;
     for slot in 2..=20u64 {
         env.svm.warp_to_slot(slot);
