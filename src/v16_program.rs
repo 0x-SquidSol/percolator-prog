@@ -49006,7 +49006,7 @@ mod g8_kani_proofs {
     /// Mutants: `<=` for `<` between thresholds; a floor off by one; zeros not read as defaults;
     /// L_launch not checked; L3 vs L_tier not checked.
     #[kani::proof]
-    #[kani::unwind(4)]
+    #[kani::unwind(13)] // whole-array `==` on [u32; 3] lowers to a 12-byte memcmp (4 was short: unwinding-assertion FAIL, run 2026-10-14)
     fn kani_r2_tier_bounds_validator_exact() {
         let th: [u32; 3] = kani::any();
         let lev: [u16; 3] = kani::any();
@@ -49208,7 +49208,9 @@ mod g8_kani_proofs {
         let prev_rise = prev_rise as u64;
         let stamp = depth_rise_stamp(prev_rise);
         let slot = prev_rise + dt as u64;
-        let (lg, r) = (lg as u64, r as u64 * 1_000);
+        // both scaled by 1,000 so `lg` can exceed the tier-0 seed (>= 5e9 atoms); with `lg` a raw u32
+        // the "one doubling" cover was unreachable (run 2026-10-14: 5 of 6 covers).
+        let (lg, r) = (lg as u64 * 1_000, r as u64 * 1_000);
         let (out, stamp2) = depth_rate_limited(ever, lg, stamp, r, slot, seed);
         assert!(out <= r, "never above the reading");
         if !ever {
