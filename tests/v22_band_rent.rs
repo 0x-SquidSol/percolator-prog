@@ -2500,6 +2500,7 @@ fn s10_cu_settle_holding_rent() {
 
 const DEPTH_T1: u64 = percolator_prog::growth_v19::DEPTH_TIER1_E6;
 const DEPTH_EVER: u8 = percolator_prog::growth_v19::DEPTH_EVER;
+const DEPTH_PREV_REAL: u8 = percolator_prog::growth_v19::DEPTH_PREV_REAL;
 
 impl Env {
     /// Tag 63's 44-byte form `[depth_mode u8][depth_e6 u64]`, at the current slot.
@@ -2621,14 +2622,14 @@ fn g8_push_auth_mark_wire_35_44_and_mode_refusals() {
     assert_eq!((g.depth_e6, g.depth_prev_e6), (40_000_000_000, 30_000_000_000), "previous depth moves to prev");
     // R2.1: the pair (30k, 40k) in two slots was a fresh effective depth: DEPTH_EVER is set
     // and the last good depth is min(30k, 40k).
-    assert_eq!(g.depth_source, 1 | DEPTH_EVER);
+    assert_eq!(g.depth_source, 1 | DEPTH_PREV_REAL | DEPTH_EVER);
     assert_eq!((g.depth_last_good_e6, g.depth_last_good_slot), (30_000_000_000, env.clock_slot()));
     // The 35 B form zeroes the depth (absent is never stale-but-trusted); DEPTH_EVER and the
     // last good depth stay (the sticky cap's input).
     env.warp(1);
     env.push(PRICE);
     let g = env.growth();
-    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 40_000_000_000, DEPTH_EVER));
+    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 40_000_000_000, DEPTH_EVER | DEPTH_PREV_REAL));
     assert_eq!(g.depth_last_good_e6, 30_000_000_000);
     assert_eq!(g.depth_slot, env.clock_slot());
     // 44 B with mode 0 and depth 0 is the explicit "none" form.
@@ -2696,7 +2697,7 @@ fn g8_off_band_ceiling_stays_launch_whatever_depth_and_capital() {
     env.trade_cpi(&taker.0, taker.1, &lp, 290 * Q).expect("control: 2.9x inside the launch ceiling");
     let g = env.growth();
     assert_eq!((g.ceil_x100, g.ceil_slot, g.c_launch_atoms), (g0.ceil_x100, g0.ceil_slot, 0), "never ratcheted off-band");
-    assert_eq!(g.depth_source, 1 | DEPTH_EVER, "the depth is stored (and ignored) off-band");
+    assert_eq!(g.depth_source, 1 | DEPTH_PREV_REAL | DEPTH_EVER, "the depth is stored (and ignored) off-band");
 }
 
 /// (c) Band market (clamp-enforced, L_tier 10x), L_launch 3x, tier-1 attested depth (venue tier
@@ -3192,4 +3193,65 @@ fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
     assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "lowered table binds at once (stored 7x)");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().ceil_x100, 500, "the next writer stores the fall");
+}
+
+/// Coordinator ruling (most conservative wins): an attested (mode 1) reading of 0 is a REAL zero
+/// depth, not "absent": the κ cap is 0 AT ONCE (no second sample), DEPTH_EVER is set and the last
+/// good depth becomes 0; opens get nothing while a reduce lands. A later positive reading
+/// restores the normal rule only after its own min-of-two (the first positive sample's previous
+/// sample is the real 0). CONTROL: the 35 B form at the same point is absent, so the sticky
+/// last good depth ($600 -> 300 units) applies instead. Also: a market that never had depth is
+/// closed at once by an attested 0.
+#[test]
+fn r2_attested_zero_reading_caps_at_zero_at_once() {
+    for absent_control in [false, true] {
+        let mut env = Env::new(band_cfg());
+        env.auth_mark();
+        let lp = env.lp(1_000 * USD);
+        env.warp(1);
+        env.depth_twice(600 * USD_E6);
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64);
+        let taker = env.trader(1_000 * USD);
+        env.trade_cpi(&taker.0, taker.1, &lp, 100 * Q).expect("open under the cap");
+        env.warp(1);
+        if absent_control {
+            env.push(PRICE);
+        } else {
+            env.push_depth(PRICE, 1, 0).expect("attested 0");
+        }
+        let g = env.growth();
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        if absent_control {
+            assert_eq!(g.depth_last_good_e6, 600 * USD_E6, "35 B: absent, last good kept");
+            assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "35 B: sticky $600");
+            continue;
+        }
+        assert_eq!((g.depth_e6, g.depth_last_good_e6, g.depth_source & DEPTH_EVER), (0, 0, DEPTH_EVER));
+        assert_eq!(env.growth().rent_n_cap_q, 0, "a real 0: cap 0 at once");
+        let t2 = env.trader(1_000 * USD);
+        let r = env.trade_cpi(&t2.0, t2.1, &lp, 10 * Q);
+        assert_eq!(env.pos(t2.1), 0, "cap 0: no open: {r:?}");
+        env.trade_cpi(&taker.0, taker.1, &lp, -50 * Q).expect("a reduce at cap 0");
+        // a positive reading: min with the real 0 -> still 0
+        env.warp(1);
+        env.push_depth(PRICE, 1, 600 * USD_E6).expect("positive after 0");
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        assert_eq!(env.growth().rent_n_cap_q, 0, "first positive sample after a real 0: still 0");
+        // its own min-of-two restores the normal rule
+        env.warp(1);
+        env.push_depth(PRICE, 1, 600 * USD_E6).expect("second positive");
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "two positive samples: $600 at κ 0.5");
+        env.assert_conservation();
+    }
+    // never had depth: an attested 0 closes opens at once (and sets DEPTH_EVER)
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.warp(1);
+    env.push_depth(PRICE, 1, 0).expect("attested 0 first");
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    let g = env.growth();
+    assert_eq!((g.rent_n_cap_q, g.depth_source & DEPTH_EVER), (0, DEPTH_EVER));
 }

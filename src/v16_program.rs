@@ -28051,6 +28051,14 @@ pub mod processor {
     /// depth 0), 1 (keeper-attested) or `growth_v19::DEPTH_SOURCE_DEX` (2: the on-chain DEX
     /// reader's mode-2 handler passes the depth it computed from the pool). Anything else is
     /// refused (`DepthInputInvalid`).
+    ///
+    /// Coordinator ruling (most conservative wins): mode 1 or 2 with a depth of 0 is a REAL
+    /// reading of zero depth (fresh at once, `DEPTH_EVER`, last good 0, κ cap 0: opens closed,
+    /// reduces / closes always allowed). Only the 35 B form, mode 0, staleness and the first real
+    /// sample after an absent one are "absent" (sticky `last_good >> k`). The v2.2 keeper never
+    /// sends an attested 0 by accident: `keeper/src/cross-cluster/push-depth.ts` returns `null`
+    /// (= the 35 B form) for an unreadable pool, a missing reserve or a computed depth <= 0, and
+    /// its 44 B encoder throws on a zero depth (checked at keeper 5fbff4d).
     #[inline(never)]
     fn push_auth_mark_depth_view(
         group: &mut state::MarketViewMutV16<'_>,
@@ -42082,7 +42090,7 @@ pub mod processor {
         /// clamp.
         venue_tier: u8,
         /// R2.1 §1 (W-M1): the depth the κ cap uses (`growth_v19::cap_depth_e6`): the fresh
-        /// effective depth, else the sticky `last_good >> k` once `DEPTH_EVER`, else `None` (no
+        /// reading (a real 0 = cap 0), else the sticky `last_good >> k` once `DEPTH_EVER`, else `None` (no
         /// cap: never had a fresh depth). `None` off the clamp.
         cap_depth_e6: Option<u64>,
         /// §1.2 force-down: a senior draw / G9 backstop outstanding (the fill-time halt mirror
@@ -42126,11 +42134,11 @@ pub mod processor {
             });
         }
         let now = authenticated_market_slot_or_fallback_view(group);
-        let effective_depth_e6 =
-            growth_v19::effective_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, now);
+        // The fresh reading (a real 0 included: most conservative wins); absent -> None.
+        let fresh = growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, now);
         let thresholds = g.tier_thresholds_e6();
         let venue_tier =
-            growth_v19::venue_tier(effective_depth_e6, g.depth_source, thresholds, g.attested_max_tier);
+            growth_v19::venue_tier(fresh.unwrap_or(0), g.depth_source, thresholds, g.attested_max_tier);
         let book_tier = match c_m {
             Some(c) => growth_v19::book_tier(c, g.lambda_bps, thresholds),
             None => 0,
@@ -42138,7 +42146,7 @@ pub mod processor {
         let tier = growth_v19::combined_tier(venue_tier, book_tier);
         let cap_depth_e6 = growth_v19::cap_depth_e6(
             g.depth_source,
-            effective_depth_e6,
+            fresh,
             g.depth_last_good_e6,
             g.depth_last_good_slot,
             now,
@@ -48293,8 +48301,13 @@ mod g8_kani_proofs {
             assert!(lambda_eff_bps(lam, tier) <= DEFAULT_LAMBDA_BPS);
             let lg: u32 = kani::any();
             let lgs: u32 = kani::any();
-            let cap = cap_depth_e6(src, eff, lg as u64, lgs as u64, now);
-            assert_eq!(cap.is_some(), depth_ever(src));
+            // stale / future-stamped: the fresh reading is absent whatever the bytes say
+            if now < slot || now - slot > DEPTH_MAX_AGE_SLOTS {
+                let fr = fresh_depth_e6(depth, prev, slot, src, now);
+                assert_eq!(fr, None);
+                let cap = cap_depth_e6(src, fr, lg as u64, lgs as u64, now);
+                assert_eq!(cap.is_some(), depth_ever(src));
+            }
         }
         kani::cover!(now > slot && now - slot == DEPTH_MAX_AGE_SLOTS && eff != 0, "150 slots: still fresh");
         kani::cover!(now > slot && now - slot == DEPTH_MAX_AGE_SLOTS + 1 && depth != 0 && prev != 0, "151 slots: stale");
@@ -48306,20 +48319,48 @@ mod g8_kani_proofs {
     }
 
     /// R2.1 §1 (W-M1): once DEPTH_EVER is set the cap depth is ALWAYS `Some` (the κ cap on N_cap
-    /// is never `u128::MAX`, i.e. never uncapped); it is the fresh depth when there is one, else
-    /// `last_good >> k` with `k = floor(age / 9,000)` (0 from k = 64), which is <= last_good and
-    /// monotone NON-INCREASING in staleness.
-    /// Mutants: return `None` when stale (round 1); `k` from `depth_slot` instead of
-    /// `last_good_slot`; `<<` for `>>`; `k > 64` for `k >= 64` (shift overflow); decay by 9,001.
+    /// is never `u128::MAX`, i.e. never uncapped); it is the fresh reading when there is one (a
+    /// REAL 0 included: cap 0, coordinator ruling), else `last_good >> k` with
+    /// `k = floor(age / 9,000)` (0 from k = 64), which is <= last_good and monotone
+    /// NON-INCREASING in staleness. And `fresh_depth_e6`: a fresh real 0 is `Some(0)` at once;
+    /// an absent current sample, a stale stamp or a positive sample after an absent one is `None`;
+    /// a positive sample after a real one is `Some(min)`.
+    /// Mutants: return `None` when stale (round 1); a real 0 read as absent; a real 0 waiting for
+    /// a second sample; `k` from `depth_slot` instead of `last_good_slot`; `<<` for `>>`;
+    /// `k > 64` for `k >= 64` (shift overflow); decay by 9,001.
     #[kani::proof]
     fn kani_r2_sticky_cap_never_uncapped_and_monotone() {
+        let fd: u32 = kani::any();
+        let fp: u32 = kani::any();
+        let fs: u32 = kani::any();
+        let fnow: u32 = kani::any();
+        let fsrc: u8 = kani::any();
+        let (fd, fp, fs, fnow) = (fd as u64, fp as u64, fs as u64, fnow as u64);
+        let fr = fresh_depth_e6(fd, fp, fs, fsrc, fnow);
+        let fresh_age = fnow >= fs && fnow - fs <= DEPTH_MAX_AGE_SLOTS;
+        let cur_real = depth_source_of(fsrc) != DEPTH_SOURCE_NONE;
+        let prev_real = fsrc & DEPTH_PREV_REAL != 0;
+        if !fresh_age || !cur_real {
+            assert_eq!(fr, None);
+        } else if fd == 0 {
+            assert_eq!(fr, Some(0), "a fresh real 0 at once");
+        } else if !prev_real {
+            assert_eq!(fr, None, "first real sample of a pair");
+        } else {
+            assert_eq!(fr, Some(fd.min(fp)));
+        }
+        kani::cover!(fresh_age && cur_real && fd == 0 && fr == Some(0), "real 0 at once");
+        kani::cover!(fresh_age && cur_real && fd > 0 && prev_real && fp == 0 && fr == Some(0), "positive after a real 0 stays 0");
+        kani::cover!(fresh_age && cur_real && fd > 0 && !prev_real && fr.is_none(), "first of pair absent");
+        kani::cover!(fresh_age && !cur_real && fr.is_none(), "absent current sample");
         let src: u8 = kani::any();
-        let eff: u32 = kani::any();
+        let eff: Option<u32> = kani::any();
+        let eff = eff.map(|e| e as u64);
         let lg: u64 = kani::any();
         let lgs: u32 = kani::any();
         let n1: u32 = kani::any();
         let n2: u32 = kani::any();
-        let (eff, lgs, n1, n2) = (eff as u64, lgs as u64, n1 as u64 * 64, n2 as u64 * 64);
+        let (lgs, n1, n2) = (lgs as u64, n1 as u64 * 64, n2 as u64 * 64);
         let ever = src | DEPTH_EVER;
         let c = cap_depth_e6(ever, eff, lg, lgs, n1);
         assert!(c.is_some(), "never uncapped once DEPTH_EVER");
@@ -48328,22 +48369,21 @@ mod g8_kani_proofs {
         kani::assume(price != 0);
         // the κ cap on N_cap (POS_SCALE 1) is a real number, never the "no cap" sentinel
         assert!(depth_cap_q(tier, c, price as u64, 1) != u128::MAX);
-        if eff > 0 {
-            assert_eq!(c, Some(eff));
+        if eff.is_some() {
+            assert_eq!(c, eff);
         } else {
             assert!(c.unwrap() <= lg);
             let (a, b) = if n1 <= n2 { (n1, n2) } else { (n2, n1) };
             assert!(sticky_depth_e6(lg, lgs, a) >= sticky_depth_e6(lg, lgs, b));
         }
-        if eff == 0 {
-            assert_eq!(cap_depth_e6(src & !DEPTH_EVER, 0, lg, lgs, n1), None);
-        }
+        assert_eq!(cap_depth_e6(src & !DEPTH_EVER, None, lg, lgs, n1), None);
         let k = n1.saturating_sub(lgs) / DEPTH_STICKY_EPOCH_SLOTS;
-        kani::cover!(eff > 0, "fresh depth");
-        kani::cover!(eff == 0 && k == 0 && lg > 0 && c == Some(lg), "stale, same epoch: full last good");
-        kani::cover!(eff == 0 && k == 1 && lg > 1 && c == Some(lg / 2), "one epoch: halved");
-        kani::cover!(eff == 0 && k >= 64 && lg > 0 && c == Some(0), "k >= 64: cap 0, still capped");
-        kani::cover!(eff == 0 && n1 < lgs, "future last-good stamp: no decay");
+        kani::cover!(eff.is_some_and(|e| e > 0), "fresh depth");
+        kani::cover!(eff == Some(0) && c == Some(0), "fresh real 0: cap 0");
+        kani::cover!(eff.is_none() && k == 0 && lg > 0 && c == Some(lg), "stale, same epoch: full last good");
+        kani::cover!(eff.is_none() && k == 1 && lg > 1 && c == Some(lg / 2), "one epoch: halved");
+        kani::cover!(eff.is_none() && k >= 64 && lg > 0 && c == Some(0), "k >= 64: cap 0, still capped");
+        kani::cover!(eff.is_none() && n1 < lgs, "future last-good stamp: no decay");
     }
 
     /// The one depth writer (W-L2 + R2.1): a push in the same slot (or earlier) as the stored
@@ -48362,6 +48402,7 @@ mod g8_kani_proofs {
         let src_lo: u8 = kani::any();
         kani::assume(src_lo <= DEPTH_SOURCE_DEX);
         let ever: bool = kani::any();
+        let prev_real: bool = kani::any();
         let new_src: u8 = kani::any();
         kani::assume(new_src >= 1 && new_src <= DEPTH_SOURCE_DEX);
         let lg: u32 = kani::any();
@@ -48371,7 +48412,9 @@ mod g8_kani_proofs {
             depth_e6: d,
             depth_slot: s,
             depth_prev_e6: p,
-            depth_source: src_lo | if ever { DEPTH_EVER } else { 0 },
+            depth_source: src_lo
+                | if ever { DEPTH_EVER } else { 0 }
+                | if prev_real { DEPTH_PREV_REAL } else { 0 },
             last_good_e6: lg as u64,
             last_good_slot: lgs as u64,
         };
@@ -48386,20 +48429,25 @@ mod g8_kani_proofs {
             assert!(depth_ever(o.depth_source));
         }
         assert!(depth_source_byte_ok(o.depth_source));
-        let eff = effective_depth_e6(o.depth_e6, o.depth_prev_e6, o.depth_slot, now);
-        if eff > 0 {
+        let fr = fresh_depth_e6(o.depth_e6, o.depth_prev_e6, o.depth_slot, o.depth_source, now);
+        if let Some(f) = fr {
             assert!(depth_ever(o.depth_source));
-            assert_eq!(o.last_good_e6, eff);
+            assert_eq!(o.last_good_e6, f);
         } else {
             assert_eq!((o.last_good_e6, o.last_good_slot), (lg as u64, lgs as u64));
             assert_eq!(depth_ever(o.depth_source), ever);
         }
+        if !(s != 0 && now <= s) && n == 0 {
+            assert_eq!(fr, Some(0), "a later-slot real 0 is fresh at once");
+        }
+        let eff = fr.unwrap_or(0);
         kani::cover!(s != 0 && now == s && n > d && o.depth_e6 == d, "same-slot raise refused");
         kani::cover!(s != 0 && now == s && n < d && o.depth_e6 == n, "same-slot fall");
         kani::cover!(s != 0 && now < s, "regression stamp: fall only");
         kani::cover!(now > s && o.depth_prev_e6 == d, "later slot rotates");
         kani::cover!(s == 0, "first ever sample");
         kani::cover!(eff > 0 && !ever, "first fresh pair sets DEPTH_EVER");
+        kani::cover!(fr == Some(0) && !ever, "a real 0 sets DEPTH_EVER");
     }
 
     /// R2.1 §2: `tier_config_ok` is EXACTLY the stated bounds (each group all-zero, or with zeros

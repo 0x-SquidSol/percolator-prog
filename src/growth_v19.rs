@@ -988,6 +988,11 @@ pub const DEPTH_SOURCE_MASK: u8 = 0x03;
 /// Sticky: never cleared except by the I-1 reset (asset restart / slot reuse / re-activation).
 /// Once set, an absent or stale reading no longer removes the κ cap (`cap_depth_e6`).
 pub const DEPTH_EVER: u8 = 0x80;
+/// Byte 44 bit 2 (coordinator ruling 2026-10-14, "most conservative wins"): the PREVIOUS sample
+/// (`depth_prev_e6`) was a REAL reading (source 1 or 2, a 0 included), not an absent one (35 B
+/// push, mode 0, never). With the source bits (which say the same of the CURRENT sample) it lets
+/// a real reading of 0 be told apart from "absent" in both slots of the min-of-two.
+pub const DEPTH_PREV_REAL: u8 = 0x04;
 /// PushAuthMark 44 B `depth_mode`: 0 = none (the depth must be 0), 1 = keeper-attested. Any
 /// other value is refused with `DepthInputInvalid` (128) by the decoder of this build.
 pub const DEPTH_MODE_NONE: u8 = 0;
@@ -1033,9 +1038,10 @@ pub fn depth_ever(depth_source_byte: u8) -> bool {
     depth_source_byte & DEPTH_EVER != 0
 }
 
-/// Validator: only bits 0-1 (a known source, 0..=2) and bit 7 may be set.
+/// Validator: only bits 0-1 (a known source, 0..=2), bit 2 (`DEPTH_PREV_REAL`) and bit 7
+/// (`DEPTH_EVER`) may be set.
 pub fn depth_source_byte_ok(depth_source_byte: u8) -> bool {
-    depth_source_byte & !(DEPTH_SOURCE_MASK | DEPTH_EVER) == 0
+    depth_source_byte & !(DEPTH_SOURCE_MASK | DEPTH_PREV_REAL | DEPTH_EVER) == 0
         && depth_source_of(depth_source_byte) <= DEPTH_SOURCE_DEX
 }
 
@@ -1058,6 +1064,41 @@ pub fn effective_depth_e6(depth_e6: u64, depth_prev_e6: u64, depth_slot: u64, no
     }
 }
 
+/// The FRESH reading the tiers and the κ cap use (coordinator ruling: most conservative wins).
+/// `None` = absent: stale (> `DEPTH_MAX_AGE_SLOTS`), a future stamp, the current sample absent
+/// (35 B push / mode 0 / never: source bits NONE), or the first REAL sample of a pair (the
+/// previous one absent). Otherwise `Some(min(current, previous))` where a REAL 0 counts as 0:
+/// * a real reading of 0 (attested or DEX mode with depth 0) is `Some(0)` AT ONCE (the min of
+///   0 and anything is 0; it does not wait for a second sample);
+/// * a later positive reading restores a positive value only after its own min-of-two (its
+///   previous sample is the real 0, so the min stays 0 until a second positive sample).
+pub fn fresh_depth_e6(
+    depth_e6: u64,
+    depth_prev_e6: u64,
+    depth_slot: u64,
+    depth_source_byte: u8,
+    now_slot: u64,
+) -> Option<u64> {
+    match now_slot.checked_sub(depth_slot) {
+        Some(age) if age <= DEPTH_MAX_AGE_SLOTS => {}
+        _ => return None,
+    }
+    if depth_source_of(depth_source_byte) == DEPTH_SOURCE_NONE {
+        return None;
+    }
+    if depth_e6 == 0 {
+        return Some(0);
+    }
+    if depth_source_byte & DEPTH_PREV_REAL == 0 {
+        return None;
+    }
+    Some(if depth_e6 < depth_prev_e6 {
+        depth_e6
+    } else {
+        depth_prev_e6
+    })
+}
+
 /// The stored depth state of one asset (`AssetGrowthV19` bytes 44, 56..96).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DepthState {
@@ -1072,19 +1113,22 @@ pub struct DepthState {
 
 /// THE depth writer (every PushAuthMark form: 35 B, 44 B mode 0/1, and the on-chain DEX mode 2,
 /// which calls it with `source = DEPTH_SOURCE_DEX`). `source` is the new reading's source;
-/// `DEPTH_SOURCE_NONE` or an unknown source stores no depth (`new_depth_e6` is ignored).
-/// * A push in a LATER slot than the stored sample: the stored depth becomes `depth_prev_e6`
-///   and the new one is stored, stamped `now`.
+/// `DEPTH_SOURCE_NONE` or an unknown source is an ABSENT sample (`new_depth_e6` is ignored). A
+/// REAL reading (source 1 or 2) of 0 is a real zero depth, not absent (coordinator ruling).
+/// * A push in a LATER slot than the stored sample: the stored sample becomes the previous one
+///   (`depth_prev_e6`, with `DEPTH_PREV_REAL` = whether it was real) and the new one is stored,
+///   stamped `now`.
 /// * Security review W-L2: a push in the SAME slot as the stored sample (`now == depth_slot`,
 ///   e.g. two pushes in one slot or one transaction) is not a second point in time: `prev` is
 ///   kept and the stored depth can only FALL, `min(depth_e6, new)`; the source follows the
-///   value that is kept (a same-slot DEX push cannot relabel an attested value as DEX).
+///   value that is kept (a same-slot DEX push cannot relabel an attested value as DEX), and at
+///   a tie of zeros the REAL zero wins over an absent one (more conservative).
 /// * A push stamped BEFORE the stored sample (`now < depth_slot`; the handler refuses a slot
 ///   regression, so this is defensive) is treated like the same slot (fall only).
-/// * The source bits describe the stored `depth_e6`: NONE once it is 0.
-/// * R2.1 (W-M1): when the result is a FRESH effective depth (`effective_depth_e6 > 0` at
-///   `now`), it becomes the last good depth (higher or lower), stamped with the sample's slot,
-///   and `DEPTH_EVER` is set. Otherwise the last good depth and `DEPTH_EVER` are kept.
+/// * The source bits describe the stored `depth_e6`: NONE for an absent sample.
+/// * R2.1 (W-M1): when the result is a FRESH reading (`fresh_depth_e6` is `Some`, a real 0
+///   included), it becomes the last good depth (higher or lower), stamped with the sample's
+///   slot, and `DEPTH_EVER` is set. Otherwise the last good depth and `DEPTH_EVER` are kept.
 pub fn depth_push_update(st: DepthState, source: u8, new_depth_e6: u64, now_slot: u64) -> DepthState {
     let (source, new_depth_e6) = if source == DEPTH_SOURCE_NONE || source > DEPTH_SOURCE_DEX {
         (DEPTH_SOURCE_NONE, 0)
@@ -1092,28 +1136,37 @@ pub fn depth_push_update(st: DepthState, source: u8, new_depth_e6: u64, now_slot
         (source, new_depth_e6)
     };
     let old_source = depth_source_of(st.depth_source);
-    let (d, prev, slot, src) = if st.depth_slot != 0 && now_slot <= st.depth_slot {
-        if new_depth_e6 < st.depth_e6 {
-            (new_depth_e6, st.depth_prev_e6, st.depth_slot, source)
+    let old_prev_real = st.depth_source & DEPTH_PREV_REAL;
+    let (d, prev, slot, src, prev_real) = if st.depth_slot != 0 && now_slot <= st.depth_slot {
+        let take_new = new_depth_e6 < st.depth_e6
+            || (new_depth_e6 == 0
+                && st.depth_e6 == 0
+                && source != DEPTH_SOURCE_NONE
+                && old_source == DEPTH_SOURCE_NONE);
+        if take_new {
+            (new_depth_e6, st.depth_prev_e6, st.depth_slot, source, old_prev_real)
         } else {
-            (st.depth_e6, st.depth_prev_e6, st.depth_slot, old_source)
+            (st.depth_e6, st.depth_prev_e6, st.depth_slot, old_source, old_prev_real)
         }
     } else {
-        (new_depth_e6, st.depth_e6, now_slot, source)
+        let was_real = if old_source != DEPTH_SOURCE_NONE {
+            DEPTH_PREV_REAL
+        } else {
+            0
+        };
+        (new_depth_e6, st.depth_e6, now_slot, source, was_real)
     };
-    let src = if d == 0 { DEPTH_SOURCE_NONE } else { src };
     let mut out = DepthState {
         depth_e6: d,
         depth_slot: slot,
         depth_prev_e6: prev,
-        depth_source: src | (st.depth_source & DEPTH_EVER),
+        depth_source: src | prev_real | (st.depth_source & DEPTH_EVER),
         last_good_e6: st.last_good_e6,
         last_good_slot: st.last_good_slot,
     };
-    let eff = effective_depth_e6(d, prev, slot, now_slot);
-    if eff > 0 {
+    if let Some(f) = fresh_depth_e6(d, prev, slot, out.depth_source, now_slot) {
         out.depth_source |= DEPTH_EVER;
-        out.last_good_e6 = eff;
+        out.last_good_e6 = f;
         out.last_good_slot = slot;
     }
     out
@@ -1131,21 +1184,22 @@ pub fn sticky_depth_e6(last_good_e6: u64, last_good_slot: u64, now_slot: u64) ->
     }
 }
 
-/// The depth the κ cap on `N_cap` uses (clamp-enforced markets):
-/// * a fresh effective depth: `Some(effective)`;
+/// The depth the κ cap on `N_cap` uses (clamp-enforced markets), from the FRESH reading
+/// (`fresh_depth_e6`):
+/// * a fresh reading: `Some(it)` -- a real 0 included (cap 0: opens closed at once);
 /// * none fresh but `DEPTH_EVER`: `Some(sticky_depth_e6(..))` -- the cap stays, decaying to 0
 ///   (opens closed; reductions and closes are never capacity-checked), NEVER uncapped;
 /// * never had a fresh depth: `None` (no depth cap, the capital rule alone: a market is not
 ///   closed before its first pair of readings).
 pub fn cap_depth_e6(
     depth_source_byte: u8,
-    effective_depth_e6: u64,
+    fresh_depth_e6: Option<u64>,
     last_good_e6: u64,
     last_good_slot: u64,
     now_slot: u64,
 ) -> Option<u64> {
-    if effective_depth_e6 > 0 {
-        Some(effective_depth_e6)
+    if fresh_depth_e6.is_some() {
+        fresh_depth_e6
     } else if depth_ever(depth_source_byte) {
         Some(sticky_depth_e6(last_good_e6, last_good_slot, now_slot))
     } else {
@@ -2361,7 +2415,7 @@ mod tests {
         // 35 B push: depth 0, DEPTH_EVER and last good kept
         let z = depth_push_update(s, DEPTH_SOURCE_NONE, 0, 102);
         assert_eq!(z.depth_e6, 0);
-        assert_eq!(z.depth_source, DEPTH_EVER);
+        assert_eq!(z.depth_source, DEPTH_EVER | DEPTH_PREV_REAL, "absent current, real previous");
         assert_eq!((z.last_good_e6, z.last_good_slot), (2 * t1, 101));
         // first push of a new pair (prev 0): effective 0, sticky stays
         let f = depth_push_update(z, a, 9 * t1, 103);
@@ -2371,13 +2425,14 @@ mod tests {
         let g = depth_push_update(f, a, t1, 104);
         assert_eq!((g.last_good_e6, g.last_good_slot), (t1, 104), "fresh replaces, lower too");
         // cap depth: fresh -> eff; absent + ever -> last_good >> k; never -> None
-        assert_eq!(cap_depth_e6(a, 7, 0, 0, 0), Some(7));
-        assert_eq!(cap_depth_e6(DEPTH_EVER, 0, 1_000, 100, 100 + 8_999), Some(1_000));
-        assert_eq!(cap_depth_e6(DEPTH_EVER, 0, 1_000, 100, 100 + 9_000), Some(500), "halves per epoch");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, 0, 1_000, 100, 100 + 18_000), Some(250));
-        assert_eq!(cap_depth_e6(DEPTH_EVER, 0, u64::MAX, 0, 64 * 9_000), Some(0), "k >= 64 -> 0");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, 0, 1_000, 500, 100), Some(1_000), "future stamp: no decay, still capped");
-        assert_eq!(cap_depth_e6(0, 0, 1_000, 100, 200), None, "never had depth: no cap");
+        assert_eq!(cap_depth_e6(a, Some(7), 0, 0, 0), Some(7));
+        assert_eq!(cap_depth_e6(a | DEPTH_EVER, Some(0), 1_000, 0, 0), Some(0), "a fresh real 0 caps at 0");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 8_999), Some(1_000));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 9_000), Some(500), "halves per epoch");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 18_000), Some(250));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, u64::MAX, 0, 64 * 9_000), Some(0), "k >= 64 -> 0");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 500, 100), Some(1_000), "future stamp: no decay, still capped");
+        assert_eq!(cap_depth_e6(0, None, 1_000, 100, 200), None, "never had depth: no cap");
         // N_cap at the sticky depth, tier 0 (κ 0.5): never uncapped, 0 closes opens
         let c_m = 1_000_000_000_000u128;
         assert_eq!(n_cap_g8_q(true, c_m, 10_000, 0, Some(100_000_000), 1_000_000, PS), Some(50_000_000));
@@ -2389,7 +2444,50 @@ mod tests {
         // MUTANT (round-1 rule: absent depth = no cap): the market goes uncapped
         let mutant = |eff: u64| if eff > 0 { Some(eff) } else { None };
         assert_eq!(depth_cap_q(0, mutant(0), 1_000_000, PS), u128::MAX, "mutant: uncapped");
-        assert_ne!(depth_cap_q(0, cap_depth_e6(DEPTH_EVER, 0, 1, 0, 0), 1_000_000, PS), u128::MAX);
+        assert_ne!(depth_cap_q(0, cap_depth_e6(DEPTH_EVER, None, 1, 0, 0), 1_000_000, PS), u128::MAX);
+    }
+
+    #[test]
+    fn r2_fresh_real_zero_reading_closes_at_once() {
+        let t1 = DEPTH_TIER1_E6;
+        let a = DEPTH_SOURCE_ATTESTED;
+        let fresh = |x: DepthState, now: u64| fresh_depth_e6(x.depth_e6, x.depth_prev_e6, x.depth_slot, x.depth_source, now);
+        // a healthy pair, then an attested 0: fresh Some(0) AT ONCE (no second sample needed)
+        let s = depth_push_update(DepthState::default(), a, 4 * t1, 100);
+        let s = depth_push_update(s, a, 4 * t1, 101);
+        assert_eq!(fresh(s, 101), Some(4 * t1));
+        let z = depth_push_update(s, a, 0, 102);
+        assert_eq!(fresh(z, 102), Some(0), "a real 0 takes effect at once");
+        assert_eq!((z.last_good_e6, z.last_good_slot), (0, 102), "last_good = 0");
+        assert_eq!(cap_depth_e6(z.depth_source, fresh(z, 102), z.last_good_e6, z.last_good_slot, 102), Some(0));
+        assert_eq!(venue_tier(0, z.depth_source, tier_thresholds([0; 3]), 3), 0);
+        // DEX 0 too, and from a market that never had depth (sets DEPTH_EVER)
+        let d = depth_push_update(DepthState::default(), DEPTH_SOURCE_DEX, 0, 7);
+        assert_eq!((fresh(d, 7), depth_ever(d.depth_source)), (Some(0), true));
+        // a later positive reading: its previous sample is the real 0 -> min stays 0
+        let p1 = depth_push_update(z, a, 4 * t1, 103);
+        assert_eq!(fresh(p1, 103), Some(0), "positive after a real 0: min(4t1, 0) = 0");
+        let p2 = depth_push_update(p1, a, 4 * t1, 104);
+        assert_eq!(fresh(p2, 104), Some(4 * t1), "its own min-of-two restores it");
+        assert_eq!(p2.last_good_e6, 4 * t1);
+        // contrast: absent samples (35 B / mode 0) are NOT zero readings -> sticky last good
+        let ab = depth_push_update(s, DEPTH_SOURCE_NONE, 0, 102);
+        assert_eq!(fresh(ab, 102), None);
+        assert_eq!(ab.last_good_e6, 4 * t1);
+        let ab2 = depth_push_update(ab, a, 4 * t1, 103);
+        assert_eq!(fresh(ab2, 103), None, "first real sample after an absent one: one sample");
+        // same slot: a real 0 beats an absent 0 (more conservative); an absent push cannot
+        // undo a real 0 in the same slot
+        let x = depth_push_update(ab, a, 0, 102);
+        assert_eq!(fresh(x, 102), Some(0));
+        let y = depth_push_update(z, DEPTH_SOURCE_NONE, 0, 102);
+        assert_eq!(fresh(y, 102), Some(0), "same-slot absent keeps the real 0");
+        // stale real 0 -> absent (sticky at last_good 0 -> still 0)
+        assert_eq!(fresh(z, 102 + DEPTH_MAX_AGE_SLOTS + 1), None);
+        assert_eq!(cap_depth_e6(z.depth_source, None, z.last_good_e6, z.last_good_slot, 102 + 200), Some(0));
+        // validator: bit 2 allowed, bits 3-6 not
+        assert!(depth_source_byte_ok(DEPTH_EVER | DEPTH_PREV_REAL | DEPTH_SOURCE_DEX));
+        assert!(!depth_source_byte_ok(0x08));
     }
 
     #[test]

@@ -122,43 +122,53 @@ proptest! {
     }
 
     /// W-M1 (R2.1 §1): once DEPTH_EVER is set the cap depth is ALWAYS Some (never uncapped), it
-    /// is the fresh depth when there is one, and the sticky depth is <= last_good and monotone
-    /// non-increasing in staleness, halving per 9,000 slots.
+    /// is the fresh reading when there is one (a real 0 included), and the sticky depth is <=
+    /// last_good and monotone non-increasing in staleness, halving per 9,000 slots.
     #[test]
-    fn sticky_cap_never_uncapped(src in any::<u8>(), eff in any::<u64>(), lg in any::<u64>(), lgs in any::<u64>(), n1 in any::<u64>(), n2 in any::<u64>()) {
+    fn sticky_cap_never_uncapped(src in any::<u8>(), fresh in prop::option::of(any::<u64>()), lg in any::<u64>(), lgs in any::<u64>(), n1 in any::<u64>(), n2 in any::<u64>()) {
         let ever = src | DEPTH_EVER;
-        let c = cap_depth_e6(ever, eff, lg, lgs, n1);
+        let c = cap_depth_e6(ever, fresh, lg, lgs, n1);
         prop_assert!(c.is_some());
-        if eff > 0 { prop_assert_eq!(c, Some(eff)); } else { prop_assert!(c.unwrap() <= lg); }
+        if fresh.is_some() { prop_assert_eq!(c, fresh); } else { prop_assert!(c.unwrap() <= lg); }
         let (a, b) = if n1 <= n2 { (n1, n2) } else { (n2, n1) };
         prop_assert!(sticky_depth_e6(lg, lgs, a) >= sticky_depth_e6(lg, lgs, b));
         let k = a.saturating_sub(lgs) / DEPTH_STICKY_EPOCH_SLOTS;
         if k < 64 { prop_assert_eq!(sticky_depth_e6(lg, lgs, a), lg >> k); }
-        // without DEPTH_EVER and no fresh depth: no cap (the market is not closed before its
-        // first pair of readings)
-        if eff == 0 { prop_assert_eq!(cap_depth_e6(src & !DEPTH_EVER, 0, lg, lgs, n1), None); }
+        // without DEPTH_EVER and no fresh reading: no cap (the market is not closed before its
+        // first reading)
+        prop_assert_eq!(cap_depth_e6(src & !DEPTH_EVER, None, lg, lgs, n1), None);
     }
 
     /// The one depth writer: a same-slot push never raises the depth; DEPTH_EVER is never cleared
-    /// by it; the last good depth changes exactly when the result is fresh (and then equals the
-    /// effective depth); the source bits are a known source and NONE iff the depth is 0.
+    /// by it; the last good depth changes exactly when the result is a fresh reading (and then
+    /// equals it); the source bits are a known source and NONE for an absent sample. Coordinator
+    /// ruling: a later-slot REAL reading of 0 is fresh at once (Some(0), last good 0).
     #[test]
-    fn depth_writer(d in any::<u64>(), s in any::<u64>(), p in any::<u64>(), src_lo in 0u8..=2, ever in any::<bool>(), lg in any::<u64>(), lgs in any::<u64>(), new_src in 0u8..=4, nd in any::<u64>(), now in any::<u64>()) {
-        let srcb = src_lo | if ever { DEPTH_EVER } else { 0 };
+    fn depth_writer(d in any::<u64>(), s in any::<u64>(), p in any::<u64>(), src_lo in 0u8..=2, prev_real in any::<bool>(), ever in any::<bool>(), lg in any::<u64>(), lgs in any::<u64>(), new_src in 0u8..=4, nd in any::<u64>(), now in any::<u64>()) {
+        let srcb = src_lo | if ever { DEPTH_EVER } else { 0 } | if prev_real { DEPTH_PREV_REAL } else { 0 };
         let st = DepthState { depth_e6: d, depth_slot: s, depth_prev_e6: p, depth_source: srcb, last_good_e6: lg, last_good_slot: lgs };
         let o = depth_push_update(st, new_src, nd, now);
         if s != 0 && now <= s { prop_assert!(o.depth_e6 <= d); prop_assert_eq!(o.depth_prev_e6, p); prop_assert_eq!(o.depth_slot, s); }
         if depth_ever(srcb) { prop_assert!(depth_ever(o.depth_source)); }
-        let eff = effective_depth_e6(o.depth_e6, o.depth_prev_e6, o.depth_slot, now);
-        if eff > 0 {
-            prop_assert!(depth_ever(o.depth_source));
-            prop_assert_eq!(o.last_good_e6, eff);
-        } else {
-            prop_assert_eq!((o.last_good_e6, o.last_good_slot), (lg, lgs));
-            prop_assert_eq!(depth_ever(o.depth_source), depth_ever(srcb));
+        let fresh = fresh_depth_e6(o.depth_e6, o.depth_prev_e6, o.depth_slot, o.depth_source, now);
+        match fresh {
+            Some(f) => {
+                prop_assert!(depth_ever(o.depth_source));
+                prop_assert_eq!(o.last_good_e6, f);
+                prop_assert!(f <= o.depth_e6);
+            }
+            None => {
+                prop_assert_eq!((o.last_good_e6, o.last_good_slot), (lg, lgs));
+                prop_assert_eq!(depth_ever(o.depth_source), depth_ever(srcb));
+            }
         }
         prop_assert!(depth_source_byte_ok(o.depth_source));
-        if o.depth_e6 == 0 { prop_assert_eq!(depth_source_of(o.depth_source), DEPTH_SOURCE_NONE); }
+        let real = (1..=2).contains(&new_src);
+        if !real && !(s != 0 && now <= s) { prop_assert_eq!(depth_source_of(o.depth_source), DEPTH_SOURCE_NONE); prop_assert_eq!(fresh, None); }
+        if real && nd == 0 && !(s != 0 && now <= s) {
+            prop_assert_eq!(fresh, Some(0), "a later-slot real 0 is fresh at once");
+            prop_assert_eq!(o.last_good_e6, 0);
+        }
     }
 
     /// R2.1 §2: `tier_config_ok` is exactly the stated bounds; an accepted explicit table is used
@@ -210,7 +220,12 @@ fn g8_props_mutants_are_caught() {
     assert_eq!(effective_depth_e6(DEPTH_TIER1_E6, DEPTH_TIER1_E6, 0, 151), 0);
     // W-M1: the round-1 rule leaves a market that once had depth uncapped when it goes stale.
     assert_eq!(cap_depth_mutant_round1(0), None);
-    assert!(cap_depth_e6(DEPTH_EVER, 0, DEPTH_TIER1_E6, 0, 1_000).is_some());
+    assert!(cap_depth_e6(DEPTH_EVER, None, DEPTH_TIER1_E6, 0, 1_000).is_some());
+    // Fresh-zero ruling: the "zero = absent" mutant leaves a market with a real 0 reading open.
+    let zero_as_absent = |d: u64| if d == 0 { None } else { Some(d) };
+    assert_eq!(zero_as_absent(0), None);
+    let z = depth_push_update(DepthState::default(), DEPTH_SOURCE_ATTESTED, 0, 5);
+    assert_eq!(fresh_depth_e6(z.depth_e6, z.depth_prev_e6, z.depth_slot, z.depth_source, 5), Some(0));
     // I-D2: a `max` with L_tier instead of `min` would graduate past L_tier.
     let tab = tier_leverage([0; 3], 500, 1_000);
     let mutant = 1_000u16.max(500u16.max(l_table_x100(3, [500, 500, 1_000, 2_000])));
