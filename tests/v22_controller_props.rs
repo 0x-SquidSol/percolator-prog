@@ -65,3 +65,70 @@ fn r3_item1_mutants_are_caught() {
     // The defaults are on (non-zero, both-or-neither).
     assert_eq!((vl::CUSHION_TARGET_DEFAULT_BPS, vl::CUSHION_SHARE_DEFAULT_BPS), (2_000, 5_000));
 }
+
+// ── item 3 (D1(a), GAP-4): graded stress, <= 1x descent per writer call ───────────────────────
+
+/// MUTANT (D1(a)): round 2's ADL predicate (A != 1 or mode != Normal).
+fn adl_mutant_round2(a_long_is_one: bool, a_short_is_one: bool, ml: u8, ms: u8) -> bool {
+    !a_long_is_one || !a_short_is_one || ml != 0 || ms != 0
+}
+
+/// MUTANT (GAP-4): round 2's in-force rule `min(stored, target)` (a cliff).
+fn in_force_mutant_round2(stored: u16, target: u16) -> u16 {
+    stored.min(target)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+    /// The stress level is the highest flag; the cap is monotone non-increasing in the level and
+    /// non-decreasing in the tier, `L_table(tier - s)` floored at launch for s = 1, 2, launch at 3.
+    #[test]
+    fn item3_stress_cap(dr in any::<bool>(), adl in any::<bool>(), hl in any::<bool>(), tier in 0u8..=3, la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>()) {
+        let s = gv::stress_level(dr, adl, hl);
+        prop_assert_eq!(s, if hl { 3 } else if adl { 2 } else if dr { 1 } else { 0 });
+        let tab = gv::tier_leverage(lev, la, lt);
+        for st in 0u8..3 {
+            prop_assert!(gv::stress_cap_x100(st + 1, tier, tab) <= gv::stress_cap_x100(st, tier, tab));
+        }
+        if tier < 3 { prop_assert!(gv::stress_cap_x100(s, tier, tab) <= gv::stress_cap_x100(s, tier + 1, tab)); }
+        prop_assert_eq!(gv::stress_cap_x100(3, tier, tab), tab[0]);
+        if s == 1 || s == 2 { prop_assert_eq!(gv::stress_cap_x100(s, tier, tab), tab[tier.saturating_sub(s) as usize]); }
+        prop_assert!(!gv::real_adl(0, 0));
+    }
+
+    /// The smooth descent: a writer call lowers the stored ceiling by <= 1x unless the h-lock,
+    /// never below the target; the gate reads in [max(target, stored - 1x), stored].
+    #[test]
+    fn item3_one_step(prev in any::<u16>(), target in any::<u16>(), ps in any::<u64>(), now in any::<u64>(), st in 0u8..=3, launch in any::<u16>()) {
+        let floor = launch.min(target);
+        let (c, _) = gv::ratchet_ceiling_x100(prev, ps, target, floor, st, now);
+        if c < prev {
+            if st < gv::STRESS_HLOCK {
+                prop_assert!(prev - c <= gv::RATCHET_STEP_X100);
+                prop_assert!(c >= target);
+            } else {
+                prop_assert_eq!(c, floor, "h-lock: to the floor (launch) at once");
+            }
+        }
+        let f = gv::ceiling_in_force_x100(true, prev, target, launch, u16::MAX, st);
+        prop_assert!(f <= prev);
+        if prev > target && st < gv::STRESS_HLOCK {
+            prop_assert_eq!(f, target.max(prev - gv::RATCHET_STEP_X100.min(prev)));
+        }
+    }
+}
+
+#[test]
+fn r3_item3_mutants_are_caught() {
+    // D1(a): a matched band liquidation (A_short < 1, modes Normal) is not ADL now; the round-2
+    // predicate read it as ADL (-> launch).
+    assert!(!gv::real_adl(0, 0));
+    assert!(adl_mutant_round2(true, false, 0, 0), "mutant witness: A != 1 read as ADL");
+    // GAP-4: stored 20x, target 5x: in force 19x now; the round-2 rule cliffs to 5x.
+    assert_eq!(gv::ceiling_in_force_x100(true, 2_000, 500, 500, 2_000, gv::STRESS_NONE), 1_900);
+    assert_eq!(in_force_mutant_round2(2_000, 500), 500, "mutant witness: a 15x cliff");
+    // the h-lock is the one exception
+    assert_eq!(gv::ceiling_in_force_x100(true, 2_000, 500, 500, 2_000, gv::STRESS_HLOCK), 500);
+    assert_eq!(gv::ratchet_ceiling_x100(2_000, 0, 500, 500, gv::STRESS_DRAW, 1), (1_900, 1));
+}

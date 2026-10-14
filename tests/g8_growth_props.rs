@@ -67,26 +67,38 @@ proptest! {
     /// forced it IS launch; monotone non-decreasing in the tier; the table is monotone, starts at
     /// launch and never exceeds L_tier.
     #[test]
-    fn target_bounds_and_monotone(la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), t1 in 0u8..=3, t2 in 0u8..=3, grad in any::<bool>(), force in any::<bool>()) {
+    fn target_bounds_and_monotone(la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), t1 in 0u8..=3, t2 in 0u8..=3, grad in any::<bool>(), stress in 0u8..=3) {
         let launch = la.min(lt);
         let tab = tier_leverage(lev, la, lt);
         prop_assert_eq!(tab[0], launch);
         for i in 0..3 { prop_assert!(tab[i] <= tab[i + 1] && tab[i + 1] <= lt.max(launch)); }
         let (lo, hi) = if t1 <= t2 { (t1, t2) } else { (t2, t1) };
-        let a = target_ceiling_x100(grad, force, la, lt, l_table_x100(lo, tab));
-        let b = target_ceiling_x100(grad, force, la, lt, l_table_x100(hi, tab));
+        let a = target_ceiling_x100(grad, stress, la, lt, l_table_x100(lo, tab), stress_cap_x100(stress, lo, tab));
+        let b = target_ceiling_x100(grad, stress, la, lt, l_table_x100(hi, tab), stress_cap_x100(stress, hi, tab));
         prop_assert!(a >= launch && a <= lt.max(launch) && a <= launch.max(l_table_x100(lo, tab)));
         prop_assert!(a <= l_table_x100(lo, tab).max(launch));
         prop_assert!(a <= b);
-        if !grad || force { prop_assert_eq!(a, launch); }
+        if !grad || stress >= STRESS_HLOCK { prop_assert_eq!(a, launch); }
+        // round 3 item 3: stress is graded and monotone (more stress never raises the target)
+        if stress >= 1 { prop_assert!(a <= stress_cap_x100(stress, lo, tab).max(launch)); }
+        let more = target_ceiling_x100(grad, (stress + 1).min(3), la, lt, l_table_x100(lo, tab), stress_cap_x100((stress + 1).min(3), lo, tab));
+        prop_assert!(more <= a);
     }
 
     /// Ratchet: <= +1x per epoch, only after the epoch; never climbs in the snapshot call;
     /// fall-only never rises.
     #[test]
-    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), cl in any::<u64>(), cm in any::<u128>(), grad in any::<bool>(), force in any::<bool>(), la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), tier in 0u8..=3, now in any::<u64>()) {
-        let lx = l_table_x100(tier, tier_leverage(lev, la, lt));
-        let (c, s, cl2) = graduation_ratchet(prev, ps, cl, cm, grad, force, la, lt, lx, now);
+    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), cl in any::<u64>(), cm in any::<u128>(), grad in any::<bool>(), stress in 0u8..=3, la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), tier in 0u8..=3, now in any::<u64>(), stored in any::<u16>()) {
+        let tab = tier_leverage(lev, la, lt);
+        let lx = l_table_x100(tier, tab);
+        let cap = stress_cap_x100(stress, tier, tab);
+        let (c, s, cl2) = graduation_ratchet(prev, ps, cl, cm, grad, stress, la, lt, lx, cap, now);
+        // round 3 item 3: never more than 1x down per writer call except the h-lock
+        if c < prev && stress < STRESS_HLOCK { prop_assert!(prev - c <= RATCHET_STEP_X100); }
+        let t = target_ceiling_x100(grad, stress, la, lt, lx, cap);
+        let f = ceiling_in_force_x100(true, stored, t, la, lt, stress);
+        prop_assert!(f <= stored && f >= stored.min(t));
+        if stored > t && stress < STRESS_HLOCK { prop_assert!(stored - f <= RATCHET_STEP_X100); }
         if c > prev {
             prop_assert!(cl != 0);
             prop_assert!(c as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
@@ -95,8 +107,9 @@ proptest! {
         }
         if c == prev && cl != 0 { prop_assert!(s == ps || s == now); }
         if cl != 0 { prop_assert_eq!(cl2, cl); } else { prop_assert_eq!(cl2 == 0, cm == 0); }
-        let (f, _) = graduation_fall_only(prev, ps, grad, force, la, lt, lx, now);
+        let (f, _) = graduation_fall_only(prev, ps, grad, stress, la, lt, lx, cap, now);
         prop_assert!(f <= prev);
+        if stress < STRESS_HLOCK { prop_assert!(prev - f <= RATCHET_STEP_X100); }
     }
 
     /// I-D4 at full width: with a cap depth, N_cap * 1e4 * P <= depth * κ * POS_SCALE (checked in
@@ -281,5 +294,5 @@ fn g8_props_mutants_are_caught() {
     let tab = tier_leverage([0; 3], 500, 1_000);
     let mutant = 1_000u16.max(500u16.max(l_table_x100(3, [500, 500, 1_000, 2_000])));
     assert!(mutant > 1_000);
-    assert_eq!(target_ceiling_x100(true, false, 500, 1_000, l_table_x100(3, tab)), 1_000);
+    assert_eq!(target_ceiling_x100(true, STRESS_NONE, 500, 1_000, l_table_x100(3, tab), u16::MAX), 1_000);
 }

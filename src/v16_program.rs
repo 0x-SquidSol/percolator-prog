@@ -28279,10 +28279,11 @@ pub mod processor {
                 g.ceil_x100,
                 g.ceil_slot,
                 growth_v19::graduation_on(ctx.clamp, band_bps, ctx.venue_tier),
-                ctx.force_down,
+                ctx.stress,
                 g.l_launch_x100,
                 g.l_tier_x100,
                 growth_v19::l_table_x100(ctx.venue_tier, ctx.l_table),
+                growth_v19::stress_cap_x100(ctx.stress, ctx.venue_tier, ctx.l_table),
                 ctx.now,
             );
             g.ceil_x100 = ceil;
@@ -42815,9 +42816,11 @@ pub mod processor {
         /// reading (a real 0 = cap 0), else the sticky `last_good >> k` once `DEPTH_EVER`, else `None` (no
         /// cap: never had a fresh depth). `None` off the clamp.
         cap_depth_e6: Option<u64>,
-        /// §1.2 force-down: a senior draw / G9 backstop outstanding (the fill-time halt mirror
-        /// or unbooked moved atoms), the bankruptcy h-lock latched, or ADL on either side.
-        force_down: bool,
+        /// Round 3 item 3 (design D1(a) + GAP-4): the graded stress level
+        /// (`growth_v19::stress_level`): 1 a senior draw / G9 backstop outstanding (the fill-time
+        /// halt mirror or unbooked moved atoms), 2 REAL ADL (an engine side mode != Normal; the A
+        /// factor alone is not read), 3 the bankruptcy h-lock latched; 0 none.
+        stress: u8,
         /// `authenticated_market_slot_or_fallback_view`; 0 off the clamp (unused there).
         now: u64,
         /// R2.1 §2: the market's leverage table `[L0..L3]` (`growth_v19::tier_leverage`).
@@ -42828,6 +42831,11 @@ pub mod processor {
         /// `L_table(tier)`.
         fn l_table_tier(&self) -> u16 {
             growth_v19::l_table_x100(self.tier, self.l_table)
+        }
+
+        /// The graded stress cap at the combined tier (`growth_v19::stress_cap_x100`).
+        fn stress_cap(&self) -> u16 {
+            growth_v19::stress_cap_x100(self.stress, self.tier, self.l_table)
         }
     }
 
@@ -42850,7 +42858,7 @@ pub mod processor {
                 tier: 0,
                 venue_tier: 0,
                 cap_depth_e6: None,
-                force_down: false,
+                stress: growth_v19::STRESS_NONE,
                 now: 0,
                 l_table: [0; 4],
             });
@@ -42881,10 +42889,10 @@ pub mod processor {
             .get(asset_index)
             .ok_or(PercolatorError::InvalidInstruction)?;
         let asset = &market.engine.asset;
-        let adl = asset.a_long.get() != percolator::ADL_ONE
-            || asset.a_short.get() != percolator::ADL_ONE
-            || asset.mode_long != 0
-            || asset.mode_short != 0;
+        // D1(a): REAL ADL only (a side mode DrainOnly / ResetPending). A matched band liquidation
+        // scales the LP side's A with both modes Normal; that is not ADL and no longer cliffs
+        // the ceiling (the engine's own 120 refusal while A != 1 is unchanged, D1(b) is engine).
+        let adl = growth_v19::real_adl(asset.mode_long, asset.mode_short);
         let draw = state::asset_vault_lp_draw_from_wrapper_bytes(&market.wrapper[..])?;
         let draw_out = draw.outstanding_mirror_atoms != 0 || draw.pending_moved_atoms != 0;
         let hlock = group.header.bankruptcy_hlock_active != 0;
@@ -42894,7 +42902,7 @@ pub mod processor {
             tier,
             venue_tier,
             cap_depth_e6,
-            force_down: adl || draw_out || hlock,
+            stress: growth_v19::stress_level(draw_out, adl, hlock),
             now,
             l_table: g.tier_table_x100(),
         })
@@ -42968,12 +42976,20 @@ pub mod processor {
     fn growth_ceiling_x100(g: &state::AssetGrowthV19, ctx: &GrowthG8Ctx) -> u16 {
         let target = growth_v19::target_ceiling_x100(
             ctx.graduation,
-            ctx.force_down,
+            ctx.stress,
             g.l_launch_x100,
             g.l_tier_x100,
             ctx.l_table_tier(),
+            ctx.stress_cap(),
         );
-        growth_v19::ceiling_in_force_x100(ctx.clamp, g.ceil_x100, target, g.l_launch_x100, g.l_tier_x100)
+        growth_v19::ceiling_in_force_x100(
+            ctx.clamp,
+            g.ceil_x100,
+            target,
+            g.l_launch_x100,
+            g.l_tier_x100,
+            ctx.stress,
+        )
     }
 
     /// G8 `N_cap` of the bound LP with conservative equity `c_m` (`growth_v19::n_cap_g8_q`), the
@@ -45126,10 +45142,11 @@ pub mod processor {
                 g.c_launch_atoms,
                 c_m,
                 ctx.graduation,
-                ctx.force_down,
+                ctx.stress,
                 g.l_launch_x100,
                 g.l_tier_x100,
                 ctx.l_table_tier(),
+                ctx.stress_cap(),
                 ctx.now,
             );
             if (ceil, slot, c_launch) != (g.ceil_x100, g.ceil_slot, g.c_launch_atoms) {
@@ -49068,11 +49085,18 @@ mod g8_kani_proofs {
             let la: u16 = kani::any();
             let lt: u16 = kani::any();
             let stored: u16 = kani::any();
-            let force: bool = kani::any();
+            let stress: u8 = kani::any();
             let lev: [u16; 3] = kani::any();
-            let t = target_ceiling_x100(g, force, la, lt, l_table_x100(tier, tier_leverage(lev, la, lt)));
+            let tab = tier_leverage(lev, la, lt);
+            let t = target_ceiling_x100(g, stress, la, lt, l_table_x100(tier, tab), stress_cap_x100(stress, tier, tab));
             assert_eq!(t, la.min(lt));
-            assert!(ceiling_in_force_x100(clamp, stored, t, la, lt) <= la.min(lt));
+            // round 3 item 3: the ceiling in force falls toward launch by <= 1x per writer call
+            // (the h-lock at once), so it is <= max(launch, stored - 1x) and never above stored.
+            let f = ceiling_in_force_x100(clamp, stored, t, la, lt, stress);
+            assert!(f <= core::cmp::max(la.min(lt), stored.saturating_sub(RATCHET_STEP_X100)) || !clamp);
+            if !clamp {
+                assert_eq!(f, la.min(lt));
+            }
             let lam: u32 = kani::any();
             assert!(lambda_eff_bps(lam, tier) <= DEFAULT_LAMBDA_BPS);
             let lg: u32 = kani::any();
@@ -49269,20 +49293,26 @@ mod g8_kani_proofs {
         kani::cover!(attested_max_tier_ok(3) && !attested_max_tier_ok(4), "attested bound");
     }
 
-    /// R2.1 §2/§3 + 13:10 ruling: the target is `min(L_tier, max(L_launch, L_table(tier)))`
-    /// when graduating (launch otherwise), so the ceiling IN FORCE -- min(stored, target), for
-    /// ANY stored ceiling -- is <= min(L_tier, L_table(tier)) on every table `tier_leverage`
-    /// builds (it floors at launch and clamps at L_tier), and never below launch via the target.
-    /// The ratchet writer takes <= one +1x step per epoch and only after the epoch; with
-    /// c_launch == 0 it never climbs (and snapshots); the fall-only writer never rises.
-    /// Mutants: `max` with L_tier; `max(stored, target)` in force; step 200; `now > prev_slot`
-    /// without the epoch; climbing in the snapshot call; fall-only writer using `max`; table not
-    /// clamped at L_tier.
+    /// R2.1 §2/§3 + 13:10 ruling + round 3 item 3: the target is
+    /// `min(L_tier, max(L_launch, min(L_table(tier), stress_cap)))` when graduating and below the
+    /// h-lock (launch otherwise), so it is <= min(L_tier, L_table(tier)) on every table
+    /// `tier_leverage` builds and <= the stress cap (`L_table(tier - s)`) under a draw (s = 1) or
+    /// real ADL (s = 2) unless that is below launch. The ceiling IN FORCE is never above the stored
+    /// ceiling, never below min(stored, target), and at most ONE step (1x) below the stored ceiling
+    /// unless the h-lock (then the target). The ratchet writer takes <= one +1x step per epoch and
+    /// only after the epoch, and FALLS by <= 1x per call except under the h-lock (to launch at
+    /// once); with c_launch == 0 it never climbs (and snapshots); the fall-only writer never rises
+    /// and falls <= 1x per call except under the h-lock.
+    /// Mutants: `max` with L_tier; `max(stored, target)` in force; round-2 `min(stored, target)` in
+    /// force (a cliff); step 200; `now > prev_slot` without the epoch; climbing in the snapshot
+    /// call; a fall straight to the target without the h-lock (round 2); the stress cap ignored;
+    /// `tier - s` without the floor; fall-only writer using `max`.
     #[kani::proof]
     #[kani::unwind(4)]
     fn kani_g8_ceiling_min_chain_and_ratchet() {
         let grad: bool = kani::any();
-        let force: bool = kani::any();
+        let stress: u8 = kani::any();
+        kani::assume(stress <= STRESS_HLOCK);
         let la: u16 = kani::any();
         let lt: u16 = kani::any();
         let tier: u8 = kani::any();
@@ -49290,16 +49320,32 @@ mod g8_kani_proofs {
         let lev: [u16; 3] = kani::any();
         let table = tier_leverage(lev, la, lt);
         let lx = l_table_x100(tier, table);
+        let cap = stress_cap_x100(stress, tier, table);
         let launch = la.min(lt);
-        let t = target_ceiling_x100(grad, force, la, lt, lx);
+        let t = target_ceiling_x100(grad, stress, la, lt, lx, cap);
         assert!(t <= lt);
         assert!(t >= launch);
         assert!(t <= launch.max(lx));
         assert!(t <= lt.min(lx), "ceiling target <= min(L_tier, L_table(tier))");
-        let stored: u16 = kani::any();
-        assert!(ceiling_in_force_x100(true, stored, t, la, lt) <= lt.min(lx));
-        if !grad || force {
+        if stress >= STRESS_DRAW && stress < STRESS_HLOCK {
+            assert_eq!(cap, table[tier.saturating_sub(stress) as usize]);
+            assert!(t <= cap.max(launch), "a draw / real ADL caps the target s knots down");
+        }
+        if !grad || stress >= STRESS_HLOCK {
             assert_eq!(t, launch);
+        }
+        let stored: u16 = kani::any();
+        let f = ceiling_in_force_x100(true, stored, t, la, lt, stress);
+        assert!(f <= stored, "in force never above the stored ceiling");
+        assert!(f >= stored.min(t));
+        if stored > t {
+            if stress >= STRESS_HLOCK {
+                assert_eq!(f, t);
+            } else {
+                assert!(stored - f <= RATCHET_STEP_X100, "in force: at most one step below stored");
+            }
+        } else {
+            assert_eq!(f, stored);
         }
         let c_m: u16 = kani::any();
         let c_l: u16 = kani::any();
@@ -49307,13 +49353,19 @@ mod g8_kani_proofs {
         let ps: u32 = kani::any();
         let now: u32 = kani::any();
         let (out, slot, cl_out) = graduation_ratchet(
-            prev, ps as u64, c_l as u64, c_m as u128, grad, force, la, lt, lx, now as u64,
+            prev, ps as u64, c_l as u64, c_m as u128, grad, stress, la, lt, lx, cap, now as u64,
         );
         if out > prev {
             assert!(out as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
             assert!(now as u64 >= ps as u64 + RATCHET_EPOCH_SLOTS);
             assert_eq!(slot, now as u64);
             assert!(c_l != 0, "no climb in the snapshot call");
+        }
+        if out < prev {
+            assert_eq!(slot, now as u64);
+            if stress < STRESS_HLOCK {
+                assert!(prev - out <= RATCHET_STEP_X100, "<= 1x down per writer call");
+            }
         }
         assert!(out <= prev.max(t).max(launch));
         if c_l == 0 {
@@ -49322,18 +49374,25 @@ mod g8_kani_proofs {
         } else {
             assert_eq!(cl_out, c_l as u64);
         }
-        let (f, fs) = graduation_fall_only(prev, ps as u64, grad, force, la, lt, lx, now as u64);
-        assert!(f <= prev);
-        if f == prev {
+        let (fo, fs) = graduation_fall_only(prev, ps as u64, grad, stress, la, lt, lx, cap, now as u64);
+        assert!(fo <= prev);
+        if fo == prev {
             assert_eq!(fs, ps as u64);
+        } else if stress < STRESS_HLOCK {
+            assert!(prev - fo <= RATCHET_STEP_X100);
         }
-        kani::cover!(grad && !force && t > launch && t < lt, "graduated between launch and tier");
-        kani::cover!(grad && !force && tier == 2 && t == lx && lx < lt, "capped at L_table(2)");
-        kani::cover!(grad && !force && tier == 3 && t == lt && lx == lt, "L_tier binds");
+        kani::cover!(grad && stress == 0 && t > launch && t < lt, "graduated between launch and tier");
+        kani::cover!(grad && stress == 0 && tier == 2 && t == lx && lx < lt, "capped at L_table(2)");
+        kani::cover!(grad && stress == 0 && tier == 3 && t == lt && lx == lt, "L_tier binds");
+        kani::cover!(grad && stress == STRESS_DRAW && tier == 3 && t == cap && cap < lx && t > launch, "draw: one knot down");
+        kani::cover!(grad && stress == STRESS_ADL && tier == 3 && t == cap && cap < table[2], "real ADL: two knots down");
+        kani::cover!(stored > t && stress < STRESS_HLOCK && stored - f == RATCHET_STEP_X100, "in force one step below stored");
+        kani::cover!(stored > t + RATCHET_STEP_X100 && stress == STRESS_HLOCK && f == t, "h-lock: target at once");
         kani::cover!(out > prev, "one-step rise");
-        kani::cover!(out < prev, "immediate fall");
+        kani::cover!(out < prev && prev - out == RATCHET_STEP_X100 && stress < STRESS_HLOCK, "one-step fall");
+        kani::cover!(out < prev && prev - out > RATCHET_STEP_X100 && stress == STRESS_HLOCK, "h-lock fall at once");
         kani::cover!(c_l == 0 && c_m != 0 && cl_out != 0, "c_launch snapshot");
-        kani::cover!(f < prev, "fall-only writer falls");
+        kani::cover!(fo < prev, "fall-only writer falls");
     }
 
     /// I-D4: with a cap depth (fresh or sticky) N_cap <= κ·depth/P exactly (cross-multiplied);
@@ -49391,7 +49450,8 @@ mod g8_kani_proofs {
         let tgt: u16 = kani::any();
         let la: u16 = kani::any();
         let lt: u16 = kani::any();
-        assert_eq!(ceiling_in_force_x100(false, stored, tgt, la, lt), la.min(lt));
+        let st: u8 = kani::any();
+        assert_eq!(ceiling_in_force_x100(false, stored, tgt, la, lt, st), la.min(lt));
         let c_m: u16 = kani::any();
         let lam: u16 = kani::any();
         let tier: u8 = kani::any();
@@ -49525,5 +49585,54 @@ mod r3_kani_proofs {
         kani::cover!(!proven && stored > 5_000 && a == 5_000, "a 70% record allocates at 50%");
         kani::cover!(!proven && stored < 5_000 && a == stored, "a lower dial is kept");
         kani::cover!(proven && stored > 5_000 && a == stored, "after the flip: the stored dial");
+    }
+
+    /// Item 3 (D1(a) + GAP-4): `stress_level` is the highest flag; `real_adl` reads the side
+    /// modes only; `stress_cap_x100` is `L_table(tier - s)` floored at tier 0 for s = 1, 2, launch
+    /// at 3, none at 0, monotone in s and tier; `smooth_fall_x100` is `max(target, prev - 1x)`.
+    /// Mutants: `A != 1` read as ADL (round 2); the draw ranked above ADL; `tier - s` without the
+    /// floor (index underflow); a cap at s = 0; `prev - 2x`; `min` for `max` in the fall.
+    #[kani::proof]
+    fn kani_r3_item3_stress_and_one_step() {
+        let dr: bool = kani::any();
+        let adl: bool = kani::any();
+        let hl: bool = kani::any();
+        let s = stress_level(dr, adl, hl);
+        assert_eq!(s, if hl { 3 } else if adl { 2 } else if dr { 1 } else { 0 });
+        let ml: u8 = kani::any();
+        let ms: u8 = kani::any();
+        assert_eq!(real_adl(ml, ms), ml != 0 || ms != 0);
+        let t: [u16; 4] = kani::any();
+        kani::assume(t[0] <= t[1] && t[1] <= t[2] && t[2] <= t[3]);
+        let tier: u8 = kani::any();
+        kani::assume(tier <= 3);
+        let st: u8 = kani::any();
+        kani::assume(st <= 3);
+        let c = stress_cap_x100(st, tier, t);
+        match st {
+            0 => assert_eq!(c, u16::MAX),
+            3 => assert_eq!(c, t[0]),
+            _ => assert_eq!(c, t[tier.saturating_sub(st) as usize]),
+        }
+        if st < 3 {
+            assert!(stress_cap_x100(st + 1, tier, t) <= c);
+        }
+        if tier < 3 {
+            assert!(c <= stress_cap_x100(st, tier + 1, t));
+        }
+        let prev: u16 = kani::any();
+        let tg: u16 = kani::any();
+        let f = smooth_fall_x100(prev, tg);
+        assert!(f >= tg);
+        if prev > tg {
+            assert!(prev - f <= RATCHET_STEP_X100 && f <= prev);
+        }
+        kani::cover!(st == 1 && tier == 3 && c == t[2], "draw at tier 3: one knot");
+        kani::cover!(st == 2 && tier == 1 && c == t[0], "ADL at tier 1: floored at launch");
+        kani::cover!(st == 2 && tier == 3 && c == t[1], "ADL at tier 3: two knots");
+        kani::cover!(st == 3 && c == t[0], "h-lock: launch");
+        kani::cover!(prev > tg + RATCHET_STEP_X100 && f == prev - RATCHET_STEP_X100, "one step");
+        kani::cover!(prev > tg && prev <= tg + RATCHET_STEP_X100 && f == tg, "lands on target");
+        kani::cover!(!hl && adl && dr && s == 2, "ADL outranks draw");
     }
 }

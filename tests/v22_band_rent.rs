@@ -2720,9 +2720,10 @@ fn g8_off_band_ceiling_stays_launch_whatever_depth_and_capital() {
 
 /// (c) Band market (clamp-enforced, L_tier 10x), L_launch 3x, tier-1 attested depth (venue tier
 /// 1), LP book $30k (book tier 1, `>= $25k`): tier = min(1, 1) = 1, target = L1 = 5x (R2.1). The
-/// ceiling climbs at most +1x per 9,000 slots (3x -> 4x -> 5x and stops at L_table(1)), and falls
-/// at once when the depth becomes absent (35 B push) and when it goes stale (> 150 slots); the
-/// gate follows (3.5x refused at 3x, admitted at 5x, refused again after the fall).
+/// ceiling climbs at most +1x per 9,000 slots (3x -> 4x -> 5x and stops at L_table(1)). Round 3
+/// item 3: when the depth goes stale (> 150 slots) or absent (35 B push) the target is launch at
+/// once but the ceiling in force descends ONE step (1x) per writer call, never a cliff: stale ->
+/// in force 4x (4.5x refused, 3.5x admitted); a 35 B push (a writer) stores 4x, the next 3x.
 #[test]
 fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth() {
     let mut env = env_with_launch(band_cfg(), 300);
@@ -2777,8 +2778,8 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     g.depth_slot = env.clock_slot() - 151;
     state::write_asset_growth(&mut acc.data, 0, &g, ENGINE_IMR).unwrap();
     env.svm.set_account(env.market, acc).unwrap();
-    let r = env.trade_cpi(&taker.0, taker.1, &lp, 350 * Q);
-    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "stale depth (151 slots) -> launch at once");
+    let r = env.trade_cpi(&taker.0, taker.1, &lp, 450 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "stale depth (151 slots) -> one step: 4x in force");
     // Control: 150 slots old is still fresh -> 5x.
     let mut acc = env.svm.get_account(&env.market).unwrap();
     let mut g = state::read_asset_growth(&acc.data, 0, ENGINE_IMR).unwrap().unwrap();
@@ -2789,12 +2790,18 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     let mut probe = env.svm.get_account(&env.market).unwrap();
     let saved = probe.clone();
     let _ = fresh_slot;
-    // Absent depth (a 35 B push): the stored ceiling falls at once (fall-only writer) and the
-    // gate refuses 3.5x.
+    // Absent depth (a 35 B push, a writer call): the stored ceiling falls ONE step (5x -> 4x),
+    // the next writer call another (-> 3x = launch), then holds; the gate follows.
     env.push(PRICE);
-    assert_eq!(env.growth().ceil_x100, 300, "absent depth -> launch at once");
+    assert_eq!(env.growth().ceil_x100, 400, "absent depth -> one step down per writer call");
     let r = env.trade_cpi(&t3.0, t3.1, &lp, 350 * Q);
-    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "after the fall 3.5x is refused");
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "in force 3x (one step below the stored 4x): 3.5x refused");
+    env.warp(1);
+    env.push(PRICE);
+    assert_eq!(env.growth().ceil_x100, 300, "second writer call: launch");
+    env.warp(1);
+    env.push(PRICE);
+    assert_eq!(env.growth().ceil_x100, 300, "holds at launch");
     // Back to the 150-slot-old fresh depth and the 5x stored ceiling (restore the pre-push
     // market account, STATE POKE): the 3.5x open lands.
     probe.data.copy_from_slice(&saved.data);
@@ -3151,8 +3158,9 @@ fn r2_book_tier_limits_venue_tier() {
 /// tier table at the floors ($5k / $20k / $100k, default 5x/10x/20x) with attested_max_tier 3,
 /// LP book $150k (book tier 3). Venue tier 2 ($50k): 5x -> 10x one step per 9,000 slots, holds
 /// at 10x; venue tier 3 ($150k): 10x -> 20x one step per epoch, holds at 20x (L_tier); the gate
-/// follows (10.5x refused at 10x, 19x admitted at 20x). Depth loss (35 B push): straight back to
-/// 5x, and 5.5x is refused.
+/// follows (10.5x refused at 10x, 19x admitted at 20x). Depth loss (35 B push): round 3 item 3,
+/// the ceiling descends exactly 1x per writer call (20x -> 19x -> ... -> 5x, 15 calls), never a
+/// cliff; the gate follows (in force one step below the stored ceiling); then 5.5x is refused.
 #[test]
 fn r2_band_market_graduates_5x_10x_20x_and_drops_on_depth_loss() {
     let mut env = env_tiered(500, 250, 50, 100, 60, 500);
@@ -3192,15 +3200,28 @@ fn r2_band_market_graduates_5x_10x_20x_and_drops_on_depth_loss() {
     let t2 = env.trader(100 * USD);
     env.trade_cpi(&t2.0, t2.1, &lp, 1_900 * Q).expect("19x under the graduated 20x");
     // depth loss: the 35 B push (same slot: no leg goes stale) zeroes the venue -> the
-    // fall-only writer drops the stored ceiling to launch at once
+    // fall-only writer lowers the stored ceiling by ONE step (not to launch at once)
     env.push(PRICE);
-    assert_eq!(env.growth().ceil_x100, 500, "depth loss: 5x at once");
+    assert_eq!(env.growth().ceil_x100, 1_900, "depth loss: one step (20x -> 19x)");
     // holders above the new ceiling can still reduce (and close), even while the asset is
     // loss-stale after the push's accrual (reductions are never gated)
     env.trade_cpi(&t2.0, t2.1, &lp, -1_000 * Q).expect("reduce after the drop");
     env.trade_cpi(&t2.0, t2.1, &lp, -900 * Q).expect("close after the drop");
-    env.warp(1);
-    env.push(PRICE);
+    // the reduce and the close are writer calls too (post-fill ratchet): <= 1x each
+    let c0 = env.growth().ceil_x100;
+    assert!((1_700..=1_900).contains(&c0) && (1_900 - c0).is_multiple_of(100), "two fills: <= 1x each ({c0})");
+    // every further writer call (a push here) takes exactly one more step, down to launch
+    let mut c = c0;
+    let mut calls = 0;
+    while c > 500 {
+        env.warp(1);
+        env.push(PRICE);
+        let n = env.growth().ceil_x100;
+        assert_eq!(c - n, 100, "exactly 1x per writer call: {c} -> {n}");
+        c = n;
+        calls += 1;
+    }
+    assert_eq!(calls, (c0 - 500) / 100, "one writer call per 1x step down to 5x");
     env.crank_current(lp.account);
     env.crank_current(t2.1);
     assert_eq!(env.growth().ceil_x100, 500);
@@ -3237,8 +3258,9 @@ fn r2_old_5x_market_stays_at_5x() {
 }
 
 /// R2.1 §2: a tier table change never JUMPS the ceiling: raising L2 moves the target and the
-/// ratchet climbs +1x per epoch; lowering it takes effect at the next read (the gate applies
-/// min(stored, live target)) and the next writer stores it.
+/// ratchet climbs +1x per epoch; lowering it takes effect at the next read, ONE step at a time
+/// (round 3 item 3: the gate applies max(target, stored - 1x)), and each writer call stores one
+/// step.
 #[test]
 fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
     let mut env = env_with_launch(band_cfg(), 500);
@@ -3255,10 +3277,14 @@ fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
     assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 700, "then +1x per epoch");
     env.set_tiers([0; 3], [500, 500, 1_000], 3).expect("L2 = 5x");
     let t = env.trader(100 * USD);
-    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
-    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "lowered table binds at once (stored 7x)");
+    let r = env.trade_cpi(&t.0, t.1, &lp, 650 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "lowered table binds at the next read: one step (stored 7x -> 6x in force)");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().ceil_x100, 500, "the next writer stores the fall");
+    assert_eq!(env.growth().ceil_x100, 600, "the next writer stores one step");
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().ceil_x100, 500, "and the next one the target");
+    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "5.5x over the stored 5x");
 }
 
 /// Coordinator ruling (most conservative wins): an attested (mode 1) reading of 0 is a REAL zero
@@ -4217,4 +4243,79 @@ fn v22_f1_dust_shortfall_waits_for_material_progress() {
         assert!(env.pos(long.1).unsigned_abs() < p0.unsigned_abs());
     }
     assert!(!f1_hlock(&env));
+}
+
+impl Env {
+    /// STATE POKE of the engine asset / header / draw record of asset 0 (round 3 item 3 tests).
+    fn poke_stress(&mut self, a_short: Option<u128>, mode_short: Option<u8>, hlock: Option<bool>, draw_mirror: Option<u128>) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        {
+            let (_, g) = state::market_view_mut(&mut acct.data).unwrap();
+            if let Some(a) = a_short {
+                g.markets[0].engine.asset.a_short = percolator::V16PodU128::new(a);
+            }
+            if let Some(m) = mode_short {
+                g.markets[0].engine.asset.mode_short = m;
+            }
+            if let Some(h) = hlock {
+                g.header.bankruptcy_hlock_active = h as u8;
+            }
+            if let Some(d) = draw_mirror {
+                let mut rec = state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap();
+                rec.outstanding_mirror_atoms = d;
+                state::asset_vault_lp_draw_to_wrapper_bytes(&mut g.markets[0].wrapper[..], &rec).unwrap();
+            }
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+    }
+}
+
+/// Round 3 item 3 (design D1(a) + GAP-4): graded stress and the smooth descent, on a 20x band
+/// market graduated to 20x with a fresh tier-3 venue depth. Every writer call here is a 44 B
+/// PushAuthMark in the SAME slot (the fall-only writer; the depth stays fresh).
+/// (a) D1(a): the LP side's A scaled below 1 with both modes Normal (what a matched band
+///     liquidation leaves) is NOT ADL: the ceiling stays 20x (round 2: launch at once).
+/// (b) a draw outstanding (STATE POKE of the halt mirror): the target is one knot down
+///     (L_table(2) = 10x); the ceiling descends EXACTLY 1x per writer call 20x -> 10x and holds.
+/// (c) real ADL (side mode DrainOnly), draw cleared: two knots down (5x): 10x -> 9x -> 8x ...
+/// (d) the bankruptcy h-lock: launch AT ONCE (8x -> 5x in one call), the only cliff.
+/// Negative control (file copy): with round 2's rule (a) drops to 5x and (b) to 10x in one call.
+#[test]
+fn r3_item3_graded_stress_and_one_step_descent() {
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    env.auth_mark();
+    env.set_tiers([5_000, 20_000, 100_000], [0; 3], 3).expect("UA tier table");
+    let lp = env.lp(150_000 * USD);
+    let tier3 = 150_000 * USD_E6;
+    env.depth_twice(tier3);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    env.climb_to(&lp, tier3, 2_000, 30);
+    assert_eq!(env.growth().ceil_x100, 2_000, "graduated to 20x");
+    let one = |env: &mut Env| -> u16 {
+        env.push_depth(PRICE, 1, tier3).expect("44 B push (writer)");
+        env.growth().ceil_x100
+    };
+    // (a) A != 1, modes Normal: no stress.
+    env.poke_stress(Some(percolator::ADL_ONE / 2), None, None, None);
+    assert_eq!(one(&mut env), 2_000, "D1(a): A != 1 alone is not ADL");
+    assert_eq!(one(&mut env), 2_000);
+    env.poke_stress(Some(percolator::ADL_ONE), None, None, None);
+    // (b) draw outstanding: one knot down (10x), 1x per writer call.
+    env.poke_stress(None, None, None, Some(1));
+    let mut c = 2_000u16;
+    for _ in 0..10 {
+        let n = one(&mut env);
+        assert_eq!(c - n, 100, "draw: exactly 1x per writer call ({c} -> {n})");
+        c = n;
+    }
+    assert_eq!(c, 1_000);
+    assert_eq!(one(&mut env), 1_000, "holds one knot down (L_table(2) = 10x)");
+    env.poke_stress(None, None, None, Some(0));
+    // (c) real ADL: two knots down (L_table(1) = 5x), still 1x per call.
+    env.poke_stress(None, Some(1), None, None);
+    assert_eq!(one(&mut env), 900, "real ADL: one step");
+    assert_eq!(one(&mut env), 800, "real ADL: one step");
+    // (d) the h-lock: launch at once.
+    env.poke_stress(None, None, Some(true), None);
+    assert_eq!(one(&mut env), 500, "h-lock: 8x -> 5x in one call");
 }
