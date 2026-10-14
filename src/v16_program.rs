@@ -47670,3 +47670,246 @@ mod p1_position_cap_kani_proofs {
     }
 }
 
+/// v2.2 growth overnight (2026-10-14) Kani harnesses for the G8 depth tiers, the per-market
+/// clamp predicate, the ceiling target / ratchet and the I-1 reset (`growth_v19`). In the lib
+/// (not `kani/growth/`) because `growth_v19::band_r_gap_bps` now calls the engine
+/// (`percolator::band_rent`), which the standalone `kani/growth` crate cannot resolve (it
+/// fails to compile at the base 64e52533 for that reason). WRITTEN, NOT RUN (design first, run
+/// ONCE on the final code): `cargo kani --features devnet --harness kani_g8_<name>`. Every
+/// harness carries `kani::cover!` for each branch; a verdict counts only with every cover
+/// SATISFIED. Inputs are bounded (u8 / u16 / u32 cast up) like `kani/growth`.
+#[cfg(kani)]
+mod g8_kani_proofs {
+    use crate::growth_v19::*;
+
+    /// I-1: `graduation_reset` zeroes c_launch and every depth field, puts the ceiling at
+    /// min(L_launch, L_tier) and stamps `now`.
+    /// Mutants: keep c_launch; ceil = l_launch (unclamped); ceil_slot = 0; keep depth_prev_e6.
+    #[kani::proof]
+    fn kani_g8_i1_reset_postconditions() {
+        let la: u16 = kani::any();
+        let lt: u16 = kani::any();
+        let now: u64 = kani::any();
+        let r = graduation_reset(la, lt, now);
+        assert_eq!(r.c_launch_atoms, 0);
+        assert_eq!(r.ceil_x100, la.min(lt));
+        assert!(r.ceil_x100 <= lt && r.ceil_x100 <= la);
+        assert_eq!(r.ceil_slot, now);
+        assert_eq!((r.depth_e6, r.depth_slot, r.depth_prev_e6, r.depth_source), (0, 0, 0, 0));
+        kani::cover!(la < lt, "launch below tier");
+        kani::cover!(la > lt, "launch above tier clamps");
+        kani::cover!(la == lt, "launch at tier");
+    }
+
+    /// The clamp predicate is exactly `switch ∧ band ≠ 0 ∧ derived G == stored r_gap`.
+    /// Mutants: drop the band test; drop the r_gap equality; treat `None` as a match.
+    #[kani::proof]
+    fn kani_g8_clamp_predicate_exact() {
+        let band: u16 = kani::any();
+        let stored: u16 = kani::any();
+        let derived: Option<u16> = kani::any();
+        let c = clamp_enforced(band as u64, stored, derived);
+        assert_eq!(c, EPOCH_CLAMP_ENFORCED && band != 0 && derived == Some(stored));
+        let tier: u8 = kani::any();
+        assert!(!graduation_on(false, band as u64, tier), "no clamp, no graduation");
+        if graduation_on(c, band as u64, tier) {
+            assert!(c && band != 0 && tier >= 1);
+        }
+        kani::cover!(c, "enforced");
+        kani::cover!(!c && band != 0 && derived.is_some(), "r_gap mismatch fails closed");
+        kani::cover!(!c && band != 0 && derived.is_none(), "underivable G fails closed");
+        kani::cover!(!c && band == 0, "off-band");
+    }
+
+    /// I-D3: attested depth never yields a tier above 1; any other source is tier 0.
+    /// Mutants: attested uncapped (raw tier); unknown source -> raw tier; threshold off by one.
+    #[kani::proof]
+    fn kani_g8_attested_capped_tier1() {
+        let d: u64 = kani::any();
+        let src: u8 = kani::any();
+        let t = depth_tier(d, src);
+        assert!(t <= 1);
+        if src != DEPTH_SOURCE_ATTESTED {
+            assert_eq!(t, 0);
+        } else {
+            assert_eq!(t == 1, d >= DEPTH_TIER1_E6);
+        }
+        kani::cover!(src == DEPTH_SOURCE_ATTESTED && d >= DEPTH_TIER3_E6 && t == 1, "tier-3 depth capped at 1");
+        kani::cover!(src == DEPTH_SOURCE_ATTESTED && d == DEPTH_TIER1_E6 - 1 && t == 0, "just below tier 1");
+        kani::cover!(src == 2 && d >= DEPTH_TIER3_E6 && t == 0, "unbuilt on-chain source fails closed");
+    }
+
+    /// I-D1: stale (> 150 slots), future-stamped or absent (either read 0) depth is effective 0,
+    /// hence tier 0, hence no graduation, a launch target, a ceiling in force <= launch and
+    /// λ_eff <= 1x; and no depth cap on N_cap (today's capacity).
+    /// Mutants: `age < 150` / `age <= 151`; future stamp treated fresh; max instead of min of the
+    /// two reads; stale depth not zeroed.
+    #[kani::proof]
+    fn kani_g8_depth_stale_fails_closed() {
+        let depth: u32 = kani::any();
+        let prev: u32 = kani::any();
+        let slot: u32 = kani::any();
+        let now: u32 = kani::any();
+        let (depth, prev, slot, now) = (depth as u64, prev as u64, slot as u64, now as u64);
+        let eff = effective_depth_e6(depth, prev, slot, now);
+        let stale = now < slot || now - slot > DEPTH_MAX_AGE_SLOTS || depth == 0 || prev == 0;
+        assert_eq!(eff == 0, stale || depth.min(prev) == 0);
+        if !stale {
+            assert_eq!(eff, depth.min(prev), "a one-push spike buys nothing");
+        }
+        let src: u8 = kani::any();
+        let tier = depth_tier(eff, src);
+        if stale {
+            assert_eq!(tier, 0);
+            let band: u16 = kani::any();
+            let clamp: bool = kani::any();
+            let g = graduation_on(clamp, band as u64, tier);
+            assert!(!g);
+            let la: u16 = kani::any();
+            let lt: u16 = kani::any();
+            let stored: u16 = kani::any();
+            let force: bool = kani::any();
+            let c_m: u16 = kani::any();
+            let c_l: u16 = kani::any();
+            let t = target_ceiling_x100(g, force, la, lt, l_depth_x100(tier, la), c_m as u128, c_l as u128);
+            assert_eq!(t, la.min(lt));
+            assert!(ceiling_in_force_x100(clamp, stored, t, la, lt) <= la.min(lt));
+            let lam: u32 = kani::any();
+            assert!(lambda_eff_bps(lam, tier) <= DEFAULT_LAMBDA_BPS);
+            assert_eq!(depth_cap_q(tier, eff, kani::any(), kani::any()), u128::MAX);
+        }
+        kani::cover!(now > slot && now - slot == DEPTH_MAX_AGE_SLOTS && eff != 0, "150 slots: still fresh");
+        kani::cover!(now > slot && now - slot == DEPTH_MAX_AGE_SLOTS + 1 && depth != 0 && prev != 0, "151 slots: stale");
+        kani::cover!(now < slot && depth != 0 && prev != 0, "future stamp fails closed");
+        kani::cover!(!stale && depth < prev, "min picks the new read");
+        kani::cover!(!stale && prev < depth, "min picks the previous read");
+    }
+
+    /// I-D2: the target is never above L_tier, never above max(launch, L_depth), never below
+    /// launch; the ratchet writer takes <= one +1x step per epoch and only after the epoch; with
+    /// c_launch == 0 it never climbs (and snapshots); the fall-only writer never rises.
+    /// Mutants: `max` for the depth `min`; step 200; `now > prev_slot` without the epoch;
+    /// climbing in the snapshot call; fall-only writer using `max`.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    #[kani::solver(cadical)]
+    fn kani_g8_ceiling_min_chain_and_ratchet() {
+        let grad: bool = kani::any();
+        let force: bool = kani::any();
+        let la: u16 = kani::any();
+        let lt: u16 = kani::any();
+        let tier: u8 = kani::any();
+        kani::assume(tier <= 3);
+        let ld = l_depth_x100(tier, la);
+        let c_m: u16 = kani::any();
+        let c_l: u16 = kani::any();
+        let launch = la.min(lt);
+        let t = target_ceiling_x100(grad, force, la, lt, ld, c_m as u128, c_l as u128);
+        assert!(t <= lt);
+        assert!(t >= launch);
+        assert!(t <= launch.max(ld));
+        if !grad || force {
+            assert_eq!(t, launch);
+        }
+        let prev: u16 = kani::any();
+        let ps: u32 = kani::any();
+        let now: u32 = kani::any();
+        let (out, slot, cl_out) = graduation_ratchet(
+            prev, ps as u64, c_l as u64, c_m as u128, grad, force, la, lt, ld, now as u64,
+        );
+        if out > prev {
+            assert!(out as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
+            assert!(now as u64 >= ps as u64 + RATCHET_EPOCH_SLOTS);
+            assert_eq!(slot, now as u64);
+            assert!(c_l != 0, "no climb in the snapshot call");
+        }
+        assert!(out <= prev.max(t).max(launch));
+        if c_l == 0 {
+            assert!(out <= prev.max(launch));
+            assert_eq!(cl_out == 0, c_m == 0);
+        } else {
+            assert_eq!(cl_out, c_l as u64);
+        }
+        let (f, fs) = graduation_fall_only(prev, ps as u64, c_l as u64, grad, force, la, lt, ld, now as u64);
+        assert!(f <= prev);
+        if f == prev {
+            assert_eq!(fs, ps as u64);
+        }
+        kani::cover!(grad && !force && t > launch && t < lt, "graduated between launch and tier");
+        kani::cover!(grad && !force && tier == 1 && t == ld && ld < lt, "capped at L_depth");
+        kani::cover!(out > prev, "one-step rise");
+        kani::cover!(out < prev, "immediate fall");
+        kani::cover!(c_l == 0 && c_m != 0 && cl_out != 0, "c_launch snapshot");
+        kani::cover!(f < prev, "fall-only writer falls");
+    }
+
+    /// I-D4: with a fresh depth N_cap <= κ·depth/P exactly (cross-multiplied); with none, N_cap
+    /// is the capital rule at λ_eff. Small widths (u16, POS_SCALE in {1, 10}).
+    /// Mutants: depth cap applied as `max`; κ for tier 0 = 1; depth cap skipped when fresh.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn kani_g8_ncap_le_kappa_depth_when_fresh() {
+        let c_m: u16 = kani::any();
+        let lam: u16 = kani::any();
+        let tier: u8 = kani::any();
+        kani::assume(tier <= 3);
+        let depth: u16 = kani::any();
+        let price: u16 = kani::any();
+        let ps10: bool = kani::any();
+        let ps: u128 = if ps10 { 10 } else { 1 };
+        let n = n_cap_g8_q(true, c_m as u128, lam as u32, tier, depth as u64, price as u64, ps);
+        if let Some(n) = n {
+            if depth != 0 {
+                // n * 1e4 * P <= depth * κ * POS_SCALE
+                let lhs = n * BPS * price as u128;
+                let rhs = depth as u128 * kappa_depth_bps(tier) as u128 * ps;
+                assert!(lhs <= rhs);
+            }
+            assert_eq!(
+                n_cap_q(c_m as u128, lambda_eff_bps(lam as u32, tier), price as u64, ps).map(|x| x >= n),
+                Some(true)
+            );
+        } else {
+            assert!(price == 0);
+        }
+        if depth == 0 {
+            assert_eq!(n, n_cap_q(c_m as u128, lambda_eff_bps(lam as u32, tier), price as u64, ps));
+        }
+        kani::cover!(depth != 0 && n.is_some_and(|x| x > 0) && n < n_cap_q(c_m as u128, lambda_eff_bps(lam as u32, tier), price as u64, ps), "depth cap binds");
+        kani::cover!(depth != 0 && n.is_some_and(|x| x > 0) && n == n_cap_q(c_m as u128, lambda_eff_bps(lam as u32, tier), price as u64, ps), "capital binds");
+        kani::cover!(depth == 0 && n.is_some_and(|x| x > 0), "no depth: capital rule");
+        kani::cover!(price == 0, "price 0 fails closed");
+    }
+
+    /// Off-band identity: with the clamp predicate false the ceiling in force is exactly
+    /// min(L_launch, L_tier), N_cap is exactly growth-1's `n_cap_q` at the STORED λ and the ext v3
+    /// caps are exactly `growth_matcher_caps`, whatever the depth, tier and stored ceiling.
+    /// Mutants: apply λ_eff off the clamp; apply the depth cap off the clamp; read the stored
+    /// ceiling off the clamp.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn kani_g8_off_band_identity() {
+        let stored: u16 = kani::any();
+        let tgt: u16 = kani::any();
+        let la: u16 = kani::any();
+        let lt: u16 = kani::any();
+        assert_eq!(ceiling_in_force_x100(false, stored, tgt, la, lt), la.min(lt));
+        let c_m: u16 = kani::any();
+        let lam: u16 = kani::any();
+        let tier: u8 = kani::any();
+        let depth: u16 = kani::any();
+        let price: u16 = kani::any();
+        assert_eq!(
+            n_cap_g8_q(false, c_m as u128, lam as u32, tier, depth as u64, price as u64, 1),
+            n_cap_q(c_m as u128, lam as u32, price as u64, 1)
+        );
+        let hl: bool = kani::any();
+        let mq: u16 = kani::any();
+        assert_eq!(
+            growth_matcher_caps_g8(hl, false, c_m as u128, lam as u32, tier, depth as u64, price as u64, 1, mq as u128),
+            growth_matcher_caps(hl, c_m as u128, lam as u32, price as u64, 1, mq as u128)
+        );
+        kani::cover!(stored > la.min(lt), "a graduated stored ceiling is ignored off-band");
+        kani::cover!(depth != 0 && lam > 10_000, "depth and λ > 1x ignored off-band");
+    }
+}
