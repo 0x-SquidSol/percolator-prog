@@ -28088,3 +28088,26 @@ fn ws2_close_slab_refuses_21_while_a_unitised_insurance_budget_remains() {
     let r = b.ws2_try_close_slab();
     assert!(r.as_ref().is_err_and(|e| e.contains("Custom(21)")), "budget without units -> 21: {r:?}");
 }
+
+/// v2.2 F1 static compute bound (ledger v22-f1-refresh-liquidation-2026-10-14, "regression found after
+/// deploy"): the refresh continues into liquidation only for shapes measured inside the 10% rule.
+/// 3 legs, worst shape (real liens on every domain + real ADL on every asset + pending funding): ONE
+/// crank refreshes AND liquidates, and that crank + the #287 hook + the fill event fits 1,260,000.
+/// 4 legs, same shape: the first crank is refresh-only (inside the budget on its own), and the SECOND
+/// crank liquidates (the legacy path, which keeper 12072fc sends). Negative control: f6e7180d (no
+/// bound) ran the 4-leg shape as one 1,386,624 CU crank.
+#[test]
+fn v22_f1_static_bound_keeps_the_worst_shapes_inside_the_budget() {
+    let (settle3, liq3, _, failed3) = x1h_shape(3, true, true, 0, false);
+    println!("F1BOUND n=3 settle={settle3} liq={liq3}");
+    assert!(!failed3);
+    assert_eq!(settle3, 0, "3 legs: the refresh must continue into the liquidation (no settle-only call)");
+    assert!(liq3 > 0);
+    assert!(liq3 + X1_STRANDED_BACKING_CU + X1_FILL_EVENT_CU <= X1_CRANK_CU_LIMIT, "3 legs: {liq3} + hook + fill event exceeds {X1_CRANK_CU_LIMIT}");
+    let (settle4, liq4, _, failed4) = x1h_shape(4, true, true, 0, false);
+    println!("F1BOUND n=4 settle={settle4} liq={liq4}");
+    assert!(!failed4);
+    assert!(settle4 > 0, "4 legs: the first crank must be refresh-only (outside the static bound)");
+    assert!(liq4 > 0, "4 legs: the second crank must still liquidate");
+    assert!(settle4 + X1_STRANDED_BACKING_CU <= X1_CRANK_CU_LIMIT && liq4 + X1_FILL_EVENT_CU <= X1_CRANK_CU_LIMIT);
+}

@@ -3482,7 +3482,9 @@ fn a5_explore_real_chunked_bankruptcy() {
             break;
         }
     }
-    assert_eq!(modes, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery -> Resolved within 3 cranks: {modes:?}");
+    // v2.2 F1: the bust's FIRST crank now refreshes AND takes the liquidation step (equity <= 0 always
+    // continues), which declares Recovery; the next finalises it. Same path, one crank earlier.
+    assert_eq!(modes, vec!["Recovery", "Resolved"], "Live -> Recovery -> Resolved within 2 cranks: {modes:?}");
     let _ = bk;
 }
 
@@ -3524,11 +3526,13 @@ fn wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes() {
     let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
     assert_eq!(mode(&r), "Live", "non-vacuity: Live before the bust crank");
     let mut seen = vec![];
-    for _ in 0..3 {
+    // v2.2 F1: the first crank refreshes AND declares Recovery (its follow-on liquidation step); the
+    // second finalises. The sequence is the same, one crank earlier.
+    for _ in 0..2 {
         r.crank_pf(bp);
         seen.push(mode(&r));
     }
-    assert_eq!(seen, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery (declared) -> Resolved (finalised): {seen:?}");
+    assert_eq!(seen, vec!["Recovery", "Resolved"], "Live -> Recovery (declared) -> Resolved (finalised): {seen:?}");
     // the Live-style crank is refused on a terminal market: this is the Custom(14) the Wave A
     // exploration read as a wedge
     let payer = r.env.payer.pubkey();
@@ -3734,15 +3738,21 @@ fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     r.trade(&bk, bp, qb).expect("levered long");
     r.request_76(&h, h_ata, None).expect("H 76");
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
+    // v2.2 F1: the bust's crank now refreshes AND takes the liquidation step (equity <= 0 always
+    // continues), whose residual exceeds a single step: the market goes Live -> Recovery in this crank
+    // (`a5_explore_real_chunked_bankruptcy`). The Live-with-pending-deficit window this test used to
+    // probe no longer exists for a tag-5 crank; the property under test is unchanged: with the loss
+    // unabsorbed (now in Recovery) the redeemer-signed exit is refused 118 and nothing moves.
     r.crank_pf(bp);
     eprintln!("A5 real: {}", r.loss_snapshot());
     let (_, g) = r.env.market_state();
-    assert!(g.negative_pnl_account_count > 0, "non-vacuity: an unabsorbed deficit is pending");
-    assert_eq!(format!("{:?}", g.mode), "Live", "the exit is attempted while the market is still Live");
+    assert_eq!(format!("{:?}", g.mode), "Recovery", "F1: the bust's crank declared Recovery");
     assert!(!r.no_genuine_loss_now());
     let before = r.exit_state(&h.pubkey());
     let res = r.execute_77(&h, None, true);
-    assert_eq!(code(&res), Some(ERR_NOT_LOSS_CURRENT), "A5 real: {res:?}");
+    // v2.2 F1: in Recovery the exit is refused one gate earlier, by the engine lock (21
+    // EngineLockActive), not by the loss-current gate (118): no exit of any kind, so no dip fallback.
+    assert_eq!(code(&res), Some(21), "A5 real: {res:?}");
     assert_eq!(r.exit_state(&h.pubkey()), before);
 }
 
@@ -4091,12 +4101,17 @@ fn a6_liquidating_refreshes_cu(legs: &[u16]) -> u64 {
         tr.push(p);
     }
     let lp = r.lp;
-    walk_only(&mut r, 850_000, &[lp]);
+    // v2.2 F1: cross maintenance with a DUST shortfall (see `walk_to_dust_crossing`): the refreshes stay
+    // refresh-only, so the 77's inline refreshes still meet a current, liquidatable certificate.
+    walk_to_dust_crossing(&mut r, &tr, lp);
     r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
     r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
     crank_all(&mut r);
     // one plain refresh each first: with a CURRENT certificate the engine plan selects Liquidate for the
     // inline refresh of the 77 (with a stale one it only refreshes)
+    // v2.2 F1: a dust shortfall does not continue into liquidation; one that grew material during the
+    // cooldown is liquidated here by its refresh (measured: one cap-leg trader). The test needs at least
+    // one INLINE liquidation in the 77 (asserted below). The tag-77 prelude itself has no follow-on.
     for p in &tr {
         r.crank_pf(*p);
     }
@@ -4128,4 +4143,45 @@ fn a6_liquidating_mix_of_cap_and_single_leg_refreshes_cu() {
     let cap = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
     let cu = a6_liquidating_refreshes_cu(&[cap, cap, 1, 1, 1]);
     eprintln!("A6-LIQ 2 x cap + 3 x 1-leg: {cu} CU");
+}
+
+/// v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): walk asset 0 down until some trader is
+/// first certified below maintenance, crossing in 0.2 bp steps at the end so the shortfall is DUST
+/// (< 0.5% of the requirement): the tag-5 refresh then does NOT continue into liquidation and the
+/// certificate stays current and liquidatable (the precondition A6 needs; since F1 a material
+/// shortfall is liquidated by the refresh itself). Coarse steps use each trader's own certificate:
+/// a price fall of d (fraction) on asset-0 notional N moves equity by -N d and the requirement by
+/// -mmr N d, so it crosses at d* = (E - R) / (N (1 - mmr)); steps stay at half of d*. Panics if the
+/// setup ever liquidates (positions are checked after every refresh).
+fn walk_to_dust_crossing(r: &mut Replay, tr: &[Pubkey], lp: Pubkey) {
+    let mmr = r.lm.params.maintenance_margin_bps as f64 / 10_000.0;
+    let total = |r: &Replay, p: Pubkey| r.env.portfolio_state(p).legs.iter().map(|l| l.basis_pos_q.unsigned_abs()).sum::<u128>();
+    let pos0: Vec<u128> = tr.iter().map(|p| total(r, *p)).collect();
+    for _ in 0..2_000 {
+        for p in tr {
+            r.crank_pf(*p);
+        }
+        for (p, b) in tr.iter().zip(pos0.iter()) {
+            assert_eq!(total(r, *p), *b, "setup liquidated {p} (shortfall was not dust)");
+        }
+        if tr.iter().any(|p| r.env.portfolio_state(*p).health_cert.certified_liq_deficit != 0) {
+            return;
+        }
+        let eff = r.env.market_state().1.assets[0].effective_price;
+        let mut d_star = f64::MAX;
+        for p in tr {
+            let st = r.env.portfolio_state(*p);
+            let q0 = st.legs.iter().find(|l| l.active && l.asset_index == 0).map(|l| l.basis_pos_q.unsigned_abs()).unwrap_or(0);
+            let n0 = q0 as f64 * eff as f64 / percolator::POS_SCALE as f64;
+            let c = st.health_cert;
+            let head = c.certified_equity as f64 - c.certified_maintenance_req as f64;
+            if n0 > 0.0 {
+                d_star = d_star.min(head / (n0 * (1.0 - mmr)));
+            }
+        }
+        let step = (d_star * 0.5).clamp(0.000_02, 0.02);
+        let target = ((eff as f64) * (1.0 - step)).floor() as u64;
+        walk_only(r, target.min(eff - 1), &[lp]);
+    }
+    panic!("walk_to_dust_crossing did not cross");
 }

@@ -68,6 +68,11 @@ pub mod lp_share_meta_v22;
 /// PushAuthMark depth mode 2, PDA kind 16). Pure parsers, pin check and depth math.
 pub mod depth_src_v22;
 
+/// v2.2 F1 (2026-10-14): a crank's refresh of an account left below maintenance continues into
+/// one liquidation step in the same instruction. Pure decision kernel + Kani harnesses. See
+/// `~/percolator-ops/ledger/v22-f1-refresh-liquidation-2026-10-14.md`.
+pub mod f1_refresh_liq_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -28813,7 +28818,7 @@ pub mod processor {
         observation_hints: &[CrankObservationHint],
         max_market_slots: usize,
         s10_refresh_budget: bool,
-    ) -> ProgramResult {
+    ) -> Result<Option<CrankStepReport>, ProgramError> {
         // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation). Full rewrite: the caller
         // no longer picks the action/asset -- it supplies a bounded set of raw-evidence hints and
         // the engine's `AutoCrankPlanV16` selector (already byte-identical to upstream in our
@@ -28864,6 +28869,7 @@ pub mod processor {
         // v2.2 fill events: (asset, asset generation, signed change of the effective position,
         // price) of a liquidation this crank performed. Emitted at the very end.
         let mut liq_event: Option<(u16, u64, i128, u64)> = None;
+        let f1_report;
         let cfg_after;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -28915,7 +28921,7 @@ pub mod processor {
                 group.validate_shape().map_err(map_v16_error)?;
                 // `cfg` is untouched on this path, so there is nothing to write back
                 // (upstream returns here the same way).
-                return Ok(());
+                return Ok(None);
             }
 
             // H-lock liveness (independent lane, P3 blocker): ADOPT upstream's expired
@@ -28966,7 +28972,7 @@ pub mod processor {
                             return Err(PercolatorError::InvalidInstruction.into());
                         }
                         group.validate_shape().map_err(map_v16_error)?;
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -29187,7 +29193,7 @@ pub mod processor {
                 group.validate_shape().map_err(map_v16_error)?;
                 drop(group);
                 state::write_wrapper_config(&mut market_data, &cfg)?;
-                return Ok(());
+                return Ok(None);
             }
 
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
@@ -29327,6 +29333,20 @@ pub mod processor {
                     return Err(PercolatorError::VaultLpSeniorDrawRequired.into());
                 }
             }
+            // v2.2 F1: what this step was, for the tag-5 follow-on decision (see
+            // `handle_permissionless_crank`). Only a Refresh that certified the account qualifies.
+            f1_report = CrankStepReport {
+                certified_refresh: matches!(
+                    result.as_ref(),
+                    Some(percolator::AutoCrankResultV16 {
+                        selected: AutoCrankPlanV16::RefreshAccount { .. },
+                        outcome: AutoCrankOutcomeV16::Progressed(
+                            percolator::PermissionlessProgressOutcomeV16::AccountCurrent
+                        ),
+                    })
+                ),
+                cranker_in_tail: cranker_portfolio_ai.is_some(),
+            };
             // Adaptation (5): defer 2f0c809d -- this fork's `CloseResolved` (tag 30) is the only
             // sanctioned closer. Guard against the unified call ever landing a `ResolvedClose`
             // outcome through this general path (upstream carries the identical guard).
@@ -29490,7 +29510,7 @@ pub mod processor {
                 price,
             );
         }
-        Ok(())
+        Ok(Some(f1_report))
     }
 
     /// v2.2 fill events: the ADL-effective signed size of one leg slot, read straight from the
@@ -29693,17 +29713,171 @@ pub mod processor {
         // Resolved-mode `PermissionlessCrank` call falls through to the zero-copy
         // handler below exactly as it did before this port, and hits the
         // `ResolvedClose` outcome guard there.
-        handle_permissionless_crank_zero_copy(
+        let tail = accounts.get(3..).unwrap_or(&[]);
+        let report = handle_permissionless_crank_zero_copy(
             program_id,
             owner,
             market_ai,
             portfolio_ai,
-            accounts.get(3..).unwrap_or(&[]),
+            tail,
             now_slot,
             observation_hints.as_slice(),
             max_market_slots,
             true,
+        )?;
+        // v2.2 F1: a refresh that left the account below maintenance continues into ONE
+        // liquidation step in this instruction. The step is the same public crank run once more
+        // with no observations -- byte for byte the second instruction of the legacy
+        // `[refresh T, crank T]` transaction -- so the engine's own plan selector picks its
+        // existing `Liquidate` step (engine-sized partial close, config fee) and every wrapper
+        // gate, fee split, cranker reward, event and vault-LP rule applies exactly as there.
+        // Bounded: decided once, here, outside the handler; the follow-on cannot recurse.
+        if let Some(report) = report {
+            if report.certified_refresh
+                && f1_follow_on_wanted(program_id, market_ai, portfolio_ai, max_market_slots, now_slot)?
+            {
+                // The cranker reward account (if the first step took one) is the tail's last
+                // account; the oracle accounts were for the observations, which the follow-on
+                // does not carry.
+                let follow_tail: &[AccountInfo<'a>] = if report.cranker_in_tail {
+                    tail.get(tail.len().saturating_sub(1)..).unwrap_or(&[])
+                } else {
+                    &[]
+                };
+                handle_permissionless_crank_zero_copy(
+                    program_id,
+                    owner,
+                    market_ai,
+                    portfolio_ai,
+                    follow_tail,
+                    now_slot,
+                    &[],
+                    max_market_slots,
+                    true,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// v2.2 F1: what one unified crank step did, for the tag-5 follow-on decision.
+    #[derive(Clone, Copy)]
+    struct CrankStepReport {
+        /// The engine selected `RefreshAccount` and it certified the account (`AccountCurrent`).
+        certified_refresh: bool,
+        /// The step split a reward-eligible cranker portfolio off the END of the tail.
+        cranker_in_tail: bool,
+    }
+
+    /// v2.2 F1: gather the decision inputs (read-only) after the first step and ask the kernel.
+    #[inline(never)]
+    fn f1_follow_on_wanted(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'_>,
+        portfolio_ai: &AccountInfo<'_>,
+        max_market_slots: usize,
+        now_slot: u64,
+    ) -> Result<bool, ProgramError> {
+        let _ = program_id;
+        let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
+        let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+        let portfolio =
+            state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+        expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+        // Cheap exit for the common case (healthy account, or a dust shortfall): the certificate the
+        // refresh just wrote. The kernel requires a nonzero deficit AND a material shortfall, so
+        // nothing below can change a `false` here; it only spares the market view and the summary
+        // (measured: ~14-27k CU per healthy refresh without it).
+        let raw_cert = &portfolio.header.health_cert;
+        if raw_cert.certified_liq_deficit.get() == 0
+            || !crate::f1_refresh_liq_v22::shortfall_material(
+                raw_cert.certified_equity.get(),
+                raw_cert.certified_maintenance_req.get(),
+            )
+        {
+            return Ok(false);
+        }
+        // The static compute bound, also before the market view (a large account outside the
+        // bound pays only these reads; its legacy second crank liquidates it).
+        let active_legs: u8 = percolator::active_bitmap_count_ones(
+            portfolio.header.active_bitmap.map(percolator::V16PodU64::get),
         )
+        .min(u8::MAX as u32) as u8;
+        let occupied_source_domains: u8 = portfolio
+            .header
+            .source_domains
+            .iter()
+            .filter(|d| d.is_occupied())
+            .count()
+            .min(u8::MAX as usize) as u8;
+        if !crate::f1_refresh_liq_v22::shape_within_budget(active_legs, occupied_source_domains) {
+            return Ok(false);
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Ok(false);
+        }
+        let summary = group
+            .build_actionable_summary_at_slot(&portfolio.as_view(), authenticated_now_slot)
+            .map_err(map_v16_error)?;
+        if !summary.liquidatable {
+            // The common case (healthy account): nothing else is read.
+            return Ok(false);
+        }
+        let cert = portfolio
+            .header
+            .health_cert
+            .try_to_runtime()
+            .map_err(map_v16_error)?;
+        let vault_lp = match market_bound_vault_asset(&group)? {
+            Some(i) => read_asset_vault_lp_from_view(&group, i)?.vault_lp_portfolio
+                == portfolio_ai.key.to_bytes(),
+            None => false,
+        };
+        let mut band_on = false;
+        let mut legs_reducible = true;
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = &portfolio.header.legs[slot];
+            slot += 1;
+            if leg.active != 1 {
+                continue;
+            }
+            let idx = leg.asset_index.get() as usize;
+            let Some(m) = group.markets.get(idx) else {
+                legs_reducible = false;
+                continue;
+            };
+            let asset = &m.engine.asset;
+            band_on |= asset.band_epoch.get() != 0;
+            let eff_nonzero = matches!(leg_slot_effective_signed_q(&group, leg), Some((_, q)) if q != 0);
+            legs_reducible &= eff_nonzero
+                && asset.oi_eff_long_q.get() != 0
+                && asset.oi_eff_short_q.get() != 0
+                && m.engine.pending_domain_loss_barrier_long.get() == 0
+                && m.engine.pending_domain_loss_barrier_short.get() == 0;
+        }
+        let inputs = crate::f1_refresh_liq_v22::F1Inputs {
+            first_step_certified_refresh: true,
+            steps_taken: 0,
+            live: true,
+            engine_liquidatable: summary.liquidatable,
+            b_stale: summary.b_stale,
+            pending_close: summary.pending_close,
+            expired_close: summary.expired_close,
+            recovery_eligible: summary.recovery_eligible,
+            resolved_winner: summary.resolved_winner,
+            certified_equity: cert.certified_equity,
+            certified_maintenance_req: cert.certified_maintenance_req,
+            certified_liq_deficit: cert.certified_liq_deficit,
+            band_on,
+            vault_lp,
+            legs_reducible,
+            active_legs,
+            occupied_source_domains,
+        };
+        Ok(crate::f1_refresh_liq_v22::follow_on_liquidation(&inputs))
     }
 
     // ── Fork LP Vault handlers (tags 74-80) ─────────────────────────────────
@@ -30731,7 +30905,8 @@ pub mod processor {
                     max_market_slots,
                     false, // S10: a redemption's inline refreshes carry no move budget
                 ) {
-                    Ok(()) => {}
+                    // v2.2 F1: the tag-77 prelude refreshes only; no follow-on liquidation here.
+                    Ok(_) => {}
                     Err(e) if e == ProgramError::from(PercolatorError::EngineNonProgress) => {}
                     Err(e) => return Err(e),
                 }
