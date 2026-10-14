@@ -8,7 +8,8 @@
 use percolator_prog::growth_v19::*;
 use proptest::prelude::*;
 
-/// MUTANT (I-D3): attested depth uncapped.
+/// MUTANT (I-D3): attested depth uncapped. (Also the reference raw tier of the on-chain DEX
+/// source, which is uncapped by design.)
 fn tier_mutant_uncapped(d: u64) -> u8 {
     if d >= DEPTH_TIER3_E6 {
         3
@@ -35,17 +36,22 @@ fn eff_mutant_151(d: u64, p: u64, s: u64, now: u64) -> u64 {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4_096))]
 
-    /// I-D3 + I-D1: tier <= 1 for every attested depth; 0 for every other source; effective
-    /// depth is min of the two reads when fresh, else 0.
+    /// I-D3 + I-D1: tier <= 1 for every attested depth; the raw tier for the on-chain DEX
+    /// source (2, round 2 R2.1 item 4); 0 for every other source; effective depth is min of
+    /// the two reads when fresh, else 0.
     #[test]
     fn tiers_and_freshness(d in any::<u64>(), p in any::<u64>(), s in any::<u64>(), now in any::<u64>(), src in any::<u8>()) {
         let eff = effective_depth_e6(d, p, s, now);
         let fresh = d != 0 && p != 0 && now >= s && now - s <= DEPTH_MAX_AGE_SLOTS;
         prop_assert_eq!(eff, if fresh { d.min(p) } else { 0 });
         let t = depth_tier(eff, src);
-        prop_assert!(t <= 1);
-        if src != DEPTH_SOURCE_ATTESTED || eff < DEPTH_TIER1_E6 { prop_assert_eq!(t, 0); }
-        prop_assert!(lambda_eff_bps(any_lambda(d), t) <= DEFAULT_LAMBDA_BPS);
+        if src == DEPTH_SOURCE_DEX {
+            prop_assert_eq!(t, tier_mutant_uncapped(eff));
+        } else {
+            prop_assert!(t <= 1);
+            if src != DEPTH_SOURCE_ATTESTED || eff < DEPTH_TIER1_E6 { prop_assert_eq!(t, 0); }
+            prop_assert!(lambda_eff_bps(any_lambda(d), t) <= DEFAULT_LAMBDA_BPS);
+        }
     }
 
     /// I-D2: target in [launch, min(L_tier, max(launch, L_depth))]; off graduation or forced it
