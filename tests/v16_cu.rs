@@ -27989,3 +27989,102 @@ fn v22_p1_compute_of_the_three_crank_trade_at_the_cap() {
         assert_eq!(x1g_legs(&env, long), if size_q < 0 { cap as u32 - 1 } else { cap as u32 });
     }
 }
+
+// ---------------------------------------------------------------------------
+// W-S2 (v2.2 growth overnight, stake builder finding): CloseSlab does not read the item-6
+// `InsuranceUnitsV20` ledger; it is safe only because the terminal retirement refuses with
+// EngineLockActive (21) while an insurance domain budget remains. Pin it.
+// ---------------------------------------------------------------------------
+
+impl V16CuEnv {
+    fn ws2_init_units(&mut self) -> Result<u64, String> {
+        let units = state::derive_insurance_units(&self.program_id, &self.market).0;
+        send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::InitInsuranceUnits,
+            vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(units, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[],
+        )
+    }
+
+    fn ws2_try_close_slab(&mut self) -> Result<u64, String> {
+        let dest = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, self.admin.pubkey(), 0),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let authority_epoch = self.control_sequences(0).authority_epoch;
+        self.svm.expire_blockhash();
+        send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::CloseSlab { authority_epoch },
+            vec![
+                AccountMeta::new(self.admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&self.admin],
+        )
+    }
+}
+
+/// A single-asset market whose asset-0 insurance is unitised (tag 116 after a tag-9 top-up),
+/// resolved with no portfolio: CloseSlab refuses with 21 while the unit holders' budget remains
+/// (the units ledger, the vault and the market are untouched). Controls: the same market with
+/// NO top-up (no budget, units ledger at genesis 0) closes; and a top-up WITHOUT units is
+/// refused the same way (the refusal is the budget rule, not something units-specific).
+#[test]
+fn ws2_close_slab_refuses_21_while_a_unitised_insurance_budget_remains() {
+    let top_up = 5 * percolator_prog::p4_rescue_ins::INS_UNITS_GENESIS_MIN_ATOMS;
+    let mut env = V16CuEnv::new();
+    env.top_up_insurance(top_up);
+    env.ws2_init_units().expect("tag 116 on a single-asset market");
+    let units_key = state::derive_insurance_units(&env.program_id, &env.market).0;
+    let units0 = state::read_insurance_units(&env.svm.get_account(&units_key).unwrap().data).unwrap();
+    assert_eq!(units0.units_total, top_up, "genesis units == the funded budget");
+    env.resolve();
+    let (_, g) = env.market_state();
+    assert!(g.insurance_domain_budget_remaining_total > 0, "vacuity: a budget remains");
+    let market0 = env.svm.get_account(&env.market).unwrap();
+    let vault0 = env.svm.get_account(&env.vault).unwrap();
+    let r = env.ws2_try_close_slab();
+    assert!(r.as_ref().is_err_and(|e| e.contains("Custom(21)")), "budget outstanding -> 21: {r:?}");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market0.data, "market untouched");
+    assert_eq!(env.svm.get_account(&env.vault).unwrap().data, vault0.data, "vault untouched");
+    assert_eq!(
+        state::read_insurance_units(&env.svm.get_account(&units_key).unwrap().data).unwrap(),
+        units0,
+        "units ledger untouched"
+    );
+    // Control 1: no top-up, no budget -> the close proceeds.
+    let mut c = V16CuEnv::new();
+    c.ws2_init_units().expect("tag 116 on an empty fund");
+    c.resolve();
+    c.ws2_try_close_slab().expect("no budget: CloseSlab closes");
+    // Control 2: a budget without units is refused the same way (the rule is the budget).
+    let mut b = V16CuEnv::new();
+    b.top_up_insurance(top_up);
+    b.resolve();
+    let r = b.ws2_try_close_slab();
+    assert!(r.as_ref().is_err_and(|e| e.contains("Custom(21)")), "budget without units -> 21: {r:?}");
+}

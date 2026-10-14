@@ -1139,3 +1139,132 @@ fn p1_w1_burned_asset_admin_creator_pot_rebooked_to_protocol() {
         "conservation to the atom"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. W-S1 (v2.2 growth overnight, stake builder finding): a BOUND pool that is owed nothing
+//    (v5 FEE_ONLY) must not wedge CloseSlab on the staker leg.
+// ─────────────────────────────────────────────────────────────────────────────
+impl Env {
+    /// STATE POKE of the crafted stake pool (owned by the stake program): v5 `risk_mode` @408.
+    fn set_pool_risk_mode(&mut self, risk_mode: u8) {
+        let mut a = self.svm.get_account(&self.pool_pda).unwrap();
+        a.data[408] = risk_mode;
+        self.svm.set_account(self.pool_pda, a).unwrap();
+    }
+
+    /// CloseSlab with the stake pool appended (read-only). On a stake-owned market the pool is
+    /// the signer `[0]` itself (stake tag 30 `AdminCloseSlab`, `marketauth` = pool PDA); here
+    /// the creator is `marketauth`, so the pool rides at the end of the list.
+    fn close_slab_with_pool(&mut self) -> Result<(), TransactionError> {
+        let admin = self.admin.insecure_clone();
+        let dest = self.new_token_account(admin.pubkey(), 0);
+        let authority_epoch = self.authority_epoch(0);
+        self.send(
+            ProgInstruction::CloseSlab { authority_epoch }.encode(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+                AccountMeta::new(self.mint, false),
+                AccountMeta::new_readonly(self.pool_pda, false),
+            ],
+            &[&admin],
+        )
+    }
+}
+
+/// A FEE_ONLY pool bound to the market: trades fed the staker leg, tag 87 refuses it forever
+/// (59), and before W-S1 CloseSlab refused forever with 71 (the re-book only orphaned the leg
+/// when `insurance_authority` was NOT the pool). Now CloseSlab, given the pool, re-books that
+/// leg onto the protocol leg (tag 84 claims it); value is conserved to the atom and nothing is
+/// burned. NEGATIVE CONTROL in-test: without the pool account the leg still wedges (71).
+#[test]
+fn ws1_fee_only_bound_pool_staker_leg_rebooks_to_protocol_then_closes() {
+    let mut e = Env::build(true, false);
+    e.set_pool_risk_mode(0); // v5 RISK_MODE_FEE_ONLY
+    let (mut env, fees) = terminal_empty_market_with_fees_in(e);
+    let supply0 = env.mint_supply();
+    assert_custom(env.withdraw_to_stake(), 59, "tag 87 refuses a FEE_ONLY pool (StakePoolModeMismatch)");
+    let d = env.withdraw_protocol_fee().expect("tag 84");
+    let mut protocol_claimed = env.token_amount(d) as u128;
+    let creator_owed = env.legs().creator_owed();
+    let d = env.withdraw_creator_fee(creator_owed).expect("tag 90");
+    let creator_claimed = env.token_amount(d) as u128;
+    // Without the pool: LP leg -> staker leg (as before), then the staker leg wedges (71).
+    let legs0 = env.legs();
+    let (res, _) = env.close_slab();
+    res.expect("re-book step: LP leg onto the staker leg");
+    let legs1 = env.legs();
+    let ins_owed = legs1.ins_accrued - legs1.ins_withdrawn;
+    assert!(ins_owed > 0 && legs1.lp_withdrawn == legs1.lp_accrued);
+    let (res, _) = env.close_slab();
+    assert_custom(res, 71, "control: without the pool account the FEE_ONLY staker leg still wedges");
+    assert_eq!(env.legs(), legs1, "the refused close moved nothing");
+    // With the pool: the staker leg is orphaned -> protocol leg; Ok, not closed, no tokens move.
+    let vault_before = env.token_amount(env.vault);
+    env.close_slab_with_pool().expect("W-S1 re-book step");
+    assert!(!env.market_closed());
+    let legs2 = env.legs();
+    assert_eq!(legs2.ins_withdrawn, legs2.ins_accrued, "staker leg re-booked");
+    assert_eq!(legs2.protocol_accrued, legs1.protocol_accrued + ins_owed, "onto the protocol leg");
+    assert_eq!(env.token_amount(env.vault), vault_before, "a re-book moves no tokens");
+    // Owed total (accrued - withdrawn over the four legs) is unchanged by the re-book.
+    let owed = |l: &Legs| {
+        (l.protocol_accrued - l.protocol_withdrawn)
+            + (l.lp_accrued - l.lp_withdrawn)
+            + (l.ins_accrued - l.ins_withdrawn)
+            + l.creator_owed()
+    };
+    assert_eq!(owed(&legs2), owed(&legs1), "only re-labelled");
+    let _ = legs0;
+    // The protocol claims it; then the close succeeds and burns nothing.
+    let d = env.withdraw_protocol_fee().expect("tag 84 (re-booked staker leg)");
+    let second = env.token_amount(d) as u128;
+    assert_eq!(second, ins_owed);
+    protocol_claimed += second;
+    assert_eq!(env.token_amount(env.vault), 0);
+    let (res, dest) = env.close_slab();
+    res.expect("CloseSlab after every leg is claimed");
+    assert!(env.market_closed());
+    assert_eq!(env.mint_supply(), supply0, "nothing burned");
+    assert_eq!(env.token_amount(dest), 0);
+    assert_eq!(fees, protocol_claimed + creator_claimed, "conservation to the atom");
+}
+
+/// NEGATIVE CONTROLS for W-S1: the re-book fires ONLY for a validated pool that is owed
+/// nothing. A FIRST_LOSS pool (owed the leg: tag 87 pays it) and a forged "pool" at the PDA
+/// key owned by another program are both ignored: CloseSlab keeps refusing with 71 and no leg
+/// moves; tag 87 still pays the FIRST_LOSS pool.
+#[test]
+fn ws1_first_loss_or_forged_pool_is_not_rebooked() {
+    let (mut env, _fees) = terminal_empty_market_with_fees_in(Env::build(true, false));
+    env.withdraw_protocol_fee().expect("tag 84");
+    let creator_owed = env.legs().creator_owed();
+    env.withdraw_creator_fee(creator_owed).expect("tag 90");
+    // FIRST_LOSS pool passed to CloseSlab: no orphaning of the staker leg (the LP leg -> staker
+    // fold is the pre-existing P1 step and may run first).
+    env.close_slab_with_pool().expect("P1 step: LP leg onto the staker leg");
+    assert!(!env.market_closed());
+    let legs1 = env.legs();
+    assert!(legs1.ins_accrued > legs1.ins_withdrawn, "FIRST_LOSS: the staker leg is still owed");
+    let protocol1 = legs1.protocol_accrued;
+    assert_custom(env.close_slab_with_pool(), 71, "FIRST_LOSS pool: the leg waits for tag 87");
+    assert_eq!(env.legs().protocol_accrued, protocol1, "nothing re-booked to protocol");
+    // Forged: same PDA key and bytes (FEE_ONLY) but owned by the system program.
+    let mut a = env.svm.get_account(&env.pool_pda).unwrap();
+    let real = a.clone();
+    a.data[408] = 0;
+    a.owner = solana_sdk::system_program::ID;
+    env.svm.set_account(env.pool_pda, a).unwrap();
+    assert_custom(env.close_slab_with_pool(), 71, "forged pool (wrong owner) ignored");
+    assert_eq!(env.legs(), legs1);
+    // Control: the real FIRST_LOSS pool is paid by tag 87, then the close proceeds.
+    env.svm.set_account(env.pool_pda, real).unwrap();
+    env.withdraw_to_stake().expect("tag 87 pays the FIRST_LOSS pool");
+    let (res, _) = env.close_slab();
+    res.expect("CloseSlab once the staker leg is paid");
+    assert!(env.market_closed());
+}

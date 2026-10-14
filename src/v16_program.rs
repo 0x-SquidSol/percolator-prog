@@ -23366,6 +23366,53 @@ pub mod processor {
         pool_ai: &AccountInfo,
         bound_insurance_authority: &[u8; 32],
     ) -> Result<(Pubkey, Pubkey), ProgramError> {
+        let pool = read_bound_stake_pool(program_id, market_ai, pool_ai, bound_insurance_authority)?;
+        // (8) Insurance-LP mode only. That is the mode whose stakers absorb
+        // this market's losses via `FlushToInsurance`; this fee leg is their
+        // compensation for exactly that exposure. Paying it to a pool that
+        // carries no such exposure would be an unearned transfer.
+        // (8b) v5: FIRST_LOSS only (Phase 4 item 6: "the 16% staker fee leg is paid only to
+        // first-loss pools").
+        if !pool.owed_staker_leg() {
+            return Err(PercolatorError::StakePoolModeMismatch.into());
+        }
+        // `vault_authority` was proven equal to the bound `insurance_authority` in (3);
+        // returning it lets the caller assert the destination token account's SPL owner is
+        // that same PDA.
+        Ok((pool.vault, pool.vault_authority))
+    }
+
+    /// A validated bound stake pool (`read_bound_stake_pool`, steps (0)-(7)).
+    #[derive(Clone, Copy)]
+    struct BoundStakePool {
+        /// (9) The pool's SPL vault, read out of the validated pool.
+        vault: Pubkey,
+        /// The pool's `vault_auth` PDA, proven equal to the bound `insurance_authority` (3).
+        vault_authority: Pubkey,
+        /// `StakePool::pool_mode` (@280).
+        pool_mode: u8,
+        /// v5 `StakePool::risk_mode` (@408).
+        risk_mode: u8,
+    }
+
+    impl BoundStakePool {
+        /// Steps (8) + (8b): is this pool owed the staker fee leg (tag 87 pays it)?
+        /// Insurance-LP mode AND v5 FIRST_LOSS; any other pool is owed nothing.
+        fn owed_staker_leg(&self) -> bool {
+            self.pool_mode == crate::constants::STAKE_POOL_MODE_INSURANCE_LP
+                && self.risk_mode == crate::constants::STAKE_POOL_RISK_MODE_FIRST_LOSS
+        }
+    }
+
+    /// Steps (0)-(7) of `load_bound_stake_pool` (the pin, the owner, the bound `vault_auth`, the
+    /// pool PDA, layout, slab, wrapper program), shared by tag 87 and CloseSlab's orphaned-leg
+    /// re-book (W-S1). Reads only: the pool's bytes are trusted only after every check passes.
+    fn read_bound_stake_pool(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo,
+        pool_ai: &AccountInfo,
+        bound_insurance_authority: &[u8; 32],
+    ) -> Result<BoundStakePool, ProgramError> {
         // (0) THE PIN. On a build with no pinned stake program id (i.e. any
         // non-`devnet` build — v17 percolator-stake has no mainnet deployment)
         // there is no program we are willing to send tokens to, so refuse
@@ -23464,32 +23511,19 @@ pub mod processor {
             if cpi_target != program_id.to_bytes() {
                 return Err(PercolatorError::StakePoolWrapperMismatch.into());
             }
-            // (8) Insurance-LP mode only. That is the mode whose stakers absorb
-            // this market's losses via `FlushToInsurance`; this fee leg is their
-            // compensation for exactly that exposure. Paying it to a pool that
-            // carries no such exposure would be an unearned transfer.
-            if data[crate::constants::STAKE_POOL_OFF_MODE]
-                != crate::constants::STAKE_POOL_MODE_INSURANCE_LP
-            {
-                return Err(PercolatorError::StakePoolModeMismatch.into());
-            }
-            // (8b) v5: FIRST_LOSS only (Phase 4 item 6: "the 16% staker fee leg is paid only to
-            // first-loss pools").
-            if data[crate::constants::STAKE_POOL_OFF_RISK_MODE]
-                != crate::constants::STAKE_POOL_RISK_MODE_FIRST_LOSS
-            {
-                return Err(PercolatorError::StakePoolModeMismatch.into());
-            }
-            // (9) The destination, read out of the validated pool.
+            // (9) The destination, read out of the validated pool; (8) / (8b) are the
+            // caller's (`BoundStakePool::owed_staker_leg`).
             let mut vault = [0u8; 32];
             vault.copy_from_slice(
                 &data[crate::constants::STAKE_POOL_OFF_VAULT
                     ..crate::constants::STAKE_POOL_OFF_VAULT + 32],
             );
-            // `vault_authority` was proven equal to the bound
-            // `insurance_authority` in (3); returning it lets the caller assert
-            // the destination token account's SPL owner is that same PDA.
-            Ok((Pubkey::new_from_array(vault), vault_authority))
+            Ok(BoundStakePool {
+                vault: Pubkey::new_from_array(vault),
+                vault_authority,
+                pool_mode: data[crate::constants::STAKE_POOL_OFF_MODE],
+                risk_mode: data[crate::constants::STAKE_POOL_OFF_RISK_MODE],
+            })
         }
     }
 
@@ -23782,11 +23816,23 @@ pub mod processor {
     /// Every move is `risk_limits_v17::fold_lp_leg_into_insurance`-shaped (source leg's
     /// `withdrawn := accrued`, destination's `accrued += owed`), so the grand total
     /// `outstanding_fee_legs_view` is conserved exactly (Kani `kani_p1_close_fee_conservation`).
+    ///
+    /// W-S1 (v2.2 growth overnight, stake builder finding): the staker leg is ALSO orphaned when
+    /// the bound pool is in the instruction (on a stake-owned market it is the CloseSlab signer
+    /// `[0]` itself: `marketauth` = the pool PDA, stake tag 30 `AdminCloseSlab`; any other
+    /// position works too) and that pool is owed nothing: not insurance-LP, or not v5
+    /// FIRST_LOSS (`BoundStakePool::owed_staker_leg`, exactly the predicate tag 87 refuses on
+    /// with `StakePoolModeMismatch`, read through the SAME owner-pinned / PDA-checked reader).
+    /// Without the pool account, or if it fails any check, the leg is treated as before.
+    #[inline(never)]
     fn rebook_orphaned_fee_legs_view(
-        market_key: &Pubkey,
+        program_id: &Pubkey,
+        market_ai: &AccountInfo,
+        accounts: &[AccountInfo],
         cfg: &mut WrapperConfigV16,
         group: &mut state::MarketViewMutV16<'_>,
     ) -> Result<bool, ProgramError> {
+        let market_key = market_ai.key;
         let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
         let mut moved = false;
         if cfg.lp_fee_accrued_atoms > cfg.lp_fee_withdrawn_atoms
@@ -23805,7 +23851,13 @@ pub mod processor {
         }
         let asset0 = read_oracle_profile_from_view(group, cfg, 0)?;
         if cfg.insurance_reserve_accrued_atoms > cfg.insurance_reserve_withdrawn_atoms
-            && !insurance_authority_bound_to_stake_pool(market_key, &asset0.insurance_authority)
+            && (!insurance_authority_bound_to_stake_pool(market_key, &asset0.insurance_authority)
+                || bound_stake_pool_owed_nothing(
+                    program_id,
+                    market_ai,
+                    accounts,
+                    &asset0.insurance_authority,
+                ))
         {
             let (insurance_withdrawn, protocol_accrued) =
                 risk_limits_v17::fold_lp_leg_into_insurance(
@@ -23849,6 +23901,37 @@ pub mod processor {
             }
         }
         Ok(moved)
+    }
+
+    /// W-S1: the market's stake pool PDA is among `accounts`, passes `read_bound_stake_pool`
+    /// (pin, owner, bound `vault_auth`, PDA, layout, slab, wrapper program), and is owed nothing
+    /// (`!owed_staker_leg()`). Any miss or failed check is `false` (the leg keeps waiting for tag
+    /// 87, the pre-W-S1 behaviour): this can only ever re-label a leg tag 87 would refuse forever.
+    fn bound_stake_pool_owed_nothing(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo,
+        accounts: &[AccountInfo],
+        insurance_authority: &[u8; 32],
+    ) -> bool {
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
+        {
+            let _ = (program_id, market_ai, accounts, insurance_authority);
+            false
+        }
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
+        {
+            let (expected_pool, _) = Pubkey::find_program_address(
+                &[crate::constants::STAKE_POOL_SEED, market_ai.key.as_ref()],
+                &crate::constants::STAKE_PROGRAM_ID,
+            );
+            let Some(pool_ai) = accounts.iter().find(|a| *a.key == expected_pool) else {
+                return false;
+            };
+            match read_bound_stake_pool(program_id, market_ai, pool_ai, insurance_authority) {
+                Ok(pool) => !pool.owed_staker_leg(),
+                Err(_) => false,
+            }
+        }
     }
 
     /// P1 F4: resolved AND no portfolio left -- the only state CloseSlab can proceed from.
@@ -24087,7 +24170,9 @@ pub mod processor {
             let rebooked = {
                 let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
                 let moved = terminal_empty_resolved_view(&group)
-                    && rebook_orphaned_fee_legs_view(market_ai.key, &mut cfg, &mut group)?;
+                    && rebook_orphaned_fee_legs_view(
+                        program_id, market_ai, accounts, &mut cfg, &mut group,
+                    )?;
                 if moved {
                     group.validate_shape().map_err(map_v16_error)?;
                 }
@@ -24205,6 +24290,17 @@ pub mod processor {
             // is upstream-equivalent behavior (see the engine's own doc comment
             // on `advance_terminal_slab_not_atomic`: "Pass `0` for upstream
             // behavior").
+            // W-S2 (v2.2 growth overnight, stake builder finding): CloseSlab does NOT read the
+            // item-6 `InsuranceUnitsV20` ledger. That is safe only because the retirement below
+            // refuses with `EngineLockActive` (21) while ANY insurance domain budget remains
+            // (`insurance_domain_budget_remaining_total != 0`, engine
+            // `retire_terminal_unbudgeted_insurance_delta`), and every unit is minted by a
+            // budget-crediting top-up (tag 9 on asset 0). So while a unit holder still has value
+            // in the fund the close waits; holders exit through terminal tag 41 (units burned)
+            // first. If units remain after the budget is spent to 0 (losses), they are worth 0
+            // and nothing of theirs is retired. Pinned by `ws2_close_slab_refuses_21_while_a_
+            // unitised_insurance_budget_remains` (tests/v16_cu.rs). Any change that lets this
+            // close proceed with a budget outstanding MUST read the units ledger first.
             let retired = match group
                 .advance_terminal_slab_not_atomic(authenticated_slot, scan_start, 0)
                 .map_err(map_v16_error)?
