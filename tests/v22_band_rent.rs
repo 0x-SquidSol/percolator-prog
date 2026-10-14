@@ -2738,7 +2738,9 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     env.settle_rent(lp.account, lp.account).expect("tag 106: ratchet site");
     let g = env.growth();
     assert_eq!((g.c_launch_atoms, g.ceil_x100, g.ceil_slot), (1_000 * USD as u64, 300, s0));
-    env.deposit_to(&lp_owner, lp.account, 29_000 * USD); // C_m $30k: book tier 1
+    // C_m $33k: book tier 1 PAST its round-3 ramp ($25k -> $31.25k), so the target is L1 = 5x
+    // exactly (at $30k the smoothed target would be 4.6x)
+    env.deposit_to(&lp_owner, lp.account, 32_000 * USD);
     // The gate reads min(stored 3x, target 5x): 3.5x is still refused.
     let taker = env.trader(100 * USD);
     let r = env.trade_cpi(&taker.0, taker.1, &lp, 350 * Q);
@@ -4408,4 +4410,42 @@ fn r3_item4_flash_must_be_held_over_the_window() {
     step(&mut env, whale, 2 * percolator_prog::growth_v19::DEPTH_TW_BUCKET_SLOTS + 20);
     let after = env.growth().depth_last_good_e6;
     assert!(after > before && after <= 2 * before, "held: one doubling ({before} -> {after})");
+}
+
+/// Round 3 item 5 (GAP-3): the leverage target is SMOOTH across a threshold and never looser
+/// than the round-2 step. 20x band market, UA thresholds at the floors ($5k / $20k / $100k),
+/// default table [5x, 5x, 10x, 20x], LP book $150k, attested_max_tier 3. A pool held at $22k
+/// (T2 + 10%) targets 5x + 5x * 0.4 = 7x (round 2: the full 10x step), so the ceiling climbs to 7x
+/// and holds; at $25k (past the 25% ramp) it continues to 10x. A depth oscillating ±2% around T2
+/// moves the target by at most 0.4x, not 5x. NEGATIVE CONTROL (file copy): the step table
+/// (round 2) climbs to 10x at $22k.
+#[test]
+fn r3_item5_ceiling_target_is_smooth_across_t2() {
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    env.auth_mark();
+    env.set_tiers([5_000, 20_000, 100_000], [0; 3], 3).expect("UA tier table");
+    let lp = env.lp(150_000 * USD);
+    let d = 22_000 * USD_E6;
+    env.depth_twice(d);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    let steps = env.climb_to(&lp, d, 700, 20);
+    assert!(steps >= 7);
+    for _ in 0..2 {
+        assert_eq!(env.epoch_step(&lp, d), 700, "holds at the smoothed 7x");
+    }
+    let t = env.trader(100 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 750 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "7.5x over the smoothed 7x");
+    env.trade_cpi(&t.0, t.1, &lp, 650 * Q).expect("6.5x under 7x");
+    env.trade_cpi(&t.0, t.1, &lp, -650 * Q).expect("close");
+    // past the ramp: the table value, one step per epoch
+    env.climb_to(&lp, 25_000 * USD_E6, 1_000, 8);
+    // the pure function: ±2% around T2 moves the target by <= 0.4x
+    let th = env.growth().tier_thresholds_e6();
+    let tab = env.growth().tier_table_x100();
+    let lt = [tab[0] as u64, tab[1] as u64, tab[2] as u64, tab[3] as u64];
+    let lo = percolator_prog::growth_v19::tier_ramp_u64(th[1] * 98 / 100, th, lt);
+    let hi = percolator_prog::growth_v19::tier_ramp_u64(th[1] * 102 / 100, th, lt);
+    assert!(hi - lo <= 40, "a ±2% oscillation moves the target by {} x100", hi - lo);
+    env.assert_conservation();
 }

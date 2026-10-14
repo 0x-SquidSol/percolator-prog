@@ -1846,6 +1846,134 @@ pub fn attested_max_tier_ok(v: u8) -> bool {
     v <= MAX_TIER
 }
 
+// ── v2.2 round 3 item 5 (design GAP-3): smooth leverage / κ / λ_depth across the thresholds ──
+
+/// The ramp above each threshold `T_i` spans `T_i / TIER_RAMP_DIV` (25%), capped at the next
+/// threshold.
+pub const TIER_RAMP_DIV: u64 = 4;
+
+/// Piecewise-linear "tier ramp" of a monotone 4-entry table (index = tier) at depth `d` over
+/// thresholds `th` (atoms). With `i = depth_tier_for(d, th)`:
+/// * `i == 0`: `table[0]`;
+/// * on the ramp `[T_i, E_i)`, `E_i = min(T_i + T_i / 4, T_{i+1})` (T_4 = infinity): linear from
+///   `table[i-1]` at `T_i` up to `table[i]` at `E_i` (floor);
+/// * past the ramp, up to the next threshold: `table[i]` (today's step value exactly).
+///
+/// NEVER LOOSER than today's step table anywhere (`<= table[tier(d)]` for every `d`), equal to it
+/// everywhere outside the 25% ramp above each threshold, CONTINUOUS (the value just below `T_i`
+/// is `table[i-1]`, the ramp starts there), and monotone non-decreasing in `d`. Khubair's "equal
+/// to today's table AT each threshold, never looser anywhere" cannot both hold for a continuous
+/// curve (the step jumps at `T_i`); never-looser is kept, so the jump at `T_i` becomes a ramp
+/// that reaches the table value 25% later. A pool oscillating ±2% around a threshold moves the
+/// target by <= 8% of that step, not the whole step. A non-monotone table (never produced by
+/// `tier_leverage`, whose output is monotone) returns the step value on its ramps.
+pub fn tier_ramp_u64(d: u64, th: [u64; 3], table: [u64; 4]) -> u64 {
+    let i = depth_tier_for(d, th) as usize;
+    if i == 0 {
+        return table[0];
+    }
+    let lo_x = th[i - 1];
+    let next = if i < 3 { th[i] } else { u64::MAX };
+    let ramp_end = core::cmp::min(lo_x.saturating_add(lo_x / TIER_RAMP_DIV), next);
+    let (lo, hi) = (table[i - 1], table[i]);
+    if d >= ramp_end || ramp_end <= lo_x || hi <= lo {
+        return hi;
+    }
+    // lo + (hi - lo) * (d - lo_x) / (ramp_end - lo_x), floor; < hi because d < ramp_end
+    let num = ((hi - lo) as u128) * ((d - lo_x) as u128);
+    let add = num / ((ramp_end - lo_x) as u128);
+    lo + add as u64
+}
+
+/// The κ table (bps of the depth) by tier: 0.5 / 1 / 1 / 2 (`kappa_depth_bps`).
+pub const KAPPA_TABLE_BPS: [u64; 4] = [5_000, 10_000, 10_000, 20_000];
+/// The λ_depth table (bps) by tier: 1x / 1x / 2x / 3x (`lambda_depth_bps`).
+pub const LAMBDA_DEPTH_TABLE_BPS: [u64; 4] = [10_000, 10_000, 20_000, 30_000];
+const _: () = assert!(KAPPA_TABLE_BPS[0] == 5_000 && KAPPA_TABLE_BPS[3] == 20_000);
+
+/// Round 3 item 5: the venue depth the ramps read: a DEX reading as is; a keeper-attested one
+/// clamped to just below the threshold above `attested_max_tier` (`T_{m+1} - 1`, so its ramp
+/// value never exceeds `L_m` -- the same cap `venue_tier` applies to the tier integer); no
+/// source: 0.
+pub fn venue_depth_capped(effective_depth_e6: u64, depth_source_byte: u8, thresholds_e6: [u64; 3], attested_max_tier_stored: u8) -> u64 {
+    match depth_source_of(depth_source_byte) {
+        DEPTH_SOURCE_DEX => effective_depth_e6,
+        DEPTH_SOURCE_ATTESTED => {
+            let m = attested_max_tier_eff(attested_max_tier_stored) as usize;
+            if m >= MAX_TIER as usize {
+                effective_depth_e6
+            } else {
+                let cap = thresholds_e6[m].saturating_sub(1);
+                if effective_depth_e6 < cap {
+                    effective_depth_e6
+                } else {
+                    cap
+                }
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// The smoothed growth dials of one market at a (venue, book) depth pair: the leverage signal
+/// `min(ramp_L(venue), ramp_L(book))` (x100), and κ / λ_depth as the same min of ramps. Each is
+/// <= its step value at `min(venue tier, book tier)`, so never looser than round 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmoothDials {
+    pub l_signal_x100: u16,
+    pub kappa_bps: u32,
+    pub lambda_depth_bps: u32,
+}
+
+pub fn smooth_dials(venue_depth_e6: u64, book_depth_e6: u64, thresholds_e6: [u64; 3], l_table_x100: [u16; 4]) -> SmoothDials {
+    let lt = [l_table_x100[0] as u64, l_table_x100[1] as u64, l_table_x100[2] as u64, l_table_x100[3] as u64];
+    let m2 = |t: [u64; 4]| {
+        let a = tier_ramp_u64(venue_depth_e6, thresholds_e6, t);
+        let b = tier_ramp_u64(book_depth_e6, thresholds_e6, t);
+        if a < b {
+            a
+        } else {
+            b
+        }
+    };
+    SmoothDials {
+        l_signal_x100: m2(lt) as u16,
+        kappa_bps: m2(KAPPA_TABLE_BPS) as u32,
+        lambda_depth_bps: m2(LAMBDA_DEPTH_TABLE_BPS) as u32,
+    }
+}
+
+/// `N_cap` with explicit (smoothed) dials: `min(n_cap_q(C_m, min(stored λ, λ_depth)), κ·depth/P)`
+/// on a clamp-enforced market; growth-1's `n_cap_q(C_m, stored λ)` off it. `n_cap_g8_q` is this at
+/// the step dials of a tier.
+#[allow(clippy::too_many_arguments)]
+pub fn n_cap_g8_q_dials(
+    clamp: bool,
+    c_m: u128,
+    stored_lambda_bps: u32,
+    lambda_depth_bps: u32,
+    kappa_bps: u32,
+    cap_depth_e6: Option<u64>,
+    price_e6: u64,
+    pos_scale: u128,
+) -> Option<u128> {
+    if !clamp {
+        return n_cap_q(c_m, stored_lambda_bps, price_e6, pos_scale);
+    }
+    let lam = if stored_lambda_bps < lambda_depth_bps { stored_lambda_bps } else { lambda_depth_bps };
+    let n = n_cap_q(c_m, lam, price_e6, pos_scale)?;
+    let d = depth_cap_q_kappa(kappa_bps, cap_depth_e6, price_e6, pos_scale);
+    Some(if n < d { n } else { d })
+}
+
+/// `depth_cap_q` with an explicit κ (bps).
+pub fn depth_cap_q_kappa(kappa_bps: u32, cap_depth_e6: Option<u64>, price_e6: u64, pos_scale: u128) -> u128 {
+    match cap_depth_e6 {
+        None => u128::MAX,
+        Some(d) => n_cap_q((d as u128) * (kappa_bps as u128) / BPS, DEFAULT_LAMBDA_BPS, price_e6, pos_scale).unwrap_or(0),
+    }
+}
+
 /// `λ_depth` (bps): 1x at tiers 0 and 1, 2x at tier 2, 3x at tier 3 (protocol constants).
 pub fn lambda_depth_bps(tier: u8) -> u32 {
     match tier {
@@ -1885,10 +2013,7 @@ pub fn depth_notional_cap_e6(tier: u8, cap_depth_e6: Option<u64>) -> Option<u128
 /// DOWN, so `<= κ·depth/P`, I-D4), `u128::MAX` only when there is no cap depth (never had a
 /// fresh one), and 0 (fail closed) on a zero price.
 pub fn depth_cap_q(tier: u8, cap_depth_e6: Option<u64>, price_e6: u64, pos_scale: u128) -> u128 {
-    match depth_notional_cap_e6(tier, cap_depth_e6) {
-        None => u128::MAX,
-        Some(nd) => n_cap_q(nd, DEFAULT_LAMBDA_BPS, price_e6, pos_scale).unwrap_or(0),
-    }
+    depth_cap_q_kappa(kappa_depth_bps(tier), cap_depth_e6, price_e6, pos_scale)
 }
 
 /// G8 `N_cap` (every reader: the post-fill gate, the TradeCpi open-room clip, the matcher ext
@@ -1905,12 +2030,16 @@ pub fn n_cap_g8_q(
     price_e6: u64,
     pos_scale: u128,
 ) -> Option<u128> {
-    if !clamp {
-        return n_cap_q(c_m, stored_lambda_bps, price_e6, pos_scale);
-    }
-    let n = n_cap_q(c_m, lambda_eff_bps(stored_lambda_bps, tier), price_e6, pos_scale)?;
-    let d = depth_cap_q(tier, cap_depth_e6, price_e6, pos_scale);
-    Some(if n < d { n } else { d })
+    n_cap_g8_q_dials(
+        clamp,
+        c_m,
+        stored_lambda_bps,
+        lambda_depth_bps(tier),
+        kappa_depth_bps(tier),
+        cap_depth_e6,
+        price_e6,
+        pos_scale,
+    )
 }
 
 /// G8 ext-v3 `(inventory_cap_q, liquidity_notional_e6)`. Off a clamp-enforced market, or with
@@ -1930,6 +2059,34 @@ pub fn growth_matcher_caps_g8(
     pos_scale: u128,
     max_position_abs_q: u128,
 ) -> (u128, u128) {
+    growth_matcher_caps_g8_dials(
+        hlock_active,
+        clamp,
+        c_m,
+        stored_lambda_bps,
+        lambda_depth_bps(tier),
+        kappa_depth_bps(tier),
+        cap_depth_e6,
+        price_e6,
+        pos_scale,
+        max_position_abs_q,
+    )
+}
+
+/// `growth_matcher_caps_g8` with explicit (round 3: smoothed) λ_depth / κ dials.
+#[allow(clippy::too_many_arguments)]
+pub fn growth_matcher_caps_g8_dials(
+    hlock_active: bool,
+    clamp: bool,
+    c_m: u128,
+    stored_lambda_bps: u32,
+    lambda_depth_bps: u32,
+    kappa_bps: u32,
+    cap_depth_e6: Option<u64>,
+    price_e6: u64,
+    pos_scale: u128,
+    max_position_abs_q: u128,
+) -> (u128, u128) {
     if !clamp {
         return growth_matcher_caps(
             hlock_active,
@@ -1940,8 +2097,8 @@ pub fn growth_matcher_caps_g8(
             max_position_abs_q,
         );
     }
-    let lam = lambda_eff_bps(stored_lambda_bps, tier);
-    let nd = match depth_notional_cap_e6(tier, cap_depth_e6) {
+    let lam = if stored_lambda_bps < lambda_depth_bps { stored_lambda_bps } else { lambda_depth_bps };
+    let nd = match cap_depth_e6.map(|d| (d as u128) * (kappa_bps as u128) / BPS) {
         None => {
             return growth_matcher_caps(hlock_active, c_m, lam, price_e6, pos_scale, max_position_abs_q)
         }
@@ -1950,7 +2107,7 @@ pub fn growth_matcher_caps_g8(
     if hlock_active {
         return (0, 0);
     }
-    let cap = n_cap_g8_q(true, c_m, stored_lambda_bps, tier, cap_depth_e6, price_e6, pos_scale)
+    let cap = n_cap_g8_q_dials(true, c_m, stored_lambda_bps, lambda_depth_bps, kappa_bps, cap_depth_e6, price_e6, pos_scale)
         .unwrap_or(0);
     let cap = if cap > max_position_abs_q {
         max_position_abs_q
@@ -2480,6 +2637,41 @@ mod tests {
     use super::*;
 
     const PS: u128 = 1_000_000;
+
+    /// Round 3 item 5 (GAP-3): the tier ramp.
+    #[test]
+    fn r3_item5_tier_ramp() {
+        let th = [25_000u64, 100_000, 500_000];
+        let l = [500u64, 500, 1_000, 2_000];
+        // below T1, and the step value past each ramp
+        assert_eq!(tier_ramp_u64(0, th, l), 500);
+        assert_eq!(tier_ramp_u64(24_999, th, l), 500);
+        assert_eq!(tier_ramp_u64(99_999, th, l), 500);
+        assert_eq!(tier_ramp_u64(125_000, th, l), 1_000, "T2 + 25%: the table value");
+        assert_eq!(tier_ramp_u64(499_999, th, l), 1_000);
+        assert_eq!(tier_ramp_u64(625_000, th, l), 2_000);
+        assert_eq!(tier_ramp_u64(u64::MAX, th, l), 2_000);
+        // on the ramp: linear from the tier below (never the step's higher value)
+        assert_eq!(tier_ramp_u64(100_000, th, l), 500, "AT T2: the value just below (continuous)");
+        assert_eq!(tier_ramp_u64(110_000, th, l), 700, "T2 + 10%: 5x + 5x * 0.4");
+        assert_eq!(tier_ramp_u64(124_999, th, l), 999);
+        // a ramp capped at a close next threshold
+        assert_eq!(tier_ramp_u64(110, [100, 120, 1_000], [1, 2, 3, 4]), 1, "floor of 1 + 1 * 10/20");
+        assert_eq!(tier_ramp_u64(119, [100, 120, 1_000], [1, 2, 3, 4]), 1);
+        assert_eq!(tier_ramp_u64(120, [100, 120, 1_000], [1, 2, 3, 4]), 2, "next ramp starts at the table value");
+        // venue cap: attested (default tier 1) clamps to T2 - 1 -> never above L1
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 0), 99_999);
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_DEX, th, 0), 600_000);
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 3), 600_000);
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_NONE, th, 3), 0);
+        // the dials: min of the two ramps
+        let d = smooth_dials(110_000, 600_000, th, [500, 500, 1_000, 2_000]);
+        assert_eq!(d, SmoothDials { l_signal_x100: 700, kappa_bps: 10_000, lambda_depth_bps: 14_000 });
+        // the step functions are the dials at a tier
+        for t in 0..=3u8 {
+            assert_eq!(n_cap_g8_q(true, 1_000_000, 30_000, t, Some(777), 1_000_000, PS), n_cap_g8_q_dials(true, 1_000_000, 30_000, lambda_depth_bps(t), kappa_depth_bps(t), Some(777), 1_000_000, PS));
+        }
+    }
 
     /// Round 3 item 1 (GAP-8): alpha <= 50% on every market until F3 is proven.
     #[test]

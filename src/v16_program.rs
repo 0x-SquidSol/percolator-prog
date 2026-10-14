@@ -28317,7 +28317,7 @@ pub mod processor {
                 ctx.stress,
                 g.l_launch_x100,
                 g.l_tier_x100,
-                growth_v19::l_table_x100(ctx.venue_tier, ctx.l_table),
+                ctx.venue_l_x100,
                 growth_v19::stress_cap_x100(ctx.stress, ctx.venue_tier, ctx.l_table),
                 ctx.now,
             );
@@ -42860,14 +42860,15 @@ pub mod processor {
         now: u64,
         /// R2.1 §2: the market's leverage table `[L0..L3]` (`growth_v19::tier_leverage`).
         l_table: [u16; 4],
+        /// Round 3 item 5 (GAP-3): the SMOOTHED leverage signal / κ / λ_depth
+        /// (`growth_v19::smooth_dials` at min(venue ramp, book ramp)); never looser than the step
+        /// values at `tier`. Neutral (tier-0 steps) off the clamp, where they are never read.
+        dials: growth_v19::SmoothDials,
+        /// The venue-only leverage ramp (the push writer's fall-only upper bound).
+        venue_l_x100: u16,
     }
 
     impl GrowthG8Ctx {
-        /// `L_table(tier)`.
-        fn l_table_tier(&self) -> u16 {
-            growth_v19::l_table_x100(self.tier, self.l_table)
-        }
-
         /// The graded stress cap at the combined tier (`growth_v19::stress_cap_x100`).
         fn stress_cap(&self) -> u16 {
             growth_v19::stress_cap_x100(self.stress, self.tier, self.l_table)
@@ -42896,6 +42897,12 @@ pub mod processor {
                 stress: growth_v19::STRESS_NONE,
                 now: 0,
                 l_table: [0; 4],
+                dials: growth_v19::SmoothDials {
+                    l_signal_x100: 0,
+                    kappa_bps: growth_v19::KAPPA_TABLE_BPS[0] as u32,
+                    lambda_depth_bps: growth_v19::LAMBDA_DEPTH_TABLE_BPS[0] as u32,
+                },
+                venue_l_x100: 0,
             });
         }
         let now = authenticated_market_slot_or_fallback_view(group);
@@ -42914,6 +42921,17 @@ pub mod processor {
             None => 0,
         };
         let tier = growth_v19::combined_tier(venue_tier, book_tier);
+        // Round 3 item 5: the same two depths, smoothed (ramps never above the step values).
+        let l_table = g.tier_table_x100();
+        let venue_depth =
+            growth_v19::venue_depth_capped(fresh.unwrap_or(0), g.depth_source, thresholds, g.attested_max_tier);
+        let book_depth = match c_m {
+            Some(c) => growth_v19::book_depth_e6(c, g.lambda_bps),
+            None => 0,
+        };
+        let dials = growth_v19::smooth_dials(venue_depth, book_depth, thresholds, l_table);
+        let lt64 = [l_table[0] as u64, l_table[1] as u64, l_table[2] as u64, l_table[3] as u64];
+        let venue_l_x100 = growth_v19::tier_ramp_u64(venue_depth, thresholds, lt64) as u16;
         let cap_depth_e6 = growth_v19::cap_depth_e6(
             g.depth_source,
             fresh,
@@ -42942,7 +42960,9 @@ pub mod processor {
             cap_depth_e6,
             stress: growth_v19::stress_level(draw_out, adl, hlock),
             now,
-            l_table: g.tier_table_x100(),
+            l_table,
+            dials,
+            venue_l_x100,
         })
     }
 
@@ -42963,7 +42983,7 @@ pub mod processor {
     ) -> Result<u32, ProgramError> {
         let ctx = growth_g8_ctx_view(group, asset_index, g, Some(c_m))?;
         Ok(if ctx.clamp {
-            growth_v19::lambda_eff_bps(g.lambda_bps, ctx.tier)
+            core::cmp::min(g.lambda_bps, ctx.dials.lambda_depth_bps)
         } else {
             g.lambda_bps
         })
@@ -43017,7 +43037,7 @@ pub mod processor {
             ctx.stress,
             g.l_launch_x100,
             g.l_tier_x100,
-            ctx.l_table_tier(),
+            ctx.dials.l_signal_x100,
             ctx.stress_cap(),
         );
         growth_v19::ceiling_in_force_x100(
@@ -43038,11 +43058,12 @@ pub mod processor {
         c_m: u128,
         price: u64,
     ) -> Option<u128> {
-        growth_v19::n_cap_g8_q(
+        growth_v19::n_cap_g8_q_dials(
             ctx.clamp,
             c_m,
             g.lambda_bps,
-            ctx.tier,
+            ctx.dials.lambda_depth_bps,
+            ctx.dials.kappa_bps,
             ctx.cap_depth_e6,
             price,
             percolator::POS_SCALE,
@@ -43076,12 +43097,13 @@ pub mod processor {
         // R8: the pure extraction (Kani target) is the whole decision. G8: off a clamp-enforced
         // market `growth_matcher_caps_g8` IS `growth_matcher_caps(.., stored lambda, ..)`.
         let ctx = growth_g8_ctx_view(group, asset_index, g, Some(c_m))?;
-        Ok(growth_v19::growth_matcher_caps_g8(
+        Ok(growth_v19::growth_matcher_caps_g8_dials(
             group.header.bankruptcy_hlock_active != 0,
             ctx.clamp,
             c_m,
             g.lambda_bps,
-            ctx.tier,
+            ctx.dials.lambda_depth_bps,
+            ctx.dials.kappa_bps,
             ctx.cap_depth_e6,
             price,
             percolator::POS_SCALE,
@@ -43208,8 +43230,8 @@ pub mod processor {
         // stored lambda and no depth cap (growth-1).
         let (gate_lambda_bps, gate_depth_cap_q) = if ctx.clamp {
             (
-                growth_v19::lambda_eff_bps(g.lambda_bps, ctx.tier),
-                growth_v19::depth_cap_q(ctx.tier, ctx.cap_depth_e6, price, percolator::POS_SCALE),
+                core::cmp::min(g.lambda_bps, ctx.dials.lambda_depth_bps),
+                growth_v19::depth_cap_q_kappa(ctx.dials.kappa_bps, ctx.cap_depth_e6, price, percolator::POS_SCALE),
             )
         } else {
             (g.lambda_bps, u128::MAX)
@@ -45166,7 +45188,7 @@ pub mod processor {
             // no-move) accruals still charge no rent: the wrapper feeds rent 0 to a duration-
             // pinned accrual and the engine grows the rent index only on non-pinned steps.
             let depth_cap_zero = ctx.clamp
-                && growth_v19::depth_cap_q(ctx.tier, ctx.cap_depth_e6, price, percolator::POS_SCALE) == 0;
+                && growth_v19::depth_cap_q_kappa(ctx.dials.kappa_bps, ctx.cap_depth_e6, price, percolator::POS_SCALE) == 0;
             let n_cap = growth_v19::rent_snapshot_n_cap_q(n_cap, depth_cap_zero);
             if g.rent_n_cap_q != n_cap {
                 g.rent_n_cap_q = n_cap;
@@ -45183,7 +45205,7 @@ pub mod processor {
                 ctx.stress,
                 g.l_launch_x100,
                 g.l_tier_x100,
-                ctx.l_table_tier(),
+                ctx.dials.l_signal_x100,
                 ctx.stress_cap(),
                 ctx.now,
             );
@@ -49767,5 +49789,49 @@ mod r3_kani_proofs {
         kani::cover!(w.bucket_p1 != 0 && w.bucket_p1 != b && o.prev_tokens == DEPTH_TW_ABSENT, "gap: prev absent");
         kani::cover!(w.bucket_p1 == 0, "first sample");
         kani::cover!(slot >= lgs as u64 + 2 * 9_000 && lg > 3 && base == (lg as u64) >> 2, "held value decays");
+    }
+
+    /// Item 5 (GAP-3): the tier ramp is NEVER above the step table, equals it past each 25%
+    /// ramp, starts each ramp at the previous table value (continuous), and is monotone in the
+    /// depth; the smoothed dials are each <= their step at min(venue tier, book tier).
+    /// Mutants: ramp before the threshold (the design's knots: looser below T_i); ramp end not
+    /// capped at the next threshold; `ceil` instead of floor on the ramp; `max` of the two ramps.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn kani_r3_item5_ramp_never_looser() {
+        let a: u16 = kani::any();
+        let b: u16 = kani::any();
+        let c: u16 = kani::any();
+        kani::assume(a >= 1 && b >= 1 && c >= 1);
+        let th = [a as u64, a as u64 + b as u64, a as u64 + b as u64 + c as u64];
+        let t0: u8 = kani::any();
+        let t1: u8 = kani::any();
+        let t2: u8 = kani::any();
+        let t3: u8 = kani::any();
+        let t = [t0 as u64, t0 as u64 + t1 as u64, t0 as u64 + t1 as u64 + t2 as u64, t0 as u64 + t1 as u64 + t2 as u64 + t3 as u64];
+        let d: u32 = kani::any();
+        let e: u32 = kani::any();
+        let (d, e) = (d as u64, e as u64);
+        let f = tier_ramp_u64(d, th, t);
+        let i = depth_tier_for(d, th) as usize;
+        assert!(f <= t[i], "never looser than the step");
+        if i > 0 {
+            assert!(f >= t[i - 1]);
+            let lo_x = th[i - 1];
+            let end = core::cmp::min(lo_x + lo_x / TIER_RAMP_DIV, if i < 3 { th[i] } else { u64::MAX });
+            if d >= end {
+                assert_eq!(f, t[i]);
+            }
+            assert_eq!(tier_ramp_u64(lo_x, th, t), t[i - 1], "ramp starts at the value below");
+        } else {
+            assert_eq!(f, t[0]);
+        }
+        if d <= e {
+            assert!(f <= tier_ramp_u64(e, th, t), "monotone");
+        }
+        kani::cover!(i == 2 && f > t[1] && f < t[2], "strictly inside a ramp");
+        kani::cover!(i == 3 && f == t[3] && t[3] > t[2], "past the last ramp");
+        kani::cover!(i == 1 && b < a / 4 && d + 1 == th[1], "ramp capped at the next threshold");
+        kani::cover!(i == 0, "below T1");
     }
 }

@@ -201,3 +201,79 @@ fn r3_item4_mutants_are_caught() {
     let (first, _, _) = gv::depth_rate_limited(false, 0, 0, 0, 500_000_000, false, 5, 24_999);
     assert_eq!(first, 24_999 / 16);
 }
+
+// ── item 5 (GAP-3): smooth tier ramps, never looser than the step table ─────────────────────
+
+/// MUTANT (the design's knots (T1/2, L0)..(T3, L3)): ramp UP TO each threshold -- looser than the
+/// step just below it.
+fn ramp_mutant_before(d: u64, th: [u64; 3], t: [u64; 4]) -> u64 {
+    let knots = [(th[0] / 2, t[0]), (th[0], t[1]), (th[1], t[2]), (th[2], t[3])];
+    if d <= knots[0].0 { return t[0]; }
+    for w in knots.windows(2) {
+        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+        if d <= x1 { return y0 + (y1 - y0) * (d - x0) / (x1 - x0).max(1); }
+    }
+    t[3]
+}
+
+fn arb_th() -> impl Strategy<Value = [u64; 3]> {
+    (1u64..1_000_000_000, 1u64..1_000_000_000, 1u64..1_000_000_000).prop_map(|(a, b, c)| [a, a + b, a + b + c])
+}
+
+fn arb_table() -> impl Strategy<Value = [u64; 4]> {
+    (0u64..50_000, 0u64..50_000, 0u64..50_000, 0u64..50_000).prop_map(|(a, b, c, d)| [a, a + b, a + b + c, a + b + c + d])
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+    /// Never looser than the step anywhere; equal to the step outside the 25% ramps; monotone;
+    /// continuous at every threshold (the value at T_i is the value just below it) and Lipschitz
+    /// on the ramp; the dials are each <= their step at min(venue tier, book tier).
+    #[test]
+    fn item5_ramp(d in any::<u64>(), e in any::<u64>(), th in arb_th(), t in arb_table()) {
+        let step = |x: u64| t[gv::depth_tier_for(x, th) as usize];
+        let f = gv::tier_ramp_u64(d, th, t);
+        prop_assert!(f <= step(d), "never looser");
+        let i = gv::depth_tier_for(d, th) as usize;
+        if i > 0 {
+            let lo_x = th[i - 1];
+            let end = (lo_x + lo_x / 4).min(if i < 3 { th[i] } else { u64::MAX });
+            if d >= end { prop_assert_eq!(f, step(d)); }
+            prop_assert!(f >= t[i - 1]);
+            prop_assert_eq!(gv::tier_ramp_u64(lo_x, th, t), t[i - 1], "continuous at the threshold");
+            // the ramp starts where the band below ends: no jump at T_i beyond the band below's
+            // own value (when that band's ramp had room to complete)
+            if lo_x > 0 { prop_assert!(gv::tier_ramp_u64(lo_x - 1, th, t) <= gv::tier_ramp_u64(lo_x, th, t)); }
+            if i >= 2 && lo_x > (th[i - 2] + th[i - 2] / 4) {
+                prop_assert_eq!(gv::tier_ramp_u64(lo_x - 1, th, t), t[i - 1], "left limit == ramp start");
+            }
+        } else {
+            prop_assert_eq!(f, t[0]);
+        }
+        let (a, b) = if d <= e { (d, e) } else { (e, d) };
+        prop_assert!(gv::tier_ramp_u64(a, th, t) <= gv::tier_ramp_u64(b, th, t), "monotone");
+    }
+
+    #[test]
+    fn item5_dials(v in any::<u64>(), b in any::<u64>(), th in arb_th(), la in 100u16..=2_000, lt in 100u16..=10_000, lev in any::<[u16; 3]>()) {
+        let tab = gv::tier_leverage(lev, la.min(lt), lt);
+        let d = gv::smooth_dials(v, b, th, tab);
+        let tier = gv::combined_tier(gv::depth_tier_for(v, th), gv::depth_tier_for(b, th));
+        prop_assert!(d.l_signal_x100 <= gv::l_table_x100(tier, tab));
+        prop_assert!(d.kappa_bps <= gv::kappa_depth_bps(tier));
+        prop_assert!(d.lambda_depth_bps <= gv::lambda_depth_bps(tier));
+        prop_assert!(d.l_signal_x100 >= tab[0] && d.kappa_bps >= 5_000 && d.lambda_depth_bps >= 10_000);
+    }
+}
+
+#[test]
+fn r3_item5_mutants_are_caught() {
+    let th = [25_000u64, 100_000, 500_000];
+    let t = [500u64, 500, 1_000, 2_000];
+    // the design's ramp-before-threshold: at $90k (tier 1, step 5x) it already gives ~9.3x
+    assert!(ramp_mutant_before(90_000, th, t) > 500, "mutant witness: looser below T2");
+    assert_eq!(gv::tier_ramp_u64(90_000, th, t), 500);
+    // the pure step (no ramp): a 5x jump at T2; the ramp moves 0.2x for +1%
+    assert_eq!(gv::tier_ramp_u64(101_000, th, t), 520);
+}
