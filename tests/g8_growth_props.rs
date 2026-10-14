@@ -1,24 +1,16 @@
-//! v2.2 growth overnight (2026-10-14) §1.1-1.4 property tests on the REAL pure functions in
-//! `src/growth_v19.rs` at FULL width (the `kani_g8_*` harnesses in `src/v16_program.rs` bound
-//! the same functions to u8 / u16 / u32 inputs; neither alone is the claim). Each property has
-//! a named mutant as a NEGATIVE CONTROL (a deterministic witness shows the mutant violates
-//! it), so no property is vacuous.
+//! v2.2 growth overnight (2026-10-14) §1.1-1.4 + round 2 (R2.1) property tests on the REAL pure
+//! functions in `src/growth_v19.rs` at FULL width (the `kani_g8_*` / `kani_r2_*` harnesses in
+//! `src/v16_program.rs` bound the same functions to u8 / u16 / u32 inputs; neither alone is the
+//! claim). Each property has a named mutant as a NEGATIVE CONTROL (a deterministic witness shows
+//! the mutant violates it), so no property is vacuous.
 #![cfg(not(kani))]
 
 use percolator_prog::growth_v19::*;
 use proptest::prelude::*;
 
-/// MUTANT (I-D3): attested depth uncapped.
-fn tier_mutant_uncapped(d: u64) -> u8 {
-    if d >= DEPTH_TIER3_E6 {
-        3
-    } else if d >= DEPTH_TIER2_E6 {
-        2
-    } else if d >= DEPTH_TIER1_E6 {
-        1
-    } else {
-        0
-    }
+/// MUTANT (I-D3): attested depth uncapped (the DEX rule applied to every source).
+fn venue_mutant_uncapped(d: u64, th: [u64; 3]) -> u8 {
+    depth_tier_for(d, th)
 }
 
 /// MUTANT (I-D1): staleness bound off by one (`age <= 151`).
@@ -32,42 +24,69 @@ fn eff_mutant_151(d: u64, p: u64, s: u64, now: u64) -> u64 {
     }
 }
 
+/// MUTANT (W-M1, the round-1 rule): an absent / stale depth removes the cap.
+fn cap_depth_mutant_round1(eff: u64) -> Option<u64> {
+    if eff > 0 {
+        Some(eff)
+    } else {
+        None
+    }
+}
+
+fn arb_thresholds() -> impl Strategy<Value = [u32; 3]> {
+    prop_oneof![Just([0u32; 3]), any::<[u32; 3]>()]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4_096))]
 
-    /// I-D3 + I-D1: tier <= 1 for every attested depth; 0 for every other source; effective
-    /// depth is min of the two reads when fresh, else 0.
+    /// I-D1 + I-D3 + R2.1 §3: effective depth is min of the two reads when fresh, else 0; the
+    /// venue tier is 0 when absent / stale or sourceless, <= attested_max_tier for attested
+    /// depth, uncapped only for the DEX source; the combined tier is <= both inputs.
     #[test]
-    fn tiers_and_freshness(d in any::<u64>(), p in any::<u64>(), s in any::<u64>(), now in any::<u64>(), src in any::<u8>()) {
+    fn tiers_and_freshness(d in any::<u64>(), p in any::<u64>(), s in any::<u64>(), now in any::<u64>(), src in any::<u8>(), amt in any::<u8>(), ths in arb_thresholds(), book in 0u8..=3) {
         let eff = effective_depth_e6(d, p, s, now);
         let fresh = d != 0 && p != 0 && now >= s && now - s <= DEPTH_MAX_AGE_SLOTS;
         prop_assert_eq!(eff, if fresh { d.min(p) } else { 0 });
-        let t = depth_tier(eff, src);
-        prop_assert!(t <= 1);
-        if src != DEPTH_SOURCE_ATTESTED || eff < DEPTH_TIER1_E6 { prop_assert_eq!(t, 0); }
-        prop_assert!(lambda_eff_bps(any_lambda(d), t) <= DEFAULT_LAMBDA_BPS);
+        let th = tier_thresholds(ths);
+        let t = venue_tier(eff, src, th, amt);
+        prop_assert!(t <= MAX_TIER);
+        if eff == 0 { prop_assert_eq!(t, 0); }
+        match depth_source_of(src) {
+            DEPTH_SOURCE_ATTESTED => prop_assert!(t <= attested_max_tier_eff(amt)),
+            DEPTH_SOURCE_DEX => prop_assert_eq!(t, depth_tier_for(eff, th)),
+            _ => prop_assert_eq!(t, 0),
+        }
+        if amt == 0 && depth_source_of(src) == DEPTH_SOURCE_ATTESTED { prop_assert!(t <= 1); }
+        let c = combined_tier(t, book);
+        prop_assert!(c <= t && c <= book);
+        prop_assert!(lambda_eff_bps(any_lambda(d), c) <= lambda_depth_bps(c));
     }
 
-    /// I-D2: target in [launch, min(L_tier, max(launch, L_depth))]; off graduation or forced it
-    /// IS launch; monotone non-decreasing in C_m.
+    /// I-D2 (R2.1): target in [launch, min(L_tier, max(launch, L_table(tier)))]; off graduation or
+    /// forced it IS launch; monotone non-decreasing in the tier; the table is monotone, starts at
+    /// launch and never exceeds L_tier.
     #[test]
-    fn target_bounds_and_monotone(la in any::<u16>(), lt in any::<u16>(), tier in 0u8..=3, a in any::<u128>(), b in any::<u128>(), cl in any::<u128>(), grad in any::<bool>(), force in any::<bool>()) {
-        let ld = l_depth_x100(tier, la);
+    fn target_bounds_and_monotone(la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), t1 in 0u8..=3, t2 in 0u8..=3, grad in any::<bool>(), force in any::<bool>()) {
         let launch = la.min(lt);
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let t1 = target_ceiling_x100(grad, force, la, lt, ld, lo, cl);
-        let t2 = target_ceiling_x100(grad, force, la, lt, ld, hi, cl);
-        prop_assert!(t1 >= launch && t1 <= lt && t1 <= launch.max(ld));
-        prop_assert!(t1 <= t2);
-        if !grad || force { prop_assert_eq!(t1, launch); }
+        let tab = tier_leverage(lev, la, lt);
+        prop_assert_eq!(tab[0], launch);
+        for i in 0..3 { prop_assert!(tab[i] <= tab[i + 1] && tab[i + 1] <= lt.max(launch)); }
+        let (lo, hi) = if t1 <= t2 { (t1, t2) } else { (t2, t1) };
+        let a = target_ceiling_x100(grad, force, la, lt, l_table_x100(lo, tab));
+        let b = target_ceiling_x100(grad, force, la, lt, l_table_x100(hi, tab));
+        prop_assert!(a >= launch && a <= lt.max(launch) && a <= launch.max(l_table_x100(lo, tab)));
+        prop_assert!(a <= l_table_x100(lo, tab).max(launch));
+        prop_assert!(a <= b);
+        if !grad || force { prop_assert_eq!(a, launch); }
     }
 
     /// Ratchet: <= +1x per epoch, only after the epoch; never climbs in the snapshot call;
     /// fall-only never rises.
     #[test]
-    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), cl in any::<u64>(), cm in any::<u128>(), grad in any::<bool>(), force in any::<bool>(), la in any::<u16>(), lt in any::<u16>(), tier in 0u8..=3, now in any::<u64>()) {
-        let ld = l_depth_x100(tier, la);
-        let (c, s, cl2) = graduation_ratchet(prev, ps, cl, cm, grad, force, la, lt, ld, now);
+    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), cl in any::<u64>(), cm in any::<u128>(), grad in any::<bool>(), force in any::<bool>(), la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), tier in 0u8..=3, now in any::<u64>()) {
+        let lx = l_table_x100(tier, tier_leverage(lev, la, lt));
+        let (c, s, cl2) = graduation_ratchet(prev, ps, cl, cm, grad, force, la, lt, lx, now);
         if c > prev {
             prop_assert!(cl != 0);
             prop_assert!(c as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
@@ -76,27 +95,102 @@ proptest! {
         }
         if c == prev && cl != 0 { prop_assert!(s == ps || s == now); }
         if cl != 0 { prop_assert_eq!(cl2, cl); } else { prop_assert_eq!(cl2 == 0, cm == 0); }
-        let (f, _) = graduation_fall_only(prev, ps, cl, grad, force, la, lt, ld, now);
+        let (f, _) = graduation_fall_only(prev, ps, grad, force, la, lt, lx, now);
         prop_assert!(f <= prev);
     }
 
-    /// I-D4 at full width: with a fresh depth, N_cap * 1e4 * P <= depth * κ * POS_SCALE (checked
-    /// in u128 where it fits); with none, the capital rule at λ_eff; off the clamp, growth-1.
+    /// I-D4 at full width: with a cap depth, N_cap * 1e4 * P <= depth * κ * POS_SCALE (checked in
+    /// u128 where it fits) and N_cap <= the capital rule at λ_eff; with none, exactly the capital
+    /// rule; off the clamp, growth-1 whatever the depth.
     #[test]
-    fn n_cap_depth_cap(cm in any::<u64>(), lam in 1u32..=MAX_LAMBDA_BPS, tier in 0u8..=3, depth in any::<u64>(), price in 1u64..=u64::MAX) {
+    fn n_cap_depth_cap(cm in any::<u64>(), lam in 1u32..=MAX_LAMBDA_BPS, tier in 0u8..=3, depth in prop::option::of(any::<u64>()), price in 1u64..=u64::MAX) {
         let ps = 1_000_000u128;
         let cm = cm as u128;
         let n = n_cap_g8_q(true, cm, lam, tier, depth, price, ps);
         let cap = n_cap_q(cm, lambda_eff_bps(lam, tier), price, ps);
-        if depth == 0 {
-            prop_assert_eq!(n, cap);
-        } else if let Some(n) = n {
-            prop_assert!(Some(n) <= cap);
-            if let (Some(l), Some(r)) = (n.checked_mul(BPS).and_then(|x| x.checked_mul(price as u128)), (depth as u128).checked_mul(kappa_depth_bps(tier) as u128 * ps)) {
-                prop_assert!(l <= r);
-            }
+        match depth {
+            None => prop_assert_eq!(n, cap),
+            Some(d) => if let Some(n) = n {
+                prop_assert!(Some(n) <= cap);
+                if let (Some(l), Some(r)) = (n.checked_mul(BPS).and_then(|x| x.checked_mul(price as u128)), (d as u128).checked_mul(kappa_depth_bps(tier) as u128 * ps)) {
+                    prop_assert!(l <= r);
+                }
+                if d == 0 { prop_assert_eq!(n, 0); }
+            },
         }
         prop_assert_eq!(n_cap_g8_q(false, cm, lam, tier, depth, price, ps), n_cap_q(cm, lam, price, ps));
+    }
+
+    /// W-M1 (R2.1 §1): once DEPTH_EVER is set the cap depth is ALWAYS Some (never uncapped), it
+    /// is the fresh depth when there is one, and the sticky depth is <= last_good and monotone
+    /// non-increasing in staleness, halving per 9,000 slots.
+    #[test]
+    fn sticky_cap_never_uncapped(src in any::<u8>(), eff in any::<u64>(), lg in any::<u64>(), lgs in any::<u64>(), n1 in any::<u64>(), n2 in any::<u64>()) {
+        let ever = src | DEPTH_EVER;
+        let c = cap_depth_e6(ever, eff, lg, lgs, n1);
+        prop_assert!(c.is_some());
+        if eff > 0 { prop_assert_eq!(c, Some(eff)); } else { prop_assert!(c.unwrap() <= lg); }
+        let (a, b) = if n1 <= n2 { (n1, n2) } else { (n2, n1) };
+        prop_assert!(sticky_depth_e6(lg, lgs, a) >= sticky_depth_e6(lg, lgs, b));
+        let k = a.saturating_sub(lgs) / DEPTH_STICKY_EPOCH_SLOTS;
+        if k < 64 { prop_assert_eq!(sticky_depth_e6(lg, lgs, a), lg >> k); }
+        // without DEPTH_EVER and no fresh depth: no cap (the market is not closed before its
+        // first pair of readings)
+        if eff == 0 { prop_assert_eq!(cap_depth_e6(src & !DEPTH_EVER, 0, lg, lgs, n1), None); }
+    }
+
+    /// The one depth writer: a same-slot push never raises the depth; DEPTH_EVER is never cleared
+    /// by it; the last good depth changes exactly when the result is fresh (and then equals the
+    /// effective depth); the source bits are a known source and NONE iff the depth is 0.
+    #[test]
+    fn depth_writer(d in any::<u64>(), s in any::<u64>(), p in any::<u64>(), src_lo in 0u8..=2, ever in any::<bool>(), lg in any::<u64>(), lgs in any::<u64>(), new_src in 0u8..=4, nd in any::<u64>(), now in any::<u64>()) {
+        let srcb = src_lo | if ever { DEPTH_EVER } else { 0 };
+        let st = DepthState { depth_e6: d, depth_slot: s, depth_prev_e6: p, depth_source: srcb, last_good_e6: lg, last_good_slot: lgs };
+        let o = depth_push_update(st, new_src, nd, now);
+        if s != 0 && now <= s { prop_assert!(o.depth_e6 <= d); prop_assert_eq!(o.depth_prev_e6, p); prop_assert_eq!(o.depth_slot, s); }
+        if depth_ever(srcb) { prop_assert!(depth_ever(o.depth_source)); }
+        let eff = effective_depth_e6(o.depth_e6, o.depth_prev_e6, o.depth_slot, now);
+        if eff > 0 {
+            prop_assert!(depth_ever(o.depth_source));
+            prop_assert_eq!(o.last_good_e6, eff);
+        } else {
+            prop_assert_eq!((o.last_good_e6, o.last_good_slot), (lg, lgs));
+            prop_assert_eq!(depth_ever(o.depth_source), depth_ever(srcb));
+        }
+        prop_assert!(depth_source_byte_ok(o.depth_source));
+        if o.depth_e6 == 0 { prop_assert_eq!(depth_source_of(o.depth_source), DEPTH_SOURCE_NONE); }
+    }
+
+    /// R2.1 §2: `tier_config_ok` is exactly the stated bounds; an accepted explicit table is used
+    /// verbatim by `tier_leverage` (the clamps are no-ops), and accepted thresholds are strictly
+    /// increasing in atoms.
+    #[test]
+    fn tier_config_bounds(th in any::<[u32; 3]>(), lev in any::<[u16; 3]>(), la in 100u16..=5_000, lt in 100u16..=10_000) {
+        let la = la.min(lt);
+        let ok = tier_config_ok(th, lev, la, lt);
+        let w: Vec<u32> = (0..3).map(|i| if th[i] == 0 { TIER_THRESHOLD_DEFAULT_USD[i] } else { th[i] }).collect();
+        let th_ok = th == [0; 3] || (w[0] < w[1] && w[1] < w[2] && (0..3).all(|i| w[i] >= TIER_THRESHOLD_FLOOR_USD[i]));
+        let v: Vec<u16> = (0..3).map(|i| if lev[i] == 0 { TIER_LEVERAGE_DEFAULT_X100[i].min(lt) } else { lev[i] }).collect();
+        let lev_ok = lev == [0; 3] || (la <= v[0] && v[0] <= v[1] && v[1] <= v[2] && v[2] <= lt);
+        prop_assert_eq!(ok, th_ok && lev_ok);
+        if ok && lev != [0; 3] {
+            prop_assert_eq!(&tier_leverage(lev, la, lt)[1..], &v[..]);
+        }
+        if ok {
+            let t = tier_thresholds(th);
+            prop_assert!(t[0] < t[1] && t[1] < t[2] && t[0] > 0);
+        }
+    }
+
+    /// R2.1 §3 book depth: never above the 1x capacity notional (and exactly it under the pins);
+    /// the book tier is monotone in C_m.
+    #[test]
+    fn book_depth_bounds(a in any::<u128>(), b in any::<u128>(), lam in 1u32..=MAX_LAMBDA_BPS, ths in arb_thresholds()) {
+        let cap = book_capacity_e6(a, lam);
+        prop_assert_eq!(book_depth_e6(a, lam) as u128, cap.min(u64::MAX as u128));
+        let th = tier_thresholds(ths);
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        prop_assert!(book_tier(lo, lam, th) <= book_tier(hi, lam, th));
     }
 }
 
@@ -107,18 +201,19 @@ fn any_lambda(seed: u64) -> u32 {
 /// NEGATIVE CONTROLS: each mutant violates its property on a concrete witness.
 #[test]
 fn g8_props_mutants_are_caught() {
-    // I-D3: the uncapped tier reaches 3 on a $500k attested depth.
-    assert_eq!(tier_mutant_uncapped(DEPTH_TIER3_E6), 3);
-    assert!(depth_tier(DEPTH_TIER3_E6, DEPTH_SOURCE_ATTESTED) <= 1);
+    let th = tier_thresholds([0; 3]);
+    // I-D3: the uncapped attested tier reaches 3 on a $500k attested depth.
+    assert_eq!(venue_mutant_uncapped(DEPTH_TIER3_E6, th), 3);
+    assert!(venue_tier(DEPTH_TIER3_E6, DEPTH_SOURCE_ATTESTED, th, 0) <= 1);
     // I-D1: the off-by-one staleness trusts a 151-slot-old depth.
     assert_eq!(eff_mutant_151(DEPTH_TIER1_E6, DEPTH_TIER1_E6, 0, 151), DEPTH_TIER1_E6);
     assert_eq!(effective_depth_e6(DEPTH_TIER1_E6, DEPTH_TIER1_E6, 0, 151), 0);
-    // I-D2: a `max` for the depth `min` would graduate past L_depth.
-    let la = 300u16;
-    let mutant = (|| -> u16 {
-        let stepped = graduated_ceiling_x100(true, la, 2_000, 1u128 << 20, 1);
-        stepped.max(l_depth_x100(1, la))
-    })();
-    assert!(mutant > 500);
-    assert_eq!(target_ceiling_x100(true, false, la, 2_000, l_depth_x100(1, la), 1u128 << 20, 1), 500);
+    // W-M1: the round-1 rule leaves a market that once had depth uncapped when it goes stale.
+    assert_eq!(cap_depth_mutant_round1(0), None);
+    assert!(cap_depth_e6(DEPTH_EVER, 0, DEPTH_TIER1_E6, 0, 1_000).is_some());
+    // I-D2: a `max` with L_tier instead of `min` would graduate past L_tier.
+    let tab = tier_leverage([0; 3], 500, 1_000);
+    let mutant = 1_000u16.max(500u16.max(l_table_x100(3, [500, 500, 1_000, 2_000])));
+    assert!(mutant > 1_000);
+    assert_eq!(target_ceiling_x100(true, false, 500, 1_000, l_table_x100(3, tab)), 1_000);
 }

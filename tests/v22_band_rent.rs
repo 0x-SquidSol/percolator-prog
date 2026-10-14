@@ -66,6 +66,10 @@ thread_local! {
     static INIT_PRICE: std::cell::Cell<u64> = const { std::cell::Cell::new(PRICE) };
     /// G8 tests: the growth block's `l_launch` of the next `Env::new` on this thread.
     static L_LAUNCH: std::cell::Cell<u16> = const { std::cell::Cell::new(1_000) };
+    /// R2 tier tests: `(engine IMR, MMR, liquidation fee, min_nonzero_mm_req)` of the next
+    /// `Env::new` on this thread (default: the 10x market of the module doc); the IM floor is
+    /// twice the MM floor.
+    static MKT: std::cell::Cell<(u64, u64, u64, u128)> = const { std::cell::Cell::new((ENGINE_IMR, MMR, LIQ_FEE, 10)) };
 }
 
 #[allow(dead_code)]
@@ -218,13 +222,13 @@ fn init_market_ix(c: &Cfg) -> ProgInstruction {
         h_min: 0,
         h_max: 10,
         initial_price: INIT_PRICE.with(|p| p.get()),
-        min_nonzero_mm_req: 10,
-        min_nonzero_im_req: 20,
-        maintenance_margin_bps: MMR,
-        initial_margin_bps: ENGINE_IMR,
+        min_nonzero_mm_req: MKT.with(|m| m.get().3),
+        min_nonzero_im_req: 2 * MKT.with(|m| m.get().3),
+        maintenance_margin_bps: MKT.with(|m| m.get().1),
+        initial_margin_bps: MKT.with(|m| m.get().0),
         max_trading_fee_bps: 10_000,
         trade_fee_base_bps: 0,
-        liquidation_fee_bps: LIQ_FEE,
+        liquidation_fee_bps: MKT.with(|m| m.get().2),
         liquidation_fee_cap: 1_000_000_000_000_000,
         min_liquidation_abs: 0,
         max_price_move_bps_per_slot: 4,
@@ -276,6 +280,8 @@ struct Env {
     slot: u64,
     upgrade_authority: Keypair,
     program_data: Pubkey,
+    /// The engine IMR this market was created with (`MKT`).
+    engine_imr: u64,
 }
 
 impl Env {
@@ -323,6 +329,7 @@ impl Env {
                 .unwrap(),
             next_key: 0x40,
             slot: 1,
+            engine_imr: MKT.with(|m| m.get().0),
             upgrade_authority: seeded_keypair(3),
             program_data: Pubkey::find_program_address(
                 &[program_id.as_ref()],
@@ -789,7 +796,7 @@ impl Env {
     }
 
     fn growth(&self) -> state::AssetGrowthV19 {
-        state::read_asset_growth(&self.svm.get_account(&self.market).unwrap().data, 0, ENGINE_IMR)
+        state::read_asset_growth(&self.svm.get_account(&self.market).unwrap().data, 0, self.engine_imr)
             .unwrap()
             .expect("growth on")
     }
@@ -2492,6 +2499,7 @@ fn s10_cu_settle_holding_rent() {
 // ---------------------------------------------------------------------------
 
 const DEPTH_T1: u64 = percolator_prog::growth_v19::DEPTH_TIER1_E6;
+const DEPTH_EVER: u8 = percolator_prog::growth_v19::DEPTH_EVER;
 
 impl Env {
     /// Tag 63's 44-byte form `[depth_mode u8][depth_e6 u64]`, at the current slot.
@@ -2576,7 +2584,7 @@ impl Env {
     }
 
     fn growth_raw(&self) -> Option<state::AssetGrowthV19> {
-        state::read_asset_growth(&self.svm.get_account(&self.market).unwrap().data, 0, ENGINE_IMR).unwrap()
+        state::read_asset_growth(&self.svm.get_account(&self.market).unwrap().data, 0, self.engine_imr).unwrap()
     }
 
     fn clock_slot(&self) -> u64 {
@@ -2611,11 +2619,17 @@ fn g8_push_auth_mark_wire_35_44_and_mode_refusals() {
     env.push_depth(PRICE, 1, 40_000_000_000).expect("second attested push");
     let g = env.growth();
     assert_eq!((g.depth_e6, g.depth_prev_e6), (40_000_000_000, 30_000_000_000), "previous depth moves to prev");
-    // The 35 B form zeroes the depth (absent is never stale-but-trusted).
+    // R2.1: the pair (30k, 40k) in two slots was a fresh effective depth: DEPTH_EVER is set
+    // and the last good depth is min(30k, 40k).
+    assert_eq!(g.depth_source, 1 | DEPTH_EVER);
+    assert_eq!((g.depth_last_good_e6, g.depth_last_good_slot), (30_000_000_000, env.clock_slot()));
+    // The 35 B form zeroes the depth (absent is never stale-but-trusted); DEPTH_EVER and the
+    // last good depth stay (the sticky cap's input).
     env.warp(1);
     env.push(PRICE);
     let g = env.growth();
-    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 40_000_000_000, 0));
+    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 40_000_000_000, DEPTH_EVER));
+    assert_eq!(g.depth_last_good_e6, 30_000_000_000);
     assert_eq!(g.depth_slot, env.clock_slot());
     // 44 B with mode 0 and depth 0 is the explicit "none" form.
     env.push_depth(PRICE, 0, 0).expect("44 B mode 0");
@@ -2682,14 +2696,14 @@ fn g8_off_band_ceiling_stays_launch_whatever_depth_and_capital() {
     env.trade_cpi(&taker.0, taker.1, &lp, 290 * Q).expect("control: 2.9x inside the launch ceiling");
     let g = env.growth();
     assert_eq!((g.ceil_x100, g.ceil_slot, g.c_launch_atoms), (g0.ceil_x100, g0.ceil_slot, 0), "never ratcheted off-band");
-    assert_eq!(g.depth_source, 1, "the depth is stored (and ignored) off-band");
+    assert_eq!(g.depth_source, 1 | DEPTH_EVER, "the depth is stored (and ignored) off-band");
 }
 
-/// (c) Band market (clamp-enforced), L_launch 3x, tier-1 attested depth (L_depth 5x), capital
-/// 8x the launch reference: the ceiling climbs at most +1x per 9,000 slots (3x -> 4x -> 5x and
-/// stops at L_depth), and falls at once when the depth becomes absent (35 B push) and when it
-/// goes stale (> 150 slots); the gate follows (3.5x refused at 3x, admitted at 5x, refused
-/// again after the fall).
+/// (c) Band market (clamp-enforced, L_tier 10x), L_launch 3x, tier-1 attested depth (venue tier
+/// 1), LP book $30k (book tier 1, `>= $25k`): tier = min(1, 1) = 1, target = L1 = 5x (R2.1). The
+/// ceiling climbs at most +1x per 9,000 slots (3x -> 4x -> 5x and stops at L_table(1)), and falls
+/// at once when the depth becomes absent (35 B push) and when it goes stale (> 150 slots); the
+/// gate follows (3.5x refused at 3x, admitted at 5x, refused again after the fall).
 #[test]
 fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth() {
     let mut env = env_with_launch(band_cfg(), 300);
@@ -2704,7 +2718,7 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     env.settle_rent(lp.account, lp.account).expect("tag 106: ratchet site");
     let g = env.growth();
     assert_eq!((g.c_launch_atoms, g.ceil_x100, g.ceil_slot), (1_000 * USD as u64, 300, s0));
-    env.deposit_to(&lp_owner, lp.account, 7_000 * USD); // C_m = 8 x C_launch: 3 doublings
+    env.deposit_to(&lp_owner, lp.account, 29_000 * USD); // C_m $30k: book tier 1
     // The gate reads min(stored 3x, target 5x): 3.5x is still refused.
     let taker = env.trader(100 * USD);
     let r = env.trade_cpi(&taker.0, taker.1, &lp, 350 * Q);
@@ -2729,7 +2743,7 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     env.warp(9_000);
     env.depth_twice(5 * DEPTH_T1);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().ceil_x100, 500, "capped at L_depth (tier 1 = 5x), not 6x");
+    assert_eq!(env.growth().ceil_x100, 500, "capped at L_table(1) = 5x, not 6x");
     // Stale depth (no position held yet, same slot): the stored ceiling is 5x but the depth's
     // stamp is 151 slots old (STATE POKE: one past DEPTH_MAX_AGE_SLOTS), so the GATE alone
     // (min(stored, live target)) refuses 3.5x.
@@ -2765,11 +2779,14 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     env.assert_conservation();
 }
 
-/// (e) The κ depth cap clips N_cap ONLY while the depth is fresh. Band market, LP $1,000 at
-/// λ 1x (N_cap 1,000 units). A fresh tier-0 depth of $600 (κ 0.5 -> $300) clips N_cap to 300
-/// units: the rent snapshot reads 300, an open of 301 is refused (GrowthCapacityFull) and 300
-/// lands. A first 44 B push alone (prev 0, effective 0) and an absent depth leave today's
-/// capacity (1,000 units).
+/// (e) The κ depth cap clips N_cap, and (R2.1, W-M1) STAYS once the market has had a fresh
+/// depth. Band market, LP $1,000 at λ 1x (N_cap 1,000 units). A first 44 B push alone (prev 0,
+/// effective 0, DEPTH_EVER not yet set) leaves today's capacity (1,000 units). A fresh tier-0
+/// depth of $600 (κ 0.5 -> $300) clips N_cap to 300 units: the rent snapshot reads 300, an open
+/// of 301 is refused / clipped and 300 lands. An absent depth (35 B push) KEEPS the cap at the
+/// last good $600 (round 1 removed it): a further open gets nothing while a reduce lands; one
+/// staleness epoch (9,000 slots) halves it to 150 units. The r_gap-mismatch market (not
+/// clamp-enforced) has no depth cap at all.
 #[test]
 fn g8_kappa_depth_cap_clips_n_cap_only_when_fresh() {
     let mut env = Env::new(band_cfg());
@@ -2799,13 +2816,27 @@ fn g8_kappa_depth_cap_clips_n_cap_only_when_fresh() {
     // The side is full: the clip leaves no room, so nothing fills (refused, or a zero fill).
     let r = env.trade_cpi(&t1.0, t1.1, &lp, Q);
     assert_eq!(env.pos(t1.1), 0, "the side is full at the depth cap: {r:?}");
-    // Absent depth (35 B, same slot): the cap is gone, today's capacity again.
+    // R2.1 (W-M1): absent depth (35 B, same slot) KEEPS the cap: the sticky last good $600 at
+    // tier 0 (κ 0.5) -> 300 units, never "uncapped".
+    env.push(PRICE);
+    let g = env.growth();
+    assert_eq!((g.depth_e6, g.depth_source & DEPTH_EVER), (0, DEPTH_EVER));
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "absent depth: the sticky cap stays");
+    let t2 = env.trader(1_000 * USD);
+    let r = env.trade_cpi(&t2.0, t2.1, &lp, 100 * Q);
+    assert_eq!(env.pos(t2.1), 0, "absent depth: the side stays full at the sticky cap: {r:?}");
+    // Reductions are never capacity-checked.
+    env.trade_cpi(&taker.0, taker.1, &lp, -100 * Q).expect("reduce at the cap");
+    assert_eq!(env.pos(taker.1), 200 * Q);
+    // One staleness epoch: the sticky depth halves ($300 -> κ 0.5 -> 150 units).
+    let lg = env.growth().depth_last_good_slot;
+    env.warp(lg + 9_000 - env.slot);
     env.push(PRICE);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    // The LP earned fees on the fills, so its capital rule is now a little above 1,000 units.
-    assert!(env.growth().rent_n_cap_q >= full, "absent depth: no cap");
-    let t2 = env.trader(1_000 * USD);
-    env.trade_cpi(&t2.0, t2.1, &lp, 100 * Q).expect("capacity back to 1,000 units");
+    assert_eq!(env.growth().rent_n_cap_q, 150 * Q as u64, "k = 1: last_good / 2");
+    let r = env.trade_cpi(&t2.0, t2.1, &lp, 10 * Q);
+    assert_eq!(env.pos(t2.1), 0, "200 units held > 150 cap: no open: {r:?}");
     env.assert_conservation();
     // §1.1 fail-closed predicate: a band market whose STORED r_gap is not G(d) (STATE POKE:
     // G + 1) is NOT clamp-enforced, so a fresh tier-0 depth does not clip N_cap there either
@@ -2847,4 +2878,318 @@ fn g8_wl2_two_same_slot_pushes_are_one_sample() {
     assert_eq!((g.depth_e6, g.depth_prev_e6), (600 * USD as u64, 400 * USD as u64));
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().rent_n_cap_q, 200 * Q as u64, "two slots: min $400 at κ 0.5 -> 200 units");
+}
+
+// ---------------------------------------------------------------------------
+// v2.2 growth round 2 (R2.1, 2026-10-14 12:52 / 13:10): sticky κ cap (W-M1), per-market tier
+// table, tier = min(venue, book), graduation 5x -> 10x -> 20x. Every test carries its control.
+// ---------------------------------------------------------------------------
+
+impl Env {
+    /// Tag 93 with the R2.1 27-byte trailer (lambda 1x, kink 50%, util unchanged), UA-signed.
+    fn set_tiers(&mut self, th: [u32; 3], lev: [u16; 3], attested_max_tier: u8) -> Result<u64, String> {
+        let ua = self.upgrade_authority.insecure_clone();
+        let (pd, market) = (self.program_data, self.market);
+        self.send(
+            ProgInstruction::SetAssetRiskLimitsV22Tiers {
+                limits: Box::new(ProgInstruction::SetAssetRiskLimits {
+                    asset_index: 0,
+                    exec_band_bps: 0,
+                    lp_exposure_k_bps: 0,
+                    lp_floor_atoms: 0,
+                    side_oi_cap_q: 0,
+                    matcher_ext_mode: 0,
+                    max_requested_fee_bps: 0,
+                }),
+                growth_lambda_bps: 10_000,
+                growth_kink_bps: 5_000,
+                growth_util_fee_max_bps: 0,
+                tiers: percolator_prog::growth_v19::TierConfig { threshold_usd: th, leverage_x100: lev },
+                attested_max_tier,
+            },
+            vec![
+                AccountMeta::new(ua.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&ua],
+        )
+    }
+
+    /// One ratchet epoch: warp to `ceil_slot + 9,000` (or 1 slot when already past), a fresh
+    /// attested pair at `depth`, then the tag-106 ratchet site. Returns the stored ceiling.
+    fn epoch_step(&mut self, lp: &Lp, depth: u64) -> u16 {
+        let due = self.growth().ceil_slot + percolator_prog::growth_v19::RATCHET_EPOCH_SLOTS;
+        let to = due.saturating_sub(self.slot + 1).max(1);
+        self.warp(to);
+        self.depth_twice(depth);
+        self.settle_rent(lp.account, lp.account).expect("tag 106: ratchet site");
+        self.growth().ceil_x100
+    }
+
+    fn poke_growth(&mut self, f: impl FnOnce(&mut state::AssetGrowthV19)) {
+        let mut acc = self.svm.get_account(&self.market).unwrap();
+        let mut g = state::read_asset_growth(&acc.data, 0, self.engine_imr).unwrap().unwrap();
+        f(&mut g);
+        state::write_asset_growth(&mut acc.data, 0, &g, self.engine_imr).unwrap();
+        self.svm.set_account(self.market, acc).unwrap();
+    }
+}
+
+/// A market with engine `(IMR, MMR, liquidation fee, min_nonzero_mm_req)` and band `band_bps`,
+/// launch `l_launch`. (At MMR 250 the Band Safety Law's floor region `N <= mm_floor·1e4/MMR`
+/// needs `mm_floor >= ~29` to absorb the per-atom rounding of loss + fee: 100 is used.)
+fn env_tiered(imr: u64, mmr: u64, liq: u64, mm_floor: u128, band_bps: u16, l_launch: u16) -> Env {
+    MKT.with(|m| m.set((imr, mmr, liq, mm_floor)));
+    let env = env_with_launch(Cfg { slots: 1, phase4: Some(phase4(band_bps, RENT_MAX)), r_gap: 0 }, l_launch);
+    MKT.with(|m| m.set((ENGINE_IMR, MMR, LIQ_FEE, 10)));
+    env
+}
+
+const USD_E6: u64 = 1_000_000;
+
+/// R2.1 §1 (W-M1): once a market has had a fresh depth, the κ cap NEVER switches off:
+/// * a stale reading (> 150 slots, STATE POKE of the stamp) keeps the last good cap;
+/// * the first push of a NEW pair (prev 0 after a 35 B push) keeps it (round 1: uncapped);
+/// * a fresh higher pair replaces it;
+/// * staleness halves it per 9,000 slots down to 0, where opens get nothing and a full close
+///   still lands.
+///
+/// NEGATIVE CONTROL: before any fresh pair (DEPTH_EVER clear) the market is uncapped.
+#[test]
+fn r2_sticky_cap_stale_first_push_of_pair_and_decay_to_zero() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let full = 1_000 * Q as u64;
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, full, "control: never had depth -> no cap");
+    env.warp(200);
+    env.push(PRICE);
+    env.warp(1); // W-L2: the 35 B push and the first attested push must not share a slot
+    env.depth_twice(600 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "fresh $600, κ 0.5");
+    // stale: the stamp 151 slots old (no push since)
+    let now = env.clock_slot();
+    env.poke_growth(|g| g.depth_slot = now - 151);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "stale: the sticky cap stays (round 1: 1,000)");
+    // first push of a new pair: 35 B (zero), then ONE attested $2,000 push next slot
+    env.warp(1);
+    env.push(PRICE);
+    env.warp(1);
+    env.push_depth(PRICE, 1, 2_000 * USD_E6).expect("first push of the new pair");
+    let g = env.growth();
+    assert_eq!((g.depth_e6, g.depth_prev_e6), (2_000 * USD_E6, 0));
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "one sample: still the sticky $600");
+    // the second sample makes the higher reading fresh: it replaces the last good depth
+    env.warp(1);
+    env.push_depth(PRICE, 1, 2_000 * USD_E6).expect("second push of the pair");
+    assert_eq!(env.growth().depth_last_good_e6, 2_000 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert!(env.growth().rent_n_cap_q >= full, "fresh $2,000 at κ 0.5 = $1,000 >= the capital rule");
+    let taker = env.trader(1_000 * USD);
+    env.trade_cpi(&taker.0, taker.1, &lp, 100 * Q).expect("open 100 units");
+    // depth goes absent and stays absent: halving per 9,000 slots, never uncapped
+    env.push(PRICE);
+    let lg = env.growth().depth_last_good_slot;
+    let mut prev = u64::MAX;
+    for k in 0..4u64 {
+        let t = lg + k * 9_000;
+        if t > env.slot {
+            env.warp(t - env.slot);
+        } else {
+            env.warp(1);
+        }
+        env.push(PRICE);
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        let n = env.growth().rent_n_cap_q;
+        assert_eq!(n, (1_000 * Q as u64) >> k, "k = {k}: $2,000 >> k at κ 0.5");
+        assert!(n <= prev);
+        prev = n;
+    }
+    // ... to 0 after 64 epochs: opens get nothing, a full close lands
+    let target = lg + 64 * 9_000;
+    env.warp(target - env.slot);
+    env.push(PRICE);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 0, "k >= 64: cap 0, not uncapped");
+    let t2 = env.trader(1_000 * USD);
+    let r = env.trade_cpi(&t2.0, t2.1, &lp, 10 * Q);
+    assert_eq!(env.pos(t2.1), 0, "cap 0: no open: {r:?}");
+    env.trade_cpi(&taker.0, taker.1, &lp, -100 * Q).expect("a full close at cap 0");
+    assert_eq!(env.pos(taker.1), 0);
+    env.assert_conservation();
+}
+
+/// R2.1 §3 venue tier: keeper-attested depth is capped at `attested_max_tier` (default 1).
+/// 10x band market, launch 5x, LP book $150k (book tier 2 at the default thresholds), attested
+/// depth $600k (raw tier 3): at the default the tier is 1 -> L1 = 5x = launch, no climb over a
+/// full epoch and 5.5x refused; after the UA sets attested_max_tier 3 the tier is min(3, 2) = 2
+/// -> target 10x and the ceiling steps to 6x (5.5x admitted).
+#[test]
+fn r2_attested_max_tier_1_vs_3() {
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    let lp = env.lp(150_000 * USD);
+    env.depth_twice(600_000 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 500, "attested capped at tier 1: 5x = launch");
+    let t = env.trader(100 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "5.5x over 5x");
+    env.set_tiers([0; 3], [0; 3], 3).expect("UA: attested_max_tier 3");
+    assert_eq!(env.growth().attested_max_tier, 3);
+    env.settle_rent(lp.account, lp.account).expect("tag 106 (epoch already elapsed)");
+    assert_eq!(env.growth().ceil_x100, 600, "tier min(3, book 2) = 2: one step toward 10x");
+    env.trade_cpi(&t.0, t.1, &lp, 550 * Q).expect("5.5x under 6x");
+    env.assert_conservation();
+}
+
+/// R2.1 §3: tier = min(venue, book). Venue tier 3 (attested $600k, attested_max_tier 3) but the
+/// LP book is $30k (book tier 1): target L1 = 5x = launch, no climb. Deposit to $120k (book tier
+/// 2): the ceiling steps to 6x. CONTROL: book tier 3 with venue tier 0 (no depth) never climbs.
+#[test]
+fn r2_book_tier_limits_venue_tier() {
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    env.set_tiers([0; 3], [0; 3], 3).expect("UA: attested_max_tier 3");
+    let lp = env.lp(30_000 * USD);
+    let owner = lp.owner.insecure_clone();
+    env.depth_twice(600_000 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 500, "book tier 1 holds venue tier 3 at 5x");
+    env.deposit_to(&owner, lp.account, 90_000 * USD);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().ceil_x100, 600, "book tier 2: one step toward 10x");
+    // control: a $600k book with no venue depth never graduates
+    let mut c = env_with_launch(band_cfg(), 500);
+    c.auth_mark();
+    c.set_tiers([0; 3], [0; 3], 3).expect("UA");
+    let clp = c.lp(600_000 * USD);
+    c.settle_rent(clp.account, clp.account).expect("snapshot");
+    c.warp(9_001);
+    c.push(PRICE);
+    c.settle_rent(clp.account, clp.account).expect("tag 106");
+    assert_eq!(c.growth().ceil_x100, 500, "venue tier 0: launch");
+}
+
+/// R2.1 + R2.0: a tiered band market (engine IMR 500 = 20x, MMR 250, liquidation fee 50 bps,
+/// band 60 bps: G(60) = 182, 182 + ~1 + ~51 <= 250 passes the Band Safety Law), launch 5x, UA
+/// tier table at the floors ($5k / $20k / $100k, default 5x/10x/20x) with attested_max_tier 3,
+/// LP book $150k (book tier 3). Venue tier 2 ($50k): 5x -> 10x one step per 9,000 slots, holds
+/// at 10x; venue tier 3 ($150k): 10x -> 20x one step per epoch, holds at 20x (L_tier); the gate
+/// follows (10.5x refused at 10x, 19x admitted at 20x). Depth loss (35 B push): straight back to
+/// 5x, and 5.5x is refused.
+#[test]
+fn r2_band_market_graduates_5x_10x_20x_and_drops_on_depth_loss() {
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    env.auth_mark();
+    let g0 = env.growth();
+    assert_eq!((g0.l_tier_x100, g0.l_launch_x100, g0.ceil_x100), (2_000, 500, 500));
+    assert_eq!(g0.r_gap_bps, percolator_prog::growth_v19::band_r_gap_bps(60).unwrap());
+    env.set_tiers([5_000, 20_000, 100_000], [0; 3], 3).expect("UA tier table");
+    let lp = env.lp(150_000 * USD);
+    let tier2 = 50_000 * USD_E6;
+    let tier3 = 150_000 * USD_E6;
+    env.depth_twice(tier2);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    assert_eq!(env.growth().ceil_x100, 500);
+    // not before the epoch boundary
+    let s = env.growth().ceil_slot;
+    env.warp(s + 9_000 - 2 - env.slot);
+    env.depth_twice(tier2);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().ceil_x100, 500, "inside the epoch: no climb");
+    let mut c = 500;
+    while c < 1_000 {
+        let n = env.epoch_step(&lp, tier2);
+        assert_eq!(n, c + 100, "+1x per epoch");
+        c = n;
+    }
+    assert_eq!(env.epoch_step(&lp, tier2), 1_000, "venue tier 2: holds at 10x");
+    let t = env.trader(100 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 1_050 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "10.5x over 10x");
+    env.trade_cpi(&t.0, t.1, &lp, 950 * Q).expect("9.5x under 10x");
+    // close it (a leg left uncertified across band epochs would block the market: 121)
+    env.trade_cpi(&t.0, t.1, &lp, -950 * Q).expect("close");
+    while c < 2_000 {
+        let n = env.epoch_step(&lp, tier3);
+        assert_eq!(n, c + 100, "+1x per epoch toward 20x");
+        c = n;
+    }
+    assert_eq!(env.epoch_step(&lp, tier3), 2_000, "holds at L_tier 20x");
+    let t2 = env.trader(100 * USD);
+    env.trade_cpi(&t2.0, t2.1, &lp, 1_900 * Q).expect("19x under the graduated 20x");
+    // depth loss: the 35 B push (same slot: no leg goes stale) zeroes the venue -> the
+    // fall-only writer drops the stored ceiling to launch at once
+    env.push(PRICE);
+    assert_eq!(env.growth().ceil_x100, 500, "depth loss: 5x at once");
+    // holders above the new ceiling can still reduce (and close), even while the asset is
+    // loss-stale after the push's accrual (reductions are never gated)
+    env.trade_cpi(&t2.0, t2.1, &lp, -1_000 * Q).expect("reduce after the drop");
+    env.trade_cpi(&t2.0, t2.1, &lp, -900 * Q).expect("close after the drop");
+    env.warp(1);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    env.crank_current(t2.1);
+    assert_eq!(env.growth().ceil_x100, 500);
+    let t3 = env.trader(100 * USD);
+    let r = env.trade_cpi(&t3.0, t3.1, &lp, 550 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "5.5x after the drop");
+    env.trade_cpi(&t3.0, t3.1, &lp, 450 * Q).expect("control: 4.5x after the drop");
+    env.assert_conservation();
+}
+
+/// R2.0: an existing 5x market (engine IMR 2,000: L_tier 5x; MMR 1,000; band 130 bps -- the
+/// CHILLHOUSE / swordcat `meme` preset) stays <= 5x whatever the depth, book and table: the
+/// default table clamps to 5x, an explicit L1 above L_tier is 130, and after epochs at venue and
+/// book tier 3 the ceiling is still 5x (5.5x refused, 4.9x admitted).
+#[test]
+fn r2_old_5x_market_stays_at_5x() {
+    let mut env = env_tiered(2_000, 1_000, LIQ_FEE, 10, 130, 500);
+    env.auth_mark();
+    assert_eq!(env.growth().l_tier_x100, 500);
+    let r = env.set_tiers([0; 3], [600, 0, 0], 3);
+    assert_err(&r, &code(PercolatorError::GrowthTierConfigInvalid), "L1 above L_tier 5x");
+    env.set_tiers([0; 3], [0; 3], 3).expect("defaults, attested 3");
+    let lp = env.lp(600_000 * USD);
+    env.depth_twice(600_000 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    for _ in 0..3 {
+        assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 500, "never above L_tier 5x");
+    }
+    let t = env.trader(100 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
+    // the engine's own IMR (20%) refuses it first (49); never admitted
+    assert!(r.is_err() && env.pos(t.1) == 0, "5.5x on a 5x market: {r:?}");
+    env.trade_cpi(&t.0, t.1, &lp, 490 * Q).expect("4.9x");
+}
+
+/// R2.1 §2: a tier table change never JUMPS the ceiling: raising L2 moves the target and the
+/// ratchet climbs +1x per epoch; lowering it takes effect at the next read (the gate applies
+/// min(stored, live target)) and the next writer stores it.
+#[test]
+fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    env.set_tiers([0; 3], [500, 600, 1_000], 3).expect("L2 = 6x");
+    let lp = env.lp(150_000 * USD);
+    env.depth_twice(600_000 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 600);
+    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 600, "held at L2 = 6x");
+    env.set_tiers([0; 3], [500, 1_000, 1_000], 3).expect("L2 = 10x");
+    let g = env.growth();
+    assert_eq!(g.ceil_x100, 600, "the setter does not move the ceiling");
+    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 700, "then +1x per epoch");
+    env.set_tiers([0; 3], [500, 500, 1_000], 3).expect("L2 = 5x");
+    let t = env.trader(100 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "lowered table binds at once (stored 7x)");
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().ceil_x100, 500, "the next writer stores the fall");
 }

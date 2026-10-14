@@ -544,6 +544,20 @@ impl Env {
         extra: &[AccountMeta],
         l_launch_x100: Option<u16>,
     ) -> Result<Lp, String> {
+        self.init_vault_lp_full_launch_tiers(signer, floor_bps, matcher_prog, extra, l_launch_x100, None)
+    }
+
+    /// Tag 94 with `l_launch_x100` and (R2.1) the optional 18-byte tier block
+    /// (`InitVaultLpV22Tiers`).
+    fn init_vault_lp_full_launch_tiers(
+        &mut self,
+        signer: &Keypair,
+        floor_bps: u16,
+        matcher_prog: Pubkey,
+        extra: &[AccountMeta],
+        l_launch_x100: Option<u16>,
+        tiers: Option<percolator_prog::growth_v19::TierConfig>,
+    ) -> Result<Lp, String> {
         let lp = self.new_program_account(self.plen);
         let ctx = Pubkey::new_unique();
         self.svm
@@ -585,13 +599,18 @@ impl Env {
         ];
         accts.extend_from_slice(extra);
         self.svm.expire_blockhash();
-        let ix = match l_launch_x100 {
-            None => ProgInstruction::InitVaultLp {
+        let ix = match (l_launch_x100, tiers) {
+            (None, _) => ProgInstruction::InitVaultLp {
                 junior_floor_bps: floor_bps,
             },
-            Some(l) => ProgInstruction::InitVaultLpV19 {
+            (Some(l), None) => ProgInstruction::InitVaultLpV19 {
                 junior_floor_bps: floor_bps,
                 l_launch_x100: l,
+            },
+            (Some(l), Some(tiers)) => ProgInstruction::InitVaultLpV22Tiers {
+                junior_floor_bps: floor_bps,
+                l_launch_x100: l,
+                tiers,
             },
         };
         self.send(ix, accts, &[signer])
@@ -2640,6 +2659,44 @@ fn p2_matcher_so() -> PathBuf {
 impl Env {
     /// Tag 93 SetAssetRiskLimits, upgrade-authority signed (ProgramData mocked = admin by
     /// `approve_matcher`).
+    /// R2.1: tag 93 with the 27-byte dial + tier trailer (lambda 1x, kink 50%, util unchanged),
+    /// signed by `signer` (the upgrade authority after `set_program_data_authority`).
+    fn set_tiers_as(
+        &mut self,
+        signer: &Keypair,
+        tiers: percolator_prog::growth_v19::TierConfig,
+        attested_max_tier: u8,
+    ) -> Result<(), String> {
+        let (pd, _) = Pubkey::find_program_address(&[self.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
+        let market = self.market;
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::SetAssetRiskLimitsV22Tiers {
+                limits: Box::new(ProgInstruction::SetAssetRiskLimits {
+                    asset_index: 0,
+                    exec_band_bps: 0,
+                    lp_exposure_k_bps: 0,
+                    lp_floor_atoms: 0,
+                    side_oi_cap_q: 0,
+                    matcher_ext_mode: 0,
+                    max_requested_fee_bps: 0,
+                }),
+                growth_lambda_bps: 10_000,
+                growth_kink_bps: 5_000,
+                growth_util_fee_max_bps: 0,
+                tiers,
+                attested_max_tier,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[signer],
+        )
+        .map(|_| ())
+    }
+
     fn set_fee_channel(&mut self, matcher_ext_mode: u8, max_requested_fee_bps: u16) -> Result<(), String> {
         let admin = self.admin.insecure_clone();
         let (pd, _) = Pubkey::find_program_address(&[self.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
@@ -5011,4 +5068,212 @@ fn s10_mirror_equals_ledger_principal_through_a_recall() {
     env.earn_execute(&d, Some(lp.portfolio)).expect("redeem after the recall");
     let end = s10_assert_mirror_equals_ledger(&env, "redeem after recall");
     assert!(end.0 + end.1 < after.0 + after.1, "vacuity: the redemption drew pot principal");
+}
+
+
+// ---------------------------------------------------------------------------
+// v2.2 growth round 2 (R2.1 §2): per-market tier table setters
+// ---------------------------------------------------------------------------
+
+fn tc(t: [u32; 3], l: [u16; 3]) -> percolator_prog::growth_v19::TierConfig {
+    percolator_prog::growth_v19::TierConfig { threshold_usd: t, leverage_x100: l }
+}
+
+/// Every R2.1 §2 bound violation for a market with L_launch 5x, L_tier 10x (each must be 130).
+fn r2_bad_tier_configs() -> Vec<(&'static str, percolator_prog::growth_v19::TierConfig)> {
+    vec![
+        ("T1 below $5k", tc([4_999, 20_000, 100_000], [0; 3])),
+        ("T2 below $20k", tc([5_000, 19_999, 100_000], [0; 3])),
+        ("T3 below $100k", tc([5_000, 20_000, 99_999], [0; 3])),
+        ("T1 == T2", tc([30_000, 30_000, 500_000], [0; 3])),
+        ("T2 above the default T3", tc([0, 600_000, 0], [0; 3])),
+        ("T3 below T2", tc([10_000, 200_000, 150_000], [0; 3])),
+        ("L1 below L_launch", tc([0; 3], [400, 0, 0])),
+        ("L2 below L1", tc([0; 3], [800, 700, 1_000])),
+        ("L3 below L2", tc([0; 3], [600, 900, 800])),
+        ("L3 above L_tier", tc([0; 3], [0, 0, 1_001])),
+    ]
+}
+
+/// R2.1 §2, creator at the tag-94 bind: the optional 18-byte tier block is stored as given when
+/// in bounds; every bound violation is refused with GrowthTierConfigInvalid (130) and the WHOLE
+/// bind reverts (the asset stays unbound, so a later good bind succeeds). Wire: 23 bytes
+/// `[94][floor u16][l_launch u16][T1 u32][T2 u32][T3 u32][L1 u16][L2 u16][L3 u16]`; a partial
+/// block is refused. NEGATIVE CONTROL: the 5-byte V19 bind leaves the table at the defaults.
+#[test]
+fn r2_tag94_creator_tier_block_bounds_and_revert() {
+    let e130 = "Custom(130)";
+    assert_eq!(PercolatorError::GrowthTierConfigInvalid as u32, 130);
+    // wire
+    let good = tc([10_000, 50_000, 200_000], [600, 800, 1_000]);
+    let v = ProgInstruction::InitVaultLpV22Tiers { junior_floor_bps: 2_000, l_launch_x100: 500, tiers: good }.encode();
+    let mut want = vec![94u8, 0xd0, 0x07, 0xf4, 0x01];
+    for t in good.threshold_usd {
+        want.extend_from_slice(&t.to_le_bytes());
+    }
+    for l in good.leverage_x100 {
+        want.extend_from_slice(&l.to_le_bytes());
+    }
+    assert_eq!(v, want);
+    assert_eq!(v.len(), 23);
+    assert_eq!(
+        ProgInstruction::decode(&v).unwrap(),
+        ProgInstruction::InitVaultLpV22Tiers { junior_floor_bps: 2_000, l_launch_x100: 500, tiers: good }
+    );
+    for len in [6usize, 21, 22, 24] {
+        let mut d = v.clone();
+        d.resize(len, 0);
+        assert!(ProgInstruction::decode(&d).is_err(), "len {len}");
+    }
+    // every refusal reverts the bind
+    let mut env = Env::new(growth_params());
+    let admin = env.admin.insecure_clone();
+    let m = env.matcher;
+    for (what, bad) in r2_bad_tier_configs() {
+        let r = env.init_vault_lp_full_launch_tiers(&admin, 2_000, m, &[], Some(500), Some(bad));
+        assert!(r.as_ref().err().is_some_and(|e| e.contains(e130)), "{what}: {:?}", r.as_ref().map(|_| ()));
+        let g = growth_rec(&env).unwrap();
+        assert_eq!((g.tier_threshold_usd, g.tier_leverage_x100, g.l_launch_x100), ([0; 3], [0; 3], 1_000), "{what}: nothing written");
+    }
+    env.init_vault_lp_full_launch_tiers(&admin, 2_000, m, &[], Some(500), Some(good)).expect("in-bounds tier block");
+    let g = growth_rec(&env).unwrap();
+    assert_eq!((g.tier_threshold_usd, g.tier_leverage_x100), (good.threshold_usd, good.leverage_x100));
+    assert_eq!((g.l_launch_x100, g.ceil_x100, g.attested_max_tier), (500, 500, 0), "creator never sets attested_max_tier");
+    // all-zero block = the defaults, accepted
+    let mut z = Env::new(growth_params());
+    let za = z.admin.insecure_clone();
+    let zm = z.matcher;
+    z.init_vault_lp_full_launch_tiers(&za, 2_000, zm, &[], Some(500), Some(tc([0; 3], [0; 3]))).expect("all defaults");
+    // NEGATIVE CONTROL: the V19 bind (no block) keeps the defaults
+    let mut c = Env::new(growth_params());
+    let ca = c.admin.insecure_clone();
+    let cm = c.matcher;
+    c.init_vault_lp_full_launch(&ca, 2_000, cm, &[], Some(500)).expect("V19 bind");
+    let g = growth_rec(&c).unwrap();
+    assert_eq!((g.tier_threshold_usd, g.tier_leverage_x100), ([0; 3], [0; 3]));
+    // growth OFF: a tier block is refused like an l_launch trailer (GrowthInvalidConfig 94)
+    let mut legacy = Env::new(Params::default());
+    let la = legacy.admin.insecure_clone();
+    let lm = legacy.matcher;
+    let r = legacy.init_vault_lp_full_launch_tiers(&la, 2_000, lm, &[], Some(500), Some(good));
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(94)")), "growth off: {:?}", r.as_ref().map(|_| ()));
+}
+
+/// R2.1 §2: an upgrade-authority tier preset set BEFORE the bind is kept FIELD BY FIELD (the
+/// G4 / L-4 rule): the creator's block fills only the zero fields; the merged table is bounded
+/// (a preset that the creator's L_launch would violate refuses the bind with 130).
+#[test]
+fn r2_tag94_creator_block_merges_under_ua_preset() {
+    // InitMarket launch 5x so a UA preset with L2 = 9x is in bounds before the bind.
+    let p5 = || Params { growth: Some((400, 500)), ..growth_params() };
+    let mut env = Env::new(p5());
+    let admin = env.admin.insecure_clone();
+    let a = admin.pubkey();
+    env.set_program_data_authority(&a);
+    env.set_tiers_as(&admin, tc([0, 40_000, 0], [0, 900, 0]), 2).expect("UA preset before bind");
+    let m = env.matcher;
+    env.init_vault_lp_full_launch_tiers(&admin, 2_000, m, &[], Some(500), Some(tc([10_000, 50_000, 200_000], [600, 800, 1_000])))
+        .expect("merged bind");
+    let g = growth_rec(&env).unwrap();
+    assert_eq!(g.tier_threshold_usd, [10_000, 40_000, 200_000], "UA's T2 kept");
+    assert_eq!(g.tier_leverage_x100, [600, 900, 1_000], "UA's L2 kept");
+    assert_eq!(g.attested_max_tier, 2, "UA's attested_max_tier kept");
+    // a UA preset L1 = 6x is violated by a creator l_launch of 7x: 130, nothing bound
+    let mut env = Env::new(p5());
+    let admin = env.admin.insecure_clone();
+    let a = admin.pubkey();
+    env.set_program_data_authority(&a);
+    env.set_tiers_as(&admin, tc([0; 3], [600, 0, 0]), 0).expect("UA preset");
+    let m = env.matcher;
+    let r = env.init_vault_lp_full_launch(&admin, 2_000, m, &[], Some(700));
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(130)")), "{:?}", r.as_ref().map(|_| ()));
+    env.init_vault_lp_full_launch(&admin, 2_000, m, &[], Some(600)).expect("L_launch 6x == L1 is in bounds");
+}
+
+/// R2.1 §2, upgrade authority via the 27-byte tag-93 trailer: replaces the table and sets
+/// attested_max_tier; every bound violation (and attested_max_tier 4) is 130 and changes
+/// nothing; a non-UA signer is Unauthorized; the old 6 / 8-byte forms leave the tier fields
+/// untouched; the trailer's legacy body must stay all-zero (L-4). Wire bytes pinned.
+#[test]
+fn r2_tag93_ua_tier_trailer_bounds_auth_and_backward_compat() {
+    use percolator_prog::growth_v19::TierConfig;
+    let t = tc([10_000, 50_000, 200_000], [600, 800, 1_000]);
+    let limits = ProgInstruction::SetAssetRiskLimits {
+        asset_index: 0, exec_band_bps: 0, lp_exposure_k_bps: 0, lp_floor_atoms: 0,
+        side_oi_cap_q: 0, matcher_ext_mode: 0, max_requested_fee_bps: 0,
+    };
+    let ix = ProgInstruction::SetAssetRiskLimitsV22Tiers {
+        limits: Box::new(limits.clone()),
+        growth_lambda_bps: 10_000, growth_kink_bps: 5_000, growth_util_fee_max_bps: 0,
+        tiers: t, attested_max_tier: 3,
+    };
+    let d = ix.encode();
+    // [93][asset u16][band u16][k u32][floor u128][cap u128][ext u8][fee u16] = 44, + 27
+    assert_eq!(d.len(), 44 + 27);
+    let mut trailer = Vec::new();
+    trailer.extend_from_slice(&10_000u32.to_le_bytes());
+    trailer.extend_from_slice(&5_000u16.to_le_bytes());
+    trailer.extend_from_slice(&0u16.to_le_bytes());
+    for v in t.threshold_usd {
+        trailer.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in t.leverage_x100 {
+        trailer.extend_from_slice(&v.to_le_bytes());
+    }
+    trailer.push(3);
+    assert_eq!(&d[44..], &trailer[..]);
+    assert_eq!(ProgInstruction::decode(&d).unwrap(), ix);
+    for len in [44 + 26, 44 + 28] {
+        let mut x = d.clone();
+        x.resize(len, 0);
+        assert!(ProgInstruction::decode(&x).is_err(), "len {len}");
+    }
+
+    let mut env = Env::new(growth_params());
+    env.bind(2_000); // admin is the upgrade authority from here
+    let admin = env.admin.insecure_clone();
+    let g0 = growth_rec(&env).unwrap();
+    assert_eq!(g0.l_launch_x100, 1_000, "growth_params launch 10x = L_tier");
+    // L_launch 10x: only L1 = L2 = L3 = 10x (or defaults) are in bounds on this market
+    let bad_l = tc([0; 3], [900, 0, 0]);
+    assert!(env.set_tiers_as(&admin, bad_l, 0).err().is_some_and(|e| e.contains("Custom(130)")));
+    for (what, bad) in r2_bad_tier_configs() {
+        if bad.leverage_x100 != [0; 3] {
+            continue; // the leverage cases above assume L_launch 5x
+        }
+        let r = env.set_tiers_as(&admin, bad, 0);
+        assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(130)")), "{what}: {r:?}");
+    }
+    let r = env.set_tiers_as(&admin, tc([0; 3], [0; 3]), 4);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(130)")), "attested_max_tier 4: {r:?}");
+    assert_eq!(growth_rec(&env).unwrap(), g0, "refusals change nothing");
+    let good = TierConfig { threshold_usd: [10_000, 50_000, 200_000], leverage_x100: [1_000, 1_000, 1_000] };
+    env.set_tiers_as(&admin, good, 3).expect("UA tier trailer");
+    let g = growth_rec(&env).unwrap();
+    assert_eq!((g.tier_threshold_usd, g.tier_leverage_x100, g.attested_max_tier), (good.threshold_usd, good.leverage_x100, 3));
+    assert_eq!((g.ceil_x100, g.ceil_slot), (g0.ceil_x100, g0.ceil_slot), "the setter never moves the stored ceiling");
+    // replace with defaults
+    env.set_tiers_as(&admin, tc([0; 3], [0; 3]), 0).expect("back to defaults");
+    assert_eq!(growth_rec(&env).unwrap().attested_max_tier, 0);
+    env.set_tiers_as(&admin, good, 3).expect("again");
+    // non-UA signer
+    let stranger = Keypair::new();
+    env.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    let r = env.set_tiers_as(&stranger, tc([0; 3], [0; 3]), 1);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(&format!("Custom({})", PercolatorError::Unauthorized as u32))), "non-UA: {r:?}");
+    // the 6-byte dial form leaves the tier fields untouched
+    let (pd, _) = Pubkey::find_program_address(&[env.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
+    let market = env.market;
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::SetAssetRiskLimitsV19 {
+            limits: Box::new(limits),
+            growth_lambda_bps: 9_000, growth_kink_bps: 5_000, growth_util_fee_max_bps: 0,
+        },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(pd, false), AccountMeta::new(market, false)],
+        &[&admin],
+    )
+    .expect("6-byte dial form");
+    let g = growth_rec(&env).unwrap();
+    assert_eq!((g.lambda_bps, g.tier_threshold_usd, g.attested_max_tier), (9_000, good.threshold_usd, 3));
 }

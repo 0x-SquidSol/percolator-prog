@@ -148,11 +148,15 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::UpdateMaintenanceFeePerSlot { .. } => "UpdateMaintenanceFeePerSlot",
         Instruction::ExpireBackingBucket { .. } => "ExpireBackingBucket",
         Instruction::WithdrawCreatorFee { .. } => "WithdrawCreatorFee",
-        Instruction::SetAssetRiskLimits { .. } | Instruction::SetAssetRiskLimitsV19 { .. } => {
+        Instruction::SetAssetRiskLimits { .. }
+        | Instruction::SetAssetRiskLimitsV19 { .. }
+        | Instruction::SetAssetRiskLimitsV22Tiers { .. } => {
             "SetAssetRiskLimits"
         }
         // P3 vault-owned LP (2026-09-29), tags 94..=102.
-        Instruction::InitVaultLp { .. } | Instruction::InitVaultLpV19 { .. } => "InitVaultLp",
+        Instruction::InitVaultLp { .. }
+        | Instruction::InitVaultLpV19 { .. }
+        | Instruction::InitVaultLpV22Tiers { .. } => "InitVaultLp",
         Instruction::VaultLpSetMatcher { .. } => "VaultLpSetMatcher",
         Instruction::DepositJuniorTranche { .. } => "DepositJuniorTranche",
         Instruction::WithdrawJuniorTranche { .. } => "WithdrawJuniorTranche",
