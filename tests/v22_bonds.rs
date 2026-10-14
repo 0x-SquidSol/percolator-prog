@@ -162,6 +162,9 @@ struct Params {
     funding: u64,
     /// growth-v19: `Some((r_gap_bps, l_launch_x100))` => InitMarket carries the growth block.
     growth: Option<(u16, u16)>,
+    /// v2.2 W-L1 tests: `Some(d)` => the growth market is a BAND market (InitMarketV22, band
+    /// `d` bps, no rent): clamp-enforced, so λ_eff applies.
+    band: Option<u16>,
 }
 
 impl Default for Params {
@@ -175,6 +178,7 @@ impl Default for Params {
             maint_fee: 0,
             funding: 0,
             growth: None,
+            band: None,
         }
     }
 }
@@ -329,12 +333,26 @@ impl Env {
                 public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
                 maintenance_fee_per_slot: p.maint_fee,
             };
-        let init = match p.growth {
-            None => init,
-            Some((r, l)) => ProgInstruction::InitMarketV19 {
+        let init = match (p.growth, p.band) {
+            (None, _) => init,
+            (Some((r, l)), None) => ProgInstruction::InitMarketV19 {
                 market: Box::new(init),
                 growth_r_gap_bps: r,
                 growth_l_launch_x100: l,
+            },
+            (Some((r, l)), Some(d)) => ProgInstruction::InitMarketV22 {
+                market: Box::new(init),
+                growth_r_gap_bps: r,
+                growth_l_launch_x100: l,
+                lot_exp: 0,
+                phase4: percolator_prog::ix::InitMarketPhase4 {
+                    rent_max_e9_per_slot: 0,
+                    rent_kink_bps: 0,
+                    band_bps: d,
+                    band_max_epoch_slots: 600,
+                    band_max_pin_slots: 9_000,
+                    band_min_leg_notional: 10_000_000,
+                },
             },
         };
         env.send(
@@ -489,12 +507,26 @@ impl Env {
                 public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
                 maintenance_fee_per_slot: p.maint_fee,
             };
-        let init = match p.growth {
-            None => init,
-            Some((r, l)) => ProgInstruction::InitMarketV19 {
+        let init = match (p.growth, p.band) {
+            (None, _) => init,
+            (Some((r, l)), None) => ProgInstruction::InitMarketV19 {
                 market: Box::new(init),
                 growth_r_gap_bps: r,
                 growth_l_launch_x100: l,
+            },
+            (Some((r, l)), Some(d)) => ProgInstruction::InitMarketV22 {
+                market: Box::new(init),
+                growth_r_gap_bps: r,
+                growth_l_launch_x100: l,
+                lot_exp: 0,
+                phase4: percolator_prog::ix::InitMarketPhase4 {
+                    rent_max_e9_per_slot: 0,
+                    rent_kink_bps: 0,
+                    band_bps: d,
+                    band_max_epoch_slots: 600,
+                    band_max_pin_slots: 9_000,
+                    band_min_leg_notional: 10_000_000,
+                },
             },
         };
         env.send(
@@ -3043,4 +3075,48 @@ fn bond_coupon_gate_uses_the_lag_worse_value_like_108_110() {
     err_has(&r108_l, PercolatorError::BondTrancheImpaired);
     assert_eq!(coupon_l, 0, "78 agrees with 108: impaired at the worse price, no coupon");
     assert!(coupon_c > 0, "control: no lag, the coupon is paid");
+}
+
+/// Security review W-L1 (v2.2 growth overnight): on a CLAMP-ENFORCED (band) market the bond
+/// withdrawal lock sizes capacity with λ_eff = min(stored λ, λ_depth(tier)), not the stored λ.
+/// STATE POKE: the stored λ is set to 2x (the value a band market's UA dial may set, tag 93; this
+/// harness has no UA mock). With no depth the tier is 0, so λ_eff = 1x and the gate admits OI up
+/// to C_m/P = 2,000 units. 1,500 units open on each side, then a 1,000 bond exit (C_m 2,000 ->
+/// 1,000): N_cap after at λ_eff = 1,000 < 1,500 -> BondCapacityLocked. Before W-L1 the lock read
+/// the stored 2x (N_cap after 2,000 >= 1,500) and the exit was PAID (file-copy negative control).
+/// Control: once the OI closes, the same exit pays par.
+#[test]
+fn wl1_band_bond_lock_uses_lambda_eff_not_the_stored_lambda() {
+    let p = Params { band: Some(100), ..growth_params() };
+    let (mut env, lp, _d, _h) = bond_world(p, 10_000, 1_000, 0, 0);
+    {
+        // STATE POKE: stored λ = 2x on the band market's growth record.
+        let mut acc = env.svm.get_account(&env.market).unwrap();
+        let mut g = state::read_asset_growth(&acc.data, 0, 1_000).unwrap().expect("growth on");
+        assert_eq!(Some(g.r_gap_bps), percolator_prog::growth_v19::band_r_gap_bps(100), "clamp-enforced");
+        g.lambda_bps = 20_000;
+        state::write_asset_growth(&mut acc.data, 0, &g, 1_000).unwrap();
+        env.svm.set_account(env.market, acc).unwrap();
+    }
+    let attacker = env.new_bond_holder();
+    env.bond_deposit(&attacker, lp.portfolio, 1_000 * U, 1).expect("bond");
+    env.bond_request(&attacker, 1_000 * U as u128).expect("109");
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    env.catch_up(lp.portfolio);
+    let long = env.new_trader(100_000 * U);
+    env.trade_signing_fee(&long, &lp, 1_500 * UQ, GROWTH_FEE).expect("long 1,500 (inside N_cap 2,000 at 1x)");
+    let short = env.new_trader(100_000 * U);
+    env.trade_signing_fee(&short, &lp, -1_500 * UQ, GROWTH_FEE).expect("short 1,500");
+    let _ = env.crank(lp.portfolio);
+    let _ = env.crank_fees_bond(lp.portfolio);
+    err_has(&env.bond_execute(&attacker, lp.portfolio, 0), PercolatorError::BondCapacityLocked);
+    env.trade_signing_fee(&long, &lp, -1_500 * UQ, GROWTH_FEE).expect("close long");
+    env.trade_signing_fee(&short, &lp, 1_500 * UQ, GROWTH_FEE).expect("close short");
+    let _ = env.crank(lp.portfolio);
+    let _ = env.crank_fees_bond(lp.portfolio);
+    let paid = env.bond_execute(&attacker, lp.portfolio, 0).expect("exit once nothing is open");
+    assert_eq!(paid, 1_000 * U, "par (coupon 0)");
+    env.assert_conserved("wl1");
 }

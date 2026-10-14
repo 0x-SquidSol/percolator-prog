@@ -2533,9 +2533,12 @@ impl Env {
         self.svm.send_transaction(tx).map(|m| m.compute_units_consumed).map_err(|e| format!("{e:?}"))
     }
 
-    /// Two attested pushes of the same depth (the effective depth is the min of the last two).
+    /// Two attested pushes of the same depth in two consecutive slots (the effective depth is
+    /// the min of the last two samples, which W-L2 requires to be in distinct slots). Advances
+    /// the clock by one slot.
     fn depth_twice(&mut self, depth_e6: u64) {
         self.push_depth(PRICE, 1, depth_e6).expect("attested push 1");
+        self.warp(1);
         self.push_depth(PRICE, 1, depth_e6).expect("attested push 2");
     }
 
@@ -2707,9 +2710,9 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     let r = env.trade_cpi(&taker.0, taker.1, &lp, 350 * Q);
     assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "stored ceiling 3x binds");
     // Up to one slot before the epoch boundary: no climb.
-    let to = s0 + 8_999 - env.slot;
+    let to = s0 + 8_998 - env.slot;
     env.warp(to);
-    env.depth_twice(5 * DEPTH_T1);
+    env.depth_twice(5 * DEPTH_T1); // ends at s0 + 8,999
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().ceil_x100, 300, "inside the epoch: no climb");
     env.warp(1);
@@ -2778,6 +2781,7 @@ fn g8_kappa_depth_cap_clips_n_cap_only_when_fresh() {
     env.push_depth(PRICE, 1, 600 * USD as u64).expect("first 44 B push");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().rent_n_cap_q, full, "first push: prev 0 -> effective 0 -> no cap");
+    env.warp(1); // W-L2: the second sample must be in a later slot
     env.push_depth(PRICE, 1, 600 * USD as u64).expect("second 44 B push");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "fresh $600 at κ 0.5 -> 300 units");
@@ -2813,9 +2817,34 @@ fn g8_kappa_depth_cap_clips_n_cap_only_when_fresh() {
     g.r_gap_bps = g_derived + 1;
     state::write_asset_growth(&mut acc.data, 0, &g, ENGINE_IMR).unwrap();
     env.svm.set_account(env.market, acc).unwrap();
-    env.push_depth(PRICE, 1, 600 * USD as u64).expect("push");
-    env.push_depth(PRICE, 1, 600 * USD as u64).expect("push");
+    env.depth_twice(600 * USD as u64);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert!(env.growth().rent_n_cap_q >= full, "r_gap mismatch: not enforced, no depth cap");
     assert_err(&env.set_growth_dials(20_000, 5_000, 0), &code(PercolatorError::GrowthInvalidConfig), "r_gap mismatch: no lambda > 1x");
+}
+
+/// Security review W-L2: two 44 B pushes in the SAME slot are ONE sample: `depth_prev_e6` is
+/// not rotated and the depth cannot rise, so the effective depth stays 0 (no tier, no κ cap);
+/// a push in the next slot makes it effective. Same-slot pushes can only lower the depth.
+#[test]
+fn g8_wl2_two_same_slot_pushes_are_one_sample() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let full = 1_000 * Q as u64;
+    env.warp(1);
+    env.push_depth(PRICE, 1, 600 * USD as u64).expect("push 1");
+    env.push_depth(PRICE, 1, 900 * USD as u64).expect("push 2, same slot");
+    let g = env.growth();
+    assert_eq!((g.depth_e6, g.depth_prev_e6), (600 * USD as u64, 0), "same slot: no rotation, no rise");
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, full, "one sample: effective 0, no cap");
+    env.push_depth(PRICE, 1, 400 * USD as u64).expect("push 3, same slot, lower");
+    assert_eq!(env.growth().depth_e6, 400 * USD as u64, "same slot: the depth can fall");
+    env.warp(1);
+    env.push_depth(PRICE, 1, 600 * USD as u64).expect("push 4, next slot");
+    let g = env.growth();
+    assert_eq!((g.depth_e6, g.depth_prev_e6), (600 * USD as u64, 400 * USD as u64));
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 200 * Q as u64, "two slots: min $400 at κ 0.5 -> 200 units");
 }

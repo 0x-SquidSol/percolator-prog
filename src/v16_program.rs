@@ -18983,8 +18983,9 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 // growth-v19: one number -- on a growth asset the default vault-LP leverage is
                 // the growth `lambda_bps` (N_cap); an explicit tag-99 value stays an override.
+                // W-L1: λ_eff on a clamp-enforced market (`growth_capacity_lambda_view`).
                 let lev = match (rec.vault_lp_max_lev_bps, asset_growth_view(&group, idx)?) {
-                    (0, Some(g)) => g.lambda_bps,
+                    (0, Some(g)) => growth_capacity_lambda_view(&group, idx, &g)?,
                     (0, None) => crate::constants::VAULT_LP_DEFAULT_MAX_LEV_BPS,
                     (v, _) => v,
                 };
@@ -27835,10 +27836,24 @@ pub mod processor {
             // The decoder admits nothing else; refuse rather than store an unknown source.
             Some(_) => return Err(PercolatorError::DepthInputInvalid.into()),
         };
-        g.depth_prev_e6 = g.depth_e6;
-        g.depth_e6 = depth_e6;
-        g.depth_source = source;
-        g.depth_slot = authenticated_slot;
+        // Security review W-L2: a same-slot push is not a second sample (prev kept, depth can
+        // only fall); a later-slot push rotates the stored depth into `depth_prev_e6`.
+        let (d, prev, slot) = growth_v19::depth_push_update(
+            g.depth_e6,
+            g.depth_prev_e6,
+            g.depth_slot,
+            depth_e6,
+            authenticated_slot,
+        );
+        g.depth_e6 = d;
+        g.depth_prev_e6 = prev;
+        g.depth_slot = slot;
+        // The source describes the stored `depth_e6`: none once it is 0.
+        g.depth_source = if d == 0 {
+            growth_v19::DEPTH_SOURCE_NONE
+        } else {
+            source
+        };
         let ctx = growth_g8_ctx_view(group, asset_index, &g)?;
         if ctx.clamp {
             let (ceil, slot) = growth_v19::graduation_fall_only(
@@ -36251,8 +36266,10 @@ pub mod processor {
             return Ok(None);
         };
         let price = market.engine.asset.effective_price.get();
+        // W-L1: λ_eff on a clamp-enforced market, never the κ depth cap (A4 must not loosen).
+        let lambda = growth_capacity_lambda_view(group, asset_index, &g)?;
         Ok(Some(
-            growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE).unwrap_or(0),
+            growth_v19::n_cap_q(c_m, lambda, price, percolator::POS_SCALE).unwrap_or(0),
         ))
     }
 
@@ -41884,6 +41901,26 @@ pub mod processor {
         })
     }
 
+    /// Security review W-L1 (v2.2 growth overnight): the LP-capacity lambda every OTHER stored-λ
+    /// reader uses (junior / bond capacity locks and bond utilisation via `growth_n_cap_for_view`,
+    /// the P3-H2 vault-LP exposure cap, the P1 LP cap / matcher headroom): `λ_eff = min(stored λ,
+    /// λ_depth(tier))` on a clamp-enforced market, the stored λ off it (growth-1, unchanged). Only
+    /// λ, never the κ depth cap: a missing or tiny depth must not let the keeper lock junior
+    /// capital or loosen the A4 lock. `λ_eff <= stored λ`, so every reader can only tighten.
+    #[inline(never)]
+    fn growth_capacity_lambda_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        g: &state::AssetGrowthV19,
+    ) -> Result<u32, ProgramError> {
+        let ctx = growth_g8_ctx_view(group, asset_index, g)?;
+        Ok(if ctx.clamp {
+            growth_v19::lambda_eff_bps(g.lambda_bps, ctx.tier)
+        } else {
+            g.lambda_bps
+        })
+    }
+
     /// G8 `N_cap` for the TradeCpi open-room clip (`growth_n_cap_g8`, 0 on `None`: no room), in
     /// its own frame so the pinned `p1_cpi_preflight_before_matcher` frame does not grow.
     #[inline(never)]
@@ -42750,15 +42787,18 @@ pub mod processor {
         if risk_limits_v17::lp_floor_halts(equity, limits.lp_floor_atoms, true) {
             return Ok((true, 0));
         }
-        // growth-v19: on a growth asset the DEFAULT multiplier is the growth `lambda_bps`
-        // (`N_cap = lambda * C_m / P` replaces `k = 1e8 / IMR`), so the headroom the matcher is
-        // clipped to and the post-fill LP cap are the same number as the growth gate's N_cap.
-        // An explicit tag-93 `lp_exposure_k_bps` stays an upgrade-authority override.
+        // growth-v19: on a growth asset the DEFAULT multiplier is the growth lambda (`N_cap =
+        // lambda * C_m / P` replaces `k = 1e8 / IMR`). W-L1 (v2.2 growth overnight): on a
+        // clamp-enforced market that lambda is `λ_eff` (`growth_capacity_lambda_view`), so this
+        // cap is the growth gate's CAPITAL rule `n_cap_q(C_m, λ_eff)`; it is NOT the gate's full
+        // N_cap, which also takes the κ depth cap when the depth is fresh (the gate stays the
+        // binding limit there; a matcher fill past it reverts, never lands). An explicit tag-93
+        // `lp_exposure_k_bps` stays an upgrade-authority override.
         let k = match (
             limits.lp_exposure_k_bps,
             asset_growth_view(group, asset_index)?,
         ) {
-            (0, Some(g)) => g.lambda_bps,
+            (0, Some(g)) => growth_capacity_lambda_view(group, asset_index, &g)?,
             (stored, _) => risk_limits_v17::effective_lp_exposure_k_bps(
                 stored,
                 group.header.config.initial_margin_bps.get(),
@@ -47989,6 +48029,31 @@ mod g8_kani_proofs {
         kani::cover!(depth != 0 && n.is_some_and(|x| x > 0) && n == n_cap_q(c_m as u128, lambda_eff_bps(lam as u32, tier), price as u64, ps), "capital binds");
         kani::cover!(depth == 0 && n.is_some_and(|x| x > 0), "no depth: capital rule");
         kani::cover!(price == 0, "price 0 fails closed");
+    }
+
+    /// W-L2: a push in the same slot (or earlier) as the stored sample never raises the depth
+    /// and never rotates `prev`; a later-slot push rotates exactly once. So two samples always
+    /// span two distinct slots.
+    /// Mutants: rotate always; `max` instead of `min` in the same-slot branch; `<` for `<=`.
+    #[kani::proof]
+    fn kani_g8_wl2_same_slot_is_one_sample() {
+        let d: u32 = kani::any();
+        let p: u32 = kani::any();
+        let s: u32 = kani::any();
+        let n: u32 = kani::any();
+        let now: u32 = kani::any();
+        let (d, p, s, n, now) = (d as u64, p as u64, s as u64, n as u64, now as u64);
+        let (d2, p2, s2) = depth_push_update(d, p, s, n, now);
+        if s != 0 && now <= s {
+            assert!(d2 <= d && d2 <= n);
+            assert_eq!((p2, s2), (p, s));
+        } else {
+            assert_eq!((d2, p2, s2), (n, d, now));
+        }
+        kani::cover!(s != 0 && now == s && n > d && d2 == d, "same-slot raise refused");
+        kani::cover!(s != 0 && now == s && n < d && d2 == n, "same-slot fall");
+        kani::cover!(now > s && p2 == d, "later slot rotates");
+        kani::cover!(s == 0, "first ever sample");
     }
 
     /// Off-band identity: with the clamp predicate false the ceiling in force is exactly

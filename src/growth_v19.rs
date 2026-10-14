@@ -998,6 +998,35 @@ pub fn effective_depth_e6(depth_e6: u64, depth_prev_e6: u64, depth_slot: u64, no
     }
 }
 
+/// The stored depth after a PushAuthMark (35 B: `new_depth_e6 = 0`). Returns
+/// `(depth_e6, depth_prev_e6, depth_slot)`.
+/// * A push in a LATER slot than the stored sample: the stored depth becomes `depth_prev_e6`
+///   and the new one is stored, stamped `now`.
+/// * Security review W-L2: a push in the SAME slot as the stored sample (`now == depth_slot`,
+///   e.g. two pushes in one slot or one transaction) is not a second point in time: `prev` is
+///   kept and the stored depth can only FALL, `min(depth_e6, new)`. So the "min of two reads"
+///   always spans two distinct slots, and a same-slot repeat can never raise the depth.
+/// * A push stamped BEFORE the stored sample (`now < depth_slot`; the handler refuses a slot
+///   regression, so this is defensive) is treated like the same slot (fall only).
+pub fn depth_push_update(
+    depth_e6: u64,
+    depth_prev_e6: u64,
+    depth_slot: u64,
+    new_depth_e6: u64,
+    now_slot: u64,
+) -> (u64, u64, u64) {
+    if depth_slot != 0 && now_slot <= depth_slot {
+        let d = if new_depth_e6 < depth_e6 {
+            new_depth_e6
+        } else {
+            depth_e6
+        };
+        (d, depth_prev_e6, depth_slot)
+    } else {
+        (new_depth_e6, depth_e6, now_slot)
+    }
+}
+
 /// The liquidity tier of an EFFECTIVE depth: 0 below $25k (or absent / stale: I-D1), 1 from
 /// $25k, 2 from $100k, 3 from $500k, but keeper-attested depth is capped at tier 1 (I-D3) and
 /// any other source (none, or an unbuilt on-chain source) is tier 0 (fail closed).
@@ -1899,6 +1928,32 @@ mod tests {
         assert_eq!((kappa_depth_bps(0), kappa_depth_bps(1), kappa_depth_bps(2), kappa_depth_bps(3)), (5_000, 10_000, 10_000, 20_000));
         assert_eq!(lambda_eff_bps(30_000, 1), 10_000);
         assert_eq!(lambda_eff_bps(5_000, 3), 5_000);
+    }
+
+    #[test]
+    fn g8_wl2_same_slot_push_is_not_a_second_sample() {
+        let t1 = DEPTH_TIER1_E6;
+        // later slot: rotate
+        assert_eq!(depth_push_update(t1, 0, 10, 2 * t1, 11), (2 * t1, t1, 11));
+        // first ever push (slot 0 = never): rotate
+        assert_eq!(depth_push_update(0, 0, 0, t1, 5), (t1, 0, 5));
+        // same slot: prev kept, depth can only fall
+        assert_eq!(depth_push_update(t1, 0, 10, 2 * t1, 10), (t1, 0, 10), "cannot raise");
+        assert_eq!(depth_push_update(2 * t1, 7, 10, t1, 10), (t1, 7, 10), "can fall");
+        assert_eq!(depth_push_update(2 * t1, 7, 10, 0, 10), (0, 7, 10), "35 B in the same slot zeroes");
+        // two same-slot attested pushes from nothing: still one sample -> effective 0
+        let (d, p, s) = depth_push_update(0, 0, 0, 5 * t1, 20);
+        let (d, p, s) = depth_push_update(d, p, s, 5 * t1, 20);
+        assert_eq!(effective_depth_e6(d, p, s, 20), 0, "W-L2: one slot is one sample");
+        let (d, p, s) = depth_push_update(d, p, s, 5 * t1, 21);
+        assert_eq!(effective_depth_e6(d, p, s, 21), 5 * t1, "two slots: effective");
+        // MUTANT (pre-W-L2 rotate-always): the same-slot pair becomes effective at once
+        let mutant = |d: u64, _p: u64, _s: u64, n: u64, now: u64| (n, d, now);
+        let (d, p, s) = mutant(0, 0, 0, 5 * t1, 20);
+        let (d, p, s) = mutant(d, p, s, 5 * t1, 20);
+        assert_eq!(effective_depth_e6(d, p, s, 20), 5 * t1, "mutant: one-slot spike counts");
+        // regression stamp: fall only
+        assert_eq!(depth_push_update(t1, 3, 10, 2 * t1, 9), (t1, 3, 10));
     }
 
     #[test]
