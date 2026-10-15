@@ -1252,9 +1252,11 @@ pub fn depth_rise_window_open(rise_slot64: u32, slot: u64) -> bool {
 
 /// The time-weighted window's bucket: 750 slots (~5 min at 400 ms). The window is the current and
 /// the previous bucket, i.e. the minimum of every fresh sample over the last 5-10 minutes.
+/// Liveness (security review F-8): a RISE needs a full adjacent bucket pair, so the keeper must
+/// push depth at least once per 750 slots or the rate-limited depth can never rise.
 pub const DEPTH_TW_BUCKET_SLOTS: u64 = 750;
 /// The stored bucket index is `(slot / 750) % DEPTH_TW_BUCKET_RING + 1` (u16; 0 = no window
-/// history yet). The ring wraps after 65,535 buckets (~49M slots, ~5.7 days); a wrapped false
+/// history yet). The ring wraps after 65,535 buckets (~49M slots, ~227 days at 400 ms); a wrapped false
 /// "same" / "adjacent" match only ever folds an OLDER minimum in (a min), never raises anything.
 pub const DEPTH_TW_BUCKET_RING: u64 = 65_535;
 /// `depth_tw_prev_tokens` value meaning "no previous bucket in the window" (a gap of more than
@@ -1878,7 +1880,8 @@ pub fn tier_ramp_u64(d: u64, th: [u64; 3], table: [u64; 4]) -> u64 {
 
 // ── v2.2 round 3 item 6 (design GAP-6): a volatility input to the leverage target ───────────
 
-/// The EWMA weight of a new sample: `1 / 2^4` (~16 pushes, ~1 min at the keeper's cadence).
+/// The EWMA weight of a new sample: `1 / 2^4`, PER PUSH (not per unit of time): the memory is
+/// ~16 pushes whatever their spacing (security review F-4, accepted for devnet).
 pub const VOL_EWMA_SHIFT: u32 = 4;
 /// z of the volatility term (protocol constant, conservative).
 pub const VOL_Z: u64 = 3;
@@ -1933,14 +1936,16 @@ pub fn vol_update_x100(var_x100: u32, has_data: bool, sample_x100: u64) -> u32 {
     }
 }
 
-/// `ceil(sqrt(x))` for u128 (Newton from above; exact).
+/// `ceil(sqrt(x))` for u128 (Newton from above; exact). Security review F-8: the first iterate
+/// is now `ceil(x / 2) = (x + x / x) / 2` (was `x / 2 + 1`, which equals `x` at `x = 2` and stopped
+/// the loop at once: `isqrt_ceil(2)` was 3).
 pub fn isqrt_ceil_u128(x: u128) -> u128 {
     if x < 2 {
         return x;
     }
     // floor sqrt by Newton
     let mut r = x;
-    let mut y = x / 2 + 1; // < x for x >= 2, and never overflows
+    let mut y = x / 2 + (x & 1); // ceil(x / 2) < x for x >= 2, and never overflows
     while y < r {
         r = y;
         y = (r + x / r) / 2;
@@ -2224,8 +2229,8 @@ pub fn growth_matcher_caps_g8_dials(
 /// with `tier = min(venue_tier, book_tier)` (the book tier IS the capital term now: absolute LP
 /// book depth vs the per-market thresholds) and `l_table_tier_x100 = L_table(tier)`
 /// (`tier_leverage`). Round 1's doublings term `L_launch + floor(log2(C_m / C_launch))·1x` is
-/// gone from the target (it made 10x need 32x the launch capital and 20x ~32,768x); `c_launch`
-/// is still recorded and reset (I-1) but no longer read here. Never above `L_tier` or
+/// gone from the target (it made 10x need 32x the launch capital and 20x ~32,768x); round 3
+/// item 6 retired `c_launch` (its bytes carry the volatility EWMA and the rent stamp). Never above `L_tier` or
 /// `max(launch, L_table(tier))` (I-D2), never below the launch ceiling, and never above the
 /// stress cap unless that is below launch.
 pub fn target_ceiling_x100(
@@ -2788,6 +2793,15 @@ mod tests {
         assert_eq!(isqrt_ceil_u128(u128::MAX), 1u128 << 64);
         assert_eq!(isqrt_ceil_u128(16), 4);
         assert_eq!(isqrt_ceil_u128(17), 5);
+        assert_eq!(isqrt_ceil_u128(2), 2, "F-8: was 3");
+        for x in 0u128..200_000 {
+            let r = isqrt_ceil_u128(x);
+            assert!(r * r >= x && (r == 0 || (r - 1) * (r - 1) < x), "ceil sqrt({x}) = {r}");
+        }
+        for k in [u64::MAX as u128, (1u128 << 64) + 1, u128::MAX - 1, (1u128 << 127) + 12_345] {
+            let r = isqrt_ceil_u128(k);
+            assert!(r.checked_mul(r).is_none_or(|p| p >= k) && (r - 1) * (r - 1) < k, "ceil sqrt({k}) = {r}");
+        }
         // L_vol: 1e6 / max(IMR 500, 3 * 174 + 50 = 572) = 1,748 (17.48x)
         assert_eq!(l_vol_x100(500, 174, 50), 1_748);
         assert_eq!(l_vol_x100(500, 0, 50), 2_000, "calm: the engine IMR binds (20x)");
