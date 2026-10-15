@@ -4532,6 +4532,122 @@ fn r3_item6_legacy_c_launch_record_migrates_on_push() {
     assert_eq!(g.vol_var_x100(), percolator_prog::growth_v19::VOL_VAR_SEED_X100, "migrated, seeded by the first (calm) sample");
 }
 
+// ── Security review F-3: records written by the combined build (153c62fc, devnet sha 01e159ce) ──
+
+/// The combined build's 120-byte growth record, by byte range (`git show 153c62fc`):
+/// 0..8 `c_launch_atoms` (u64), 30..38 the dead alloc / cushion dials (validated 0), 39 `flags`
+/// (validated 0), 44 `depth_source` (source | DEPTH_PREV_REAL 0x04 | DEPTH_EVER 0x80), 96..114
+/// the tier table, 114..118 the depth rise stamp, 118..120 `_reserved1` (validated 0).
+fn f3_assert_combined_shape(bytes: &[u8]) {
+    assert_eq!(bytes.len(), 120);
+    assert_ne!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0, "c_launch recorded at 0..8");
+    assert_eq!(&bytes[30..38], &[0u8; 8], "dead dials 30..38 zero");
+    assert_eq!(bytes[39], 0, "flags 0");
+    assert_eq!(bytes[44] & (DEPTH_PREV_REAL | DEPTH_EVER), DEPTH_PREV_REAL | DEPTH_EVER, "depth_source bits 2 and 7");
+    assert!(bytes[96..118].iter().any(|b| *b != 0), "tier table / rise stamp 96..118 set");
+    assert_eq!(&bytes[118..120], &[0u8; 2], "_reserved1 zero");
+}
+
+/// The controller's view of a combined-written record (the shared F-3 assertions): it validates
+/// and reads launch-safe -- no volatility data (L_vol = launch), no rent stamp, no depth window
+/// (round-2 depth rules) -- the keeper crank of the LP works BEFORE any migration (flags stay
+/// 0, bytes 0..8 untouched), the gate holds the 5x launch ceiling (5.5x refused, 4.5x admitted),
+/// the first later-slot push migrates the record (bit 0 + the first volatility sample; the old
+/// c_launch is gone), and a record with flags 0x02 (bit 1 without bit 0) is refused.
+fn f3_controller_reads_combined_record(env: &mut Env, lp: &Lp, tier: u64) {
+    let range = state::asset_growth_range(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap();
+    let raw = env.svm.get_account(&env.market).unwrap().data[range.clone()].to_vec();
+    f3_assert_combined_shape(&raw);
+    let g = env.growth();
+    assert_eq!(g.flags, 0);
+    assert_eq!((g.vol_has_data(), g.vol_var_x100(), g.rent_stamp64()), (false, 0, 0), "no vol data, no rent stamp");
+    assert_eq!(g.depth_tw().bucket_p1, 0, "no depth window history");
+    assert_eq!(g.depth_tw_min_e6(), None);
+    assert_eq!(g.ceil_x100, 500, "launch ceiling");
+    // the keeper crank works on the unmigrated record (the LP crank is a ratchet site)
+    env.warp(5);
+    env.crank(lp.account).expect("tag 5 on the vault LP before migration");
+    let raw2 = env.svm.get_account(&env.market).unwrap().data[range.clone()].to_vec();
+    assert_eq!((&raw2[0..8], raw2[39]), (&raw[0..8], 0u8), "the crank does not migrate");
+    // the gate: launch 5x
+    let t = env.trader(100 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "5.5x over the launch 5x");
+    env.trade_cpi(&t.0, t.1, &lp, 450 * Q).expect("4.5x under launch");
+    env.trade_cpi(&t.0, t.1, &lp, -450 * Q).expect("close");
+    // the first later-slot push migrates
+    env.warp(1);
+    env.push_depth(PRICE, 1, tier).expect("first controller push");
+    let g = env.growth();
+    assert_eq!(g.flags, percolator_prog::growth_v19::GROWTH_FLAG_R3_LAYOUT | percolator_prog::growth_v19::GROWTH_FLAG_VOL_DATA, "migrated");
+    assert_eq!(g.vol_var_x100(), percolator_prog::growth_v19::VOL_VAR_SEED_X100, "seeded by the first (calm) sample");
+    let raw3 = env.svm.get_account(&env.market).unwrap().data[range.clone()].to_vec();
+    assert_ne!(&raw3[0..8], &raw[0..8], "the retired c_launch is gone");
+    assert_ne!(g.depth_tw().bucket_p1, 0, "the window starts");
+    // flags 0x02 alone is refused (read and push)
+    let mut acc = env.svm.get_account(&env.market).unwrap();
+    acc.data[range.start + 39] = percolator_prog::growth_v19::GROWTH_FLAG_VOL_DATA;
+    env.svm.set_account(env.market, acc).unwrap();
+    assert!(state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, env.engine_imr).is_err(), "flags 0x02 refused");
+    env.warp(1);
+    assert!(env.push_depth(PRICE, 1, tier).is_err(), "a push on a flags-0x02 record fails closed");
+}
+
+/// The combined market under test: band 60 bps, 20x engine, launch 5x, UA tier table, LP $150k,
+/// depth at tier 2 held twice, then tag 106 (the combined's ratchet snapshot writes c_launch).
+fn f3_market(env: &mut Env) -> Lp {
+    env.auth_mark();
+    env.set_tiers([5_000, 20_000, 100_000], [0; 3], 3).expect("UA tier table");
+    let lp = env.lp(150_000 * USD);
+    env.depth_twice(50_000 * USD_E6);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    lp
+}
+
+/// F-3 (always runs): a record seeded EXACTLY in the combined build's byte layout (c_launch at
+/// 0..8, flags 0, dead dials 30..38 and _reserved1 118..120 zero, depth_source 0x85, tier table
+/// and rise stamp 96..118 set) on a controller market. NEGATIVE CONTROL (file copy): reading
+/// bytes 0..4 as the variance without the flags-bit-0 gate makes `vol_var_x100()` the old
+/// c_launch (nonzero) and the first assertion of `f3_controller_reads_combined_record` fails.
+#[test]
+fn f3_combined_written_record_is_launch_safe_and_migrates_on_push() {
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    let lp = f3_market(&mut env);
+    let mut acc = env.svm.get_account(&env.market).unwrap();
+    let r = state::asset_growth_range(&acc.data, 0).unwrap();
+    {
+        let b = &mut acc.data[r.clone()];
+        b[0..8].copy_from_slice(&1_000_000_000u64.to_le_bytes()); // c_launch_atoms_for: the $1,000 floor
+        b[30..38].fill(0);
+        b[39] = 0;
+        b[118..120].fill(0);
+    }
+    env.svm.set_account(env.market, acc).unwrap();
+    f3_controller_reads_combined_record(&mut env, &lp, 50_000 * USD_E6);
+    env.assert_conservation();
+}
+
+/// F-3 (the real upgrade, `#[ignore]`: machine-local binary): the market is created and run on
+/// the COMBINED binary (`COMBINED_SO`, 153c62fc = sha 01e159ce), so the record is exactly what
+/// the combined writes; then the program account is replaced by this build (the upgrade) and the
+/// same assertions run. Run: `COMBINED_SO=<combined .so> cargo test --test v22_band_rent --
+/// --ignored f3_`. A missing path is a FAILURE, never a pass.
+#[test]
+#[ignore]
+fn f3_upgrade_from_the_combined_binary_reads_its_records() {
+    let so = PathBuf::from(std::env::var_os("COMBINED_SO").expect("COMBINED_SO (the combined wrapper .so) must be set"));
+    assert!(so.exists(), "COMBINED_SO {so:?} does not exist");
+    PROG_SO.with(|p| *p.borrow_mut() = Some(so));
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    PROG_SO.with(|p| *p.borrow_mut() = None);
+    let lp = f3_market(&mut env);
+    // the upgrade: this build replaces the program bytes
+    let pid = env.program_id;
+    env.svm.add_program(pid, &std::fs::read(program_path()).expect("read wrapper BPF"));
+    f3_controller_reads_combined_record(&mut env, &lp, 50_000 * USD_E6);
+    env.assert_conservation();
+}
+
 /// Security review F-2: the tag-5 ratchet touch is BEST-EFFORT. A growth bookkeeping error in
 /// the touch (forced here: the record's flags byte 39 poked to 0x02 -- the volatility bit
 /// without the R3-layout bit, which the validator refuses -- STATE POKE) must not revert the
