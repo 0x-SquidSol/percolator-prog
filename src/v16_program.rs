@@ -49905,7 +49905,7 @@ mod r3_kani_proofs {
         kani::cover!(st == 2 && tier == 1 && c == t[0], "ADL at tier 1: floored at launch");
         kani::cover!(st == 2 && tier == 3 && c == t[1], "ADL at tier 3: two knots");
         kani::cover!(st == 3 && c == t[0], "h-lock: launch");
-        kani::cover!(prev > tg + RATCHET_STEP_X100 && st < 3 && f == tg && w == tg, "more than 1x down at once");
+        kani::cover!(prev as u32 > tg as u32 + RATCHET_STEP_X100 as u32 && st < 3 && f == tg && w == tg, "more than 1x down at once");
         kani::cover!(prev > tg && st == 3 && w == floor && floor < tg, "h-lock: to launch");
         kani::cover!(!hl && adl && dr && s == 2, "ADL outranks draw");
     }
