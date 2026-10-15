@@ -3237,6 +3237,33 @@ fn r3_item7_bind_guard_min_leg_fits_tier0_depth() {
     env.init_vault_lp_full(&admin, 2_000, m, &[]).expect("no depth yet: binds");
 }
 
+/// Security review F-2: the tag-78 ratchet touch is BEST-EFFORT. With the growth record made
+/// invalid (flags byte 39 = 0x02, STATE POKE) the fee crank with the vault LP at [8] still
+/// harvests (Ok) and leaves the growth bytes untouched. NEGATIVE CONTROL (file copy): with the
+/// round-3 `growth_ratchet_touch(..)?` the harvest reverts.
+#[test]
+fn f2_ratchet_touch_error_never_reverts_the_fee_crank() {
+    let p = Params { band: Some(100), growth: Some((400, 500)), fee_bps: 100, ..growth_params() };
+    let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+    let admin = env.admin.insecure_clone();
+    env.set_p2b_dials(&admin, [5_000, 3_000, 0, 0]).expect("ext");
+    let t = env.new_trader(5_000 * U);
+    env.trade_signing_fee(&t, &lp, 100 * UQ, GROWTH_FEE).expect("open");
+    env.trade_signing_fee(&t, &lp, -100 * UQ, GROWTH_FEE).expect("close");
+    let mut acc = env.svm.get_account(&env.market).unwrap();
+    let r = state::asset_growth_range(&acc.data, 0).unwrap();
+    acc.data[r.start + 39] = percolator_prog::growth_v19::GROWTH_FLAG_VOL_DATA;
+    let before = acc.data[r.clone()].to_vec();
+    env.svm.set_account(env.market, acc).unwrap();
+    assert!(state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, 1_000).is_err(), "vacuity: the record is refused");
+    let (cfg0, _) = env.market_state();
+    env.crank_fees_ext(lp.portfolio).expect("F-2: 78 with the LP succeeds despite the growth error");
+    let (cfg1, _) = env.market_state();
+    assert!(cfg1.lp_fee_withdrawn_atoms > cfg0.lp_fee_withdrawn_atoms, "the leg was harvested");
+    let after = env.svm.get_account(&env.market).unwrap().data[r].to_vec();
+    assert_eq!(after, before, "the touch wrote nothing");
+}
+
 /// Round 3 item 7 (GAP-15): tag 78 with the ext tail (vault LP at [8]) is a ratchet site. A
 /// band market (L_tier 10x, launch 5x) whose stored ceiling sits above its live target
 /// (STATE POKE: 8x stored, target = launch at tier 0) is lowered to the target AT ONCE (8x -> 5x;

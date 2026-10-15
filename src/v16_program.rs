@@ -29885,8 +29885,10 @@ pub mod processor {
         // Round 3 item 7 (GAP-15): every successful crank step on the bound vault LP (a refresh,
         // an accrual-only step, the F1 follow-on) is a ratchet site -- the keeper cranks the LP
         // every sweep. The helper ratchets only on a CURRENT vault-LP valuation and is a no-op
-        // for any other portfolio.
-        growth_ratchet_touch(program_id, market_ai, portfolio_ai)?;
+        // for any other portfolio. BEST-EFFORT (security review F-2): this crank sits in front of
+        // every trader refresh / liquidation, so a growth bookkeeping error must never revert
+        // it; on error the helper has written nothing (its one store is validate-then-copy).
+        let _ = growth_ratchet_touch(program_id, market_ai, portfolio_ai);
         Ok(())
     }
 
@@ -33327,9 +33329,11 @@ pub mod processor {
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
         // Round 3 item 7 (GAP-15): tag 78 is a ratchet site too, when the ext tail carries the
-        // vault LP at [8] (no-op otherwise, or on a stale LP valuation).
-        if let Some(lp_ai) = accounts.get(8) {
-            growth_ratchet_touch(program_id, account(accounts, 1)?, lp_ai)?;
+        // vault LP at [8] (no-op otherwise, or on a stale LP valuation). BEST-EFFORT (security
+        // review F-2): a growth bookkeeping error never reverts the fee harvest; on error the
+        // helper has written nothing.
+        if let (Some(market_ai), Some(lp_ai)) = (accounts.get(1), accounts.get(8)) {
+            let _ = growth_ratchet_touch(program_id, market_ai, lp_ai);
         }
         Ok(())
     }
@@ -45203,7 +45207,9 @@ pub mod processor {
     /// round 3 the ceiling climbed only when the LP was touched by a fill / 103 / 106 (D6). A
     /// no-op unless `lp_ai` IS the bound vault LP of a clamp-enforced growth asset; the same
     /// writer rule as `vault_lp_rent_route_and_snapshot_view` (rise <= +1x per epoch, fall to the
-    /// target at once).
+    /// target at once). Best-effort (security review F-2): the callers ignore its error, so a
+    /// growth bookkeeping fault never reverts the LP crank or the fee harvest; its only write is
+    /// the final validated store, so an error leaves no state change.
     #[inline(never)]
     fn growth_ratchet_touch(
         program_id: &Pubkey,
