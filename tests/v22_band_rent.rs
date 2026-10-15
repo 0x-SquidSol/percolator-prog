@@ -4648,42 +4648,6 @@ fn f3_upgrade_from_the_combined_binary_reads_its_records() {
     env.assert_conservation();
 }
 
-/// Security review F-2: the tag-5 ratchet touch is BEST-EFFORT. A growth bookkeeping error in
-/// the touch (forced here: the record's flags byte 39 poked to 0x02 -- the volatility bit
-/// without the R3-layout bit, which the validator refuses -- STATE POKE) must not revert the
-/// keeper's crank of the vault LP: the crank succeeds, the engine advances, and the growth bytes
-/// are left exactly as they were (no partial write). NEGATIVE CONTROL (file copy): with the
-/// round-3 `growth_ratchet_touch(..)?` the crank reverts.
-#[test]
-fn f2_ratchet_touch_error_never_reverts_the_lp_crank() {
-    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
-    env.auth_mark();
-    env.set_tiers([5_000, 20_000, 100_000], [0; 3], 3).expect("UA tier table");
-    let lp = env.lp(150_000 * USD);
-    let tier3 = 150_000 * USD_E6;
-    env.depth_twice(tier3);
-    let t = env.trader(1_000 * USD);
-    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("a small long: the LP holds inventory");
-    env.warp(100);
-    env.depth_twice(tier3);
-    // control: the same crank on the intact record succeeds
-    let saved = env.svm.get_account(&env.market).unwrap();
-    env.crank(lp.account).expect("control: the LP crank on an intact record");
-    env.svm.set_account(env.market, saved).unwrap();
-    // corrupt the growth record (flags 0x02: bit 1 without bit 0 is refused by the validator)
-    let mut acc = env.svm.get_account(&env.market).unwrap();
-    let r = state::asset_growth_range(&acc.data, 0).unwrap();
-    acc.data[r.start + 39] = percolator_prog::growth_v19::GROWTH_FLAG_VOL_DATA;
-    let before = acc.data[r.clone()].to_vec();
-    env.svm.set_account(env.market, acc).unwrap();
-    assert!(state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, env.engine_imr).is_err(), "vacuity: the record is refused");
-    let s0 = env.engine_asset().slot_last;
-    env.crank(lp.account).expect("F-2: the LP crank succeeds despite the growth error");
-    assert!(env.engine_asset().slot_last >= s0);
-    let after = env.svm.get_account(&env.market).unwrap().data[r].to_vec();
-    assert_eq!(after, before, "the touch wrote nothing");
-}
-
 /// Round 3 item 7 (design GAP-15 / D6): the keeper's tag-5 crank of the bound vault LP is a
 /// ratchet site. 20x band market, depth held at tier 3, the LP holding inventory (a small long
 /// against it), NO further fill and NO tag 106 / 103 / 78: each certified keeper crank of the LP

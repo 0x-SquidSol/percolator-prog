@@ -3237,10 +3237,14 @@ fn r3_item7_bind_guard_min_leg_fits_tier0_depth() {
     env.init_vault_lp_full(&admin, 2_000, m, &[]).expect("no depth yet: binds");
 }
 
-/// Security review F-2: the tag-78 ratchet touch is BEST-EFFORT. With the growth record made
-/// invalid (flags byte 39 = 0x02, STATE POKE) the fee crank with the vault LP at [8] still
-/// harvests (Ok) and leaves the growth bytes untouched. NEGATIVE CONTROL (file copy): with the
-/// round-3 `growth_ratchet_touch(..)?` the harvest reverts.
+/// Security review F-2: the ratchet touch is BEST-EFFORT. With the growth record made invalid
+/// (flags byte 39 = 0x02, STATE POKE) the fee crank with the vault LP at [8] still harvests (Ok)
+/// and leaves the growth bytes untouched. Tag 78 reads the growth record ONLY through the touch,
+/// so this forces the touch's error path; both sites (tag 5 on the vault LP, tag 78) call the
+/// same `growth_ratchet_touch_best_effort`, so this covers the tag-5 site's code too. (Tag 5
+/// itself reads the growth record earlier, in the crank's own accrual / clamp checks, which
+/// still fail closed on a corrupt record: no state makes ONLY the tag-5 touch fail.)
+/// NEGATIVE CONTROL (file copy): with the round-3 `growth_ratchet_touch(..)?` the harvest reverts.
 #[test]
 fn f2_ratchet_touch_error_never_reverts_the_fee_crank() {
     let p = Params { band: Some(100), growth: Some((400, 500)), fee_bps: 100, ..growth_params() };

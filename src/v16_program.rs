@@ -29886,9 +29886,8 @@ pub mod processor {
         // an accrual-only step, the F1 follow-on) is a ratchet site -- the keeper cranks the LP
         // every sweep. The helper ratchets only on a CURRENT vault-LP valuation and is a no-op
         // for any other portfolio. BEST-EFFORT (security review F-2): this crank sits in front of
-        // every trader refresh / liquidation, so a growth bookkeeping error must never revert
-        // it; on error the helper has written nothing (its one store is validate-then-copy).
-        let _ = growth_ratchet_touch(program_id, market_ai, portfolio_ai);
+        // every trader refresh / liquidation, so a growth bookkeeping error must never revert it.
+        growth_ratchet_touch_best_effort(program_id, market_ai, portfolio_ai);
         Ok(())
     }
 
@@ -33333,7 +33332,7 @@ pub mod processor {
         // review F-2): a growth bookkeeping error never reverts the fee harvest; on error the
         // helper has written nothing.
         if let (Some(market_ai), Some(lp_ai)) = (accounts.get(1), accounts.get(8)) {
-            let _ = growth_ratchet_touch(program_id, market_ai, lp_ai);
+            growth_ratchet_touch_best_effort(program_id, market_ai, lp_ai);
         }
         Ok(())
     }
@@ -45210,6 +45209,17 @@ pub mod processor {
     /// target at once). Best-effort (security review F-2): the callers ignore its error, so a
     /// growth bookkeeping fault never reverts the LP crank or the fee harvest; its only write is
     /// the final validated store, so an error leaves no state change.
+    /// Security review F-2: the ONE call form both ratchet sites (tag 5 on the vault LP, tag 78
+    /// with the LP at [8]) use. The touch's error is dropped: its only write is the final
+    /// `asset_growth_to_wrapper_bytes` (validate, then copy), so an error leaves the record
+    /// untouched and the caller's crank / harvest proceeds. One shared helper, so the tag-78
+    /// LiteSVM error-path test exercises the exact code the tag-5 site runs.
+    #[inline(never)]
+    fn growth_ratchet_touch_best_effort(program_id: &Pubkey, market_ai: &AccountInfo<'_>, lp_ai: &AccountInfo<'_>) {
+        // best-effort: on error nothing was written; the ratchet runs again at the next site
+        let _ = growth_ratchet_touch(program_id, market_ai, lp_ai);
+    }
+
     #[inline(never)]
     fn growth_ratchet_touch(
         program_id: &Pubkey,
