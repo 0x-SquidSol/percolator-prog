@@ -93,12 +93,11 @@ proptest! {
         let lx = l_table_x100(tier, tab);
         let cap = stress_cap_x100(stress, tier, tab);
         let (c, s) = graduation_ratchet(prev, ps, grad, stress, la, lt, lx, cap, now);
-        // round 3 item 3: never more than 1x down per writer call except the h-lock
-        if c < prev && stress < STRESS_HLOCK { prop_assert!(prev - c <= RATCHET_STEP_X100); }
         let t = target_ceiling_x100(grad, stress, la, lt, lx, cap);
-        let f = ceiling_in_force_x100(true, stored, t, la, lt, stress);
-        prop_assert!(f <= stored && f >= stored.min(t));
-        if stored > t && stress < STRESS_HLOCK { prop_assert!(stored - f <= RATCHET_STEP_X100); }
+        // security review F-1 fix A: down at once (the writer lands on the target in one call)
+        if prev > t { prop_assert_eq!((c, s), (t, now)); }
+        let f = ceiling_in_force_x100(true, stored, t, la, lt);
+        prop_assert_eq!(f, stored.min(t));
         if c > prev {
             prop_assert!(c as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
             prop_assert!(now >= ps.saturating_add(RATCHET_EPOCH_SLOTS));
@@ -107,7 +106,7 @@ proptest! {
         if c == prev { prop_assert!(s == ps || s == now); }
         let (f, _) = graduation_fall_only(prev, ps, grad, stress, la, lt, lx, cap, now);
         prop_assert!(f <= prev);
-        if stress < STRESS_HLOCK { prop_assert!(prev - f <= RATCHET_STEP_X100); }
+        if prev > t { prop_assert_eq!(f, t); }
     }
 
     /// I-D4 at full width: with a cap depth, N_cap * 1e4 * P <= depth * κ * POS_SCALE (checked in

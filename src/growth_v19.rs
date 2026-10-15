@@ -142,7 +142,7 @@ pub fn graduated_ceiling_x100(
     }
 }
 
-// ── v2.2 round 3 item 3 (design D1(a) GAP-2a + GAP-4): graded stress, smooth descent ─────────
+// ── v2.2 round 3 item 3 (design D1(a) GAP-2a + GAP-4): graded stress target ─────────────────────
 
 /// Stress level 0: none.
 pub const STRESS_NONE: u8 = 0;
@@ -153,8 +153,8 @@ pub const STRESS_DRAW: u8 = 1;
 /// TWO tiers below. (`A != 1` alone, e.g. the LP side scaled by a matched band liquidation with
 /// both modes Normal, is NOT ADL: design D1(a).)
 pub const STRESS_ADL: u8 = 2;
-/// Stress level 3: the bankruptcy h-lock is latched: the ceiling goes to launch AT ONCE (the only
-/// cliff left; opens on the crowd side are refused anyway).
+/// Stress level 3: the bankruptcy h-lock is latched: the target is launch. (Every stress level
+/// binds at once: the ceiling in force is `min(stored, target)`, security review F-1 fix A.)
 pub const STRESS_HLOCK: u8 = 3;
 
 /// D1(a): real ADL is an engine side mode other than Normal (`SideModeV16::Normal` == 0) on
@@ -191,22 +191,12 @@ pub fn stress_cap_x100(stress: u8, tier: u8, table: [u16; 4]) -> u16 {
     table[t.saturating_sub(stress) as usize]
 }
 
-/// One smooth step DOWN: `max(target, prev - 1x)` (at most 1x per writer call; never below the
-/// target, which is never below launch).
-pub fn smooth_fall_x100(prev_x100: u16, target_x100: u16) -> u16 {
-    let stepped = prev_x100.saturating_sub(RATCHET_STEP_X100);
-    if stepped > target_x100 {
-        stepped
-    } else {
-        target_x100
-    }
-}
-
-/// Ratchet the stored ceiling toward `target_x100`. v2.2 round 3 item 3 (design GAP-4, "never
-/// cliff-edge"): it FALLS by at most one `RATCHET_STEP_X100` (1x) per writer call, toward the
-/// target, except under the bankruptcy h-lock (`stress >= STRESS_HLOCK`), where it falls to
-/// `floor_x100` (launch) at once -- the crowd side is closed then anyway. Rises by at most one
-/// `RATCHET_STEP_X100` per `RATCHET_EPOCH_SLOTS`. Returns `(ceil_x100, ceil_slot)`.
+/// Ratchet the stored ceiling toward `target_x100`: UP GRADUALLY, DOWN AT ONCE (Khubair's
+/// 12:52 rule; security review F-1 fix A). A fall goes to the target in the same call, stamped
+/// `now`; under the bankruptcy h-lock (`stress >= STRESS_HLOCK`) the target is `floor_x100`
+/// (launch). Rises by at most one `RATCHET_STEP_X100` per `RATCHET_EPOCH_SLOTS`. Round 3 item 3's
+/// graded stress only chooses the TARGET (`stress_cap_x100`); there is no per-call descent limit.
+/// Returns `(ceil_x100, ceil_slot)`.
 pub fn ratchet_ceiling_x100(
     prev_ceil_x100: u16,
     prev_slot: u64,
@@ -228,10 +218,7 @@ pub fn ratchet_ceiling_x100(
         return (prev_ceil_x100, prev_slot);
     }
     if target < prev_ceil_x100 {
-        if hlock {
-            return (target, now_slot);
-        }
-        return (smooth_fall_x100(prev_ceil_x100, target), now_slot);
+        return (target, now_slot);
     }
     if now_slot >= prev_slot.saturating_add(RATCHET_EPOCH_SLOTS) {
         let stepped = prev_ceil_x100.saturating_add(RATCHET_STEP_X100);
@@ -2271,22 +2258,18 @@ pub fn target_ceiling_x100(
 }
 
 /// The ceiling the gate applies (x100). Off a clamp-enforced market: `min(L_launch, L_tier)`,
-/// exactly growth-1 (off-band identity). On one, round 3 item 3 ("never cliff-edge"):
-/// * stored <= live target: the stored ratcheted ceiling (it climbs only through the ratchet);
-/// * h-lock: the live target (launch) at once;
-/// * otherwise `max(target, stored - 1x)`: at most ONE step below the stored ceiling, which the
-///   writers lower by at most 1x per call toward the target. So the ceiling in force never drops
-///   by more than 1x per writer call, is never above the stored ceiling and never below the
-///   live target. (Round 2 read `min(stored, target)`: a depth or stress drop cliffed 20x -> 5x
-///   in one slot. Leverage acts only on NEW opens; capacity, the κ cap and the h-lock still bind
-///   at once, and every value stays <= L_tier, which the Band Safety Law made safe.)
+/// exactly growth-1 (off-band identity). On one: `min(stored, live target)` -- leverage goes UP
+/// gradually (the stored ceiling climbs only through the ratchet, +1x per epoch) and DOWN AT
+/// ONCE: a depth collapse, stale / zero / missing depth (tier 0 -> launch), draw or real-ADL
+/// stress (graded target), the h-lock (launch) or a lower upper-authority tier table all bind in
+/// the same slot, before any writer runs (security review F-1, fix A; round 3's 1x-per-call
+/// descent is removed).
 pub fn ceiling_in_force_x100(
     clamp: bool,
     stored_ceil_x100: u16,
     target_x100: u16,
     l_launch_x100: u16,
     l_tier_x100: u16,
-    stress: u8,
 ) -> u16 {
     if !clamp {
         return if l_launch_x100 < l_tier_x100 {
@@ -2296,18 +2279,15 @@ pub fn ceiling_in_force_x100(
         };
     }
     if stored_ceil_x100 <= target_x100 {
-        return stored_ceil_x100;
+        stored_ceil_x100
+    } else {
+        target_x100
     }
-    if stress >= STRESS_HLOCK {
-        return target_x100;
-    }
-    smooth_fall_x100(stored_ceil_x100, target_x100)
 }
 
 /// The ratchet WRITER at a site with the bound vault LP's `C_m` in hand (clamp-enforced markets
 /// only; the target's book tier was built from it). Returns `(ceil_x100, ceil_slot)`: ratchet
-/// toward `target_ceiling_x100` (falls <= 1x per call, the h-lock at once; rises <= +1x per
-/// epoch). Round 3 item 6: the retired `c_launch` snapshot (R2.1 stopped reading it; its
+/// toward `target_ceiling_x100` (falls to it at once; rises <= +1x per epoch). Round 3 item 6: the retired `c_launch` snapshot (R2.1 stopped reading it; its
 /// "no climb in the snapshot call" hold is redundant with the I-1 / bind stamp `ceil_slot = now`,
 /// which already makes the first climb wait a full epoch) is gone, and its bytes 0..8 carry the
 /// volatility EWMA and the rent stamp.
@@ -2342,9 +2322,8 @@ pub fn graduation_ratchet(
 /// The FALL-ONLY ratchet (PushAuthMark: the depth changed but no `C_m` is in hand). The caller
 /// passes the VENUE tier's graduation, `L_table(venue_tier)` and the stress cap at the venue
 /// tier: the venue tier bounds `min(venue, book)` from above, so this upper bound is never below
-/// the real target and the stored ceiling only ever falls here, stamped `now`: by at most 1x per
-/// call (round 3 item 3), to launch at once under the h-lock; it never rises without the LP's
-/// equity.
+/// the real target and the stored ceiling only ever falls here, stamped `now`, to that bound at
+/// once (security review F-1 fix A); it never rises without the LP's equity.
 #[allow(clippy::too_many_arguments)]
 pub fn graduation_fall_only(
     prev_ceil_x100: u16,
@@ -2366,11 +2345,7 @@ pub fn graduation_fall_only(
         stress_cap_x100,
     );
     if upper < prev_ceil_x100 {
-        if stress >= STRESS_HLOCK {
-            (upper, now_slot)
-        } else {
-            (smooth_fall_x100(prev_ceil_x100, upper), now_slot)
-        }
+        (upper, now_slot)
     } else {
         (prev_ceil_x100, prev_slot)
     }
@@ -3081,12 +3056,11 @@ mod tests {
             ratchet_ceiling_x100(500, 0, 800, 500, STRESS_NONE, 9_000),
             (600, 9_000)
         );
-        // round 3 item 3: a fall is <= 1x per call (800 -> 700, not 600); the h-lock goes to the
-        // floor (launch) at once; draw / ADL stress never jumps below one step
-        assert_eq!(ratchet_ceiling_x100(800, 0, 600, 500, STRESS_NONE, 1), (700, 1));
-        assert_eq!(ratchet_ceiling_x100(700, 1, 600, 500, STRESS_NONE, 2), (600, 2));
+        // F-1 fix A: a fall goes to the target AT ONCE (800 -> 600 in one call); the h-lock goes
+        // to the floor (launch); draw / ADL stress falls to its (graded) target at once
+        assert_eq!(ratchet_ceiling_x100(800, 0, 600, 500, STRESS_NONE, 1), (600, 1));
         assert_eq!(ratchet_ceiling_x100(800, 0, 900, 500, STRESS_HLOCK, 1), (500, 1));
-        assert_eq!(ratchet_ceiling_x100(800, 0, 500, 500, STRESS_ADL, 1), (700, 1));
+        assert_eq!(ratchet_ceiling_x100(800, 0, 500, 500, STRESS_ADL, 1), (500, 1));
     }
 
     #[test]
@@ -3542,36 +3516,27 @@ mod tests {
         // D1(a): A != 1 is not read; only a non-Normal side mode is ADL
         assert!(!real_adl(0, 0) && real_adl(1, 0) && real_adl(0, 2));
         // ceiling in force: off clamp == launch whatever is stored
-        assert_eq!(ceiling_in_force_x100(false, 900, 900, 300, 1_000, STRESS_NONE), 300);
-        // round 3: <= one step below stored, never below the target, never above stored
-        assert_eq!(ceiling_in_force_x100(true, 900, 400, 300, 1_000, STRESS_NONE), 800);
-        assert_eq!(ceiling_in_force_x100(true, 900, 850, 300, 1_000, STRESS_ADL), 850);
-        assert_eq!(ceiling_in_force_x100(true, 900, 400, 300, 1_000, STRESS_HLOCK), 400, "h-lock at once");
-        assert_eq!(ceiling_in_force_x100(true, 400, 900, 300, 1_000, STRESS_NONE), 400);
+        assert_eq!(ceiling_in_force_x100(false, 900, 900, 300, 1_000), 300);
+        // F-1 fix A: min(stored, target) -- down at once, up only through the ratchet
+        assert_eq!(ceiling_in_force_x100(true, 900, 400, 300, 1_000), 400, "down at once");
+        assert_eq!(ceiling_in_force_x100(true, 900, 850, 300, 1_000), 850);
+        assert_eq!(ceiling_in_force_x100(true, 400, 900, 300, 1_000), 400, "up only via the ratchet");
         // round 3 item 6: no c_launch snapshot any more; a climb waits a full epoch from the
         // stamp (bind / I-1 reset stamp ceil_slot = now)
         assert_eq!(graduation_ratchet(500, 50_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 50_000), (500, 50_000));
-        // +1x per 9,000 slots toward 10x; falls 1x per call (h-lock at once); unchanged keeps its stamp
+        // +1x per 9,000 slots toward 10x; falls to the target at once; unchanged keeps its stamp
         assert_eq!(graduation_ratchet(500, 0, true, STRESS_NONE, 500, 2_000, 1_000, n, 8_999), (500, 0));
         assert_eq!(graduation_ratchet(500, 0, true, STRESS_NONE, 500, 2_000, 1_000, n, 9_000), (600, 9_000));
         assert_eq!(graduation_ratchet(600, 9_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 18_000), (700, 18_000));
         assert_eq!(graduation_ratchet(1_000, 18_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_000), (1_000, 18_000), "at target: stamp kept");
-        assert_eq!(graduation_ratchet(1_000, 18_000, false, STRESS_NONE, 500, 2_000, 500, n, 40_001), (900, 40_001), "depth gone: one step down");
+        assert_eq!(graduation_ratchet(1_000, 18_000, false, STRESS_NONE, 500, 2_000, 500, n, 40_001), (500, 40_001), "depth gone: launch at once");
         assert_eq!(graduation_ratchet(1_000, 18_000, true, STRESS_HLOCK, 500, 2_000, 1_000, n, 40_001), (500, 40_001), "h-lock: launch at once");
-        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_DRAW, 500, 2_000, 2_000, 1_000, 40_001), (1_900, 40_001), "draw: one step toward L_table(2)");
-        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_001), (1_900, 40_001), "tier 3 -> 2: one step");
-        // 20x -> 10x takes 10 writer calls, never more than 1x each
-        let (mut ce, mut sl) = (2_000u16, 0u64);
-        for i in 1..=10u64 {
-            let (c2, s2) = graduation_ratchet(ce, sl, true, STRESS_NONE, 500, 2_000, 1_000, n, 100_000 + i);
-            assert_eq!(ce - c2, 100);
-            (ce, sl) = (c2, s2);
-        }
-        assert_eq!(ce, 1_000);
-        // fall-only (push): never rises, <= 1x per call, the h-lock at once
+        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_DRAW, 500, 2_000, 2_000, 1_000, 40_001), (1_000, 40_001), "draw: L_table(tier 3 - 1) = 10x at once");
+        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_001), (1_000, 40_001), "tier 3 -> 2: at once");
+        // fall-only (push): never rises; falls to the bound at once (the h-lock too)
         assert_eq!(graduation_fall_only(500, 7, true, STRESS_NONE, 500, 2_000, 1_000, n, 99), (500, 7));
-        assert_eq!(graduation_fall_only(1_000, 7, false, STRESS_NONE, 500, 2_000, 500, n, 99), (900, 99));
-        assert_eq!(graduation_fall_only(2_000, 7, true, STRESS_NONE, 500, 2_000, 1_000, n, 99), (1_900, 99));
+        assert_eq!(graduation_fall_only(1_000, 7, false, STRESS_NONE, 500, 2_000, 500, n, 99), (500, 99));
+        assert_eq!(graduation_fall_only(2_000, 7, true, STRESS_NONE, 500, 2_000, 1_000, n, 99), (1_000, 99));
         assert_eq!(graduation_fall_only(2_000, 7, true, STRESS_HLOCK, 500, 2_000, 1_000, n, 99), (500, 99));
     }
 

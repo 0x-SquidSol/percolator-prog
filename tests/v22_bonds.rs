@@ -3239,8 +3239,8 @@ fn r3_item7_bind_guard_min_leg_fits_tier0_depth() {
 
 /// Round 3 item 7 (GAP-15): tag 78 with the ext tail (vault LP at [8]) is a ratchet site. A
 /// band market (L_tier 10x, launch 5x) whose stored ceiling sits above its live target
-/// (STATE POKE: 8x stored, target = launch at tier 0) is lowered ONE step (8x -> 7x) by the fee
-/// crank alone. CONTROL: the same crank without the ext tail (no LP account) does not touch it.
+/// (STATE POKE: 8x stored, target = launch at tier 0) is lowered to the target AT ONCE (8x -> 5x;
+/// security review F-1 fix A) by the fee crank alone. CONTROL: the same crank without the ext tail (no LP account) does not touch it.
 #[test]
 fn r3_item7_fee_crank_is_a_ratchet_site() {
     let p = Params { band: Some(100), growth: Some((400, 500)), fee_bps: 100, ..growth_params() };
@@ -3265,7 +3265,7 @@ fn r3_item7_fee_crank_is_a_ratchet_site() {
         r.expect("78");
         let c = state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, 1_000).unwrap().unwrap().ceil_x100;
         if with_lp {
-            assert_eq!(c, 700, "78 with the LP: one step toward the target");
+            assert_eq!(c, 500, "78 with the LP: down to the target at once");
         } else {
             assert_eq!(c, 800, "control: no LP account, no ratchet");
         }

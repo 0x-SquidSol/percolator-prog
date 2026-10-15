@@ -66,16 +66,37 @@ fn r3_item1_mutants_are_caught() {
     assert_eq!((vl::CUSHION_TARGET_DEFAULT_BPS, vl::CUSHION_SHARE_DEFAULT_BPS), (2_000, 5_000));
 }
 
-// ── item 3 (D1(a), GAP-4): graded stress, <= 1x descent per writer call ───────────────────────
+// ── item 3 (D1(a), GAP-4) after security review F-1 fix A: graded stress TARGET, down at once ──
 
 /// MUTANT (D1(a)): round 2's ADL predicate (A != 1 or mode != Normal).
 fn adl_mutant_round2(a_long_is_one: bool, a_short_is_one: bool, ml: u8, ms: u8) -> bool {
     !a_long_is_one || !a_short_is_one || ml != 0 || ms != 0
 }
 
-/// MUTANT (GAP-4): round 2's in-force rule `min(stored, target)` (a cliff).
-fn in_force_mutant_round2(stored: u16, target: u16) -> u16 {
-    stored.min(target)
+/// MUTANT (F-1 i): the round-3 1x-per-call descent restored in the in-force read
+/// `max(target, stored - 1x)` (stored <= target: stored).
+fn in_force_mutant_one_step(stored: u16, target: u16) -> u16 {
+    if stored <= target {
+        stored
+    } else {
+        target.max(stored.saturating_sub(gv::RATCHET_STEP_X100))
+    }
+}
+
+/// MUTANT (F-1 i, writer): the round-3 ratchet fall `max(target, prev - 1x)` per call.
+fn writer_fall_mutant_one_step(prev: u16, target: u16) -> u16 {
+    target.max(prev.saturating_sub(gv::RATCHET_STEP_X100))
+}
+
+/// MUTANT (F-1 ii): stale / zero / missing depth does NOT drop the ceiling at once -- the gate
+/// keeps reading the stored ceiling until a writer runs (no `min` with the live target when the
+/// target came from a tier-0 / no-depth reading).
+fn in_force_mutant_stale_kept(stored: u16, target: u16, depth_usable: bool) -> u16 {
+    if depth_usable {
+        stored.min(target)
+    } else {
+        stored
+    }
 }
 
 proptest! {
@@ -97,25 +118,32 @@ proptest! {
         prop_assert!(!gv::real_adl(0, 0));
     }
 
-    /// The smooth descent: a writer call lowers the stored ceiling by <= 1x unless the h-lock,
-    /// never below the target; the gate reads in [max(target, stored - 1x), stored].
+    /// Down at once: whenever the live target is below the stored ceiling, the gate reads the
+    /// target in the same slot (`min(stored, target)`) and one writer call lands the stored
+    /// ceiling on it (the floor -- launch -- under the h-lock), stamped `now`.
     #[test]
-    fn item3_one_step(prev in any::<u16>(), target in any::<u16>(), ps in any::<u64>(), now in any::<u64>(), st in 0u8..=3, launch in any::<u16>()) {
+    fn item3_down_at_once(prev in any::<u16>(), target in any::<u16>(), ps in any::<u64>(), now in any::<u64>(), st in 0u8..=3, launch in any::<u16>()) {
         let floor = launch.min(target);
-        let (c, _) = gv::ratchet_ceiling_x100(prev, ps, target, floor, st, now);
-        if c < prev {
-            if st < gv::STRESS_HLOCK {
-                prop_assert!(prev - c <= gv::RATCHET_STEP_X100);
-                prop_assert!(c >= target);
-            } else {
-                prop_assert_eq!(c, floor, "h-lock: to the floor (launch) at once");
-            }
+        let (c, cs) = gv::ratchet_ceiling_x100(prev, ps, target, floor, st, now);
+        if prev > target {
+            prop_assert_eq!(c, if st >= gv::STRESS_HLOCK { floor } else { target }, "writer: down at once");
+            prop_assert_eq!(cs, now);
         }
-        let f = gv::ceiling_in_force_x100(true, prev, target, launch, u16::MAX, st);
-        prop_assert!(f <= prev);
-        if prev > target && st < gv::STRESS_HLOCK {
-            prop_assert_eq!(f, target.max(prev - gv::RATCHET_STEP_X100.min(prev)));
-        }
+        let f = gv::ceiling_in_force_x100(true, prev, target, launch, u16::MAX);
+        prop_assert_eq!(f, prev.min(target));
+    }
+
+    /// Stale / zero / missing depth: the venue tier is 0, the target is launch, and the ceiling
+    /// in force is launch in the SAME read whatever was stored (full width, every stress level).
+    #[test]
+    fn item3_stale_depth_launch_at_once(stored in any::<u16>(), st in 0u8..=3, la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), band in any::<u16>()) {
+        let tab = gv::tier_leverage(lev, la, lt);
+        // tier 0 (no usable depth) -> graduation off, L_table(0) = launch
+        let grad = gv::graduation_on(true, band as u64, 0);
+        prop_assert!(!grad);
+        let t = gv::target_ceiling_x100(grad, st, la, lt, gv::l_table_x100(0, tab), gv::stress_cap_x100(st, 0, tab));
+        prop_assert_eq!(t, la.min(lt));
+        prop_assert_eq!(gv::ceiling_in_force_x100(true, stored, t, la, lt), stored.min(la.min(lt)));
     }
 }
 
@@ -125,12 +153,19 @@ fn r3_item3_mutants_are_caught() {
     // predicate read it as ADL (-> launch).
     assert!(!gv::real_adl(0, 0));
     assert!(adl_mutant_round2(true, false, 0, 0), "mutant witness: A != 1 read as ADL");
-    // GAP-4: stored 20x, target 5x: in force 19x now; the round-2 rule cliffs to 5x.
-    assert_eq!(gv::ceiling_in_force_x100(true, 2_000, 500, 500, 2_000, gv::STRESS_NONE), 1_900);
-    assert_eq!(in_force_mutant_round2(2_000, 500), 500, "mutant witness: a 15x cliff");
-    // the h-lock is the one exception
-    assert_eq!(gv::ceiling_in_force_x100(true, 2_000, 500, 500, 2_000, gv::STRESS_HLOCK), 500);
-    assert_eq!(gv::ratchet_ceiling_x100(2_000, 0, 500, 500, gv::STRESS_DRAW, 1), (1_900, 1));
+    // F-1 fix A: stored 20x, target 5x (depth collapse): in force 5x in the same read, and one
+    // writer call lands the stored ceiling on 5x.
+    assert_eq!(gv::ceiling_in_force_x100(true, 2_000, 500, 500, 2_000), 500);
+    assert_eq!(gv::ratchet_ceiling_x100(2_000, 0, 500, 500, gv::STRESS_NONE, 1), (500, 1));
+    assert_eq!(gv::ratchet_ceiling_x100(2_000, 0, 1_000, 500, gv::STRESS_DRAW, 1), (1_000, 1), "draw: to L_table(tier-1) at once");
+    // mutant (i): the 1x/call descent comes back -> 19x in force, 19x stored: caught by both
+    // item3_down_at_once assertions
+    assert_eq!(in_force_mutant_one_step(2_000, 500), 1_900, "mutant witness (i): in force 19x, not 5x");
+    assert_eq!(writer_fall_mutant_one_step(2_000, 500), 1_900, "mutant witness (i): writer 19x, not 5x");
+    // mutant (ii): stale / zero / missing depth kept at the stored 20x -> caught by
+    // item3_stale_depth_launch_at_once
+    assert_eq!(in_force_mutant_stale_kept(2_000, 500, false), 2_000, "mutant witness (ii): stale keeps 20x");
+    assert_ne!(in_force_mutant_stale_kept(2_000, 500, false), gv::ceiling_in_force_x100(true, 2_000, 500, 500, 2_000));
 }
 
 // ── item 4 (GAP-5, D-I1, D2): time-weighted two-bucket window ───────────────────────────────

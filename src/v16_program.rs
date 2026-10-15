@@ -43127,7 +43127,6 @@ pub mod processor {
             target,
             g.l_launch_x100,
             g.l_tier_x100,
-            ctx.stress,
         )
     }
 
@@ -45203,8 +45202,8 @@ pub mod processor {
     /// of the vault LP (after its refresh) and tag 78 (the fee crank, LP passed read-only). Before
     /// round 3 the ceiling climbed only when the LP was touched by a fill / 103 / 106 (D6). A
     /// no-op unless `lp_ai` IS the bound vault LP of a clamp-enforced growth asset; the same
-    /// writer rule as `vault_lp_rent_route_and_snapshot_view` (rise <= +1x per epoch, fall <= 1x
-    /// per call, the h-lock at once).
+    /// writer rule as `vault_lp_rent_route_and_snapshot_view` (rise <= +1x per epoch, fall to the
+    /// target at once).
     #[inline(never)]
     fn growth_ratchet_touch(
         program_id: &Pubkey,
@@ -49294,8 +49293,11 @@ mod g8_kani_proofs {
     /// hence venue tier 0, hence tier 0, hence no graduation, a launch target, a ceiling in force
     /// <= launch and λ_eff <= 1x. R2.1: the κ cap is then the STICKY depth once DEPTH_EVER
     /// (never `u128::MAX`), and absent only before the first fresh depth.
+    /// Security review F-1 fix A: the ceiling in force is <= launch in the SAME read (not one
+    /// step per writer call).
     /// Mutants: `age < 150` / `age <= 151`; future stamp treated fresh; max instead of min of the
-    /// two reads; stale depth not zeroed; cap removed when stale (round-1 W-M1).
+    /// two reads; stale depth not zeroed; cap removed when stale (round-1 W-M1); the round-3
+    /// 1x-per-call descent in the in-force read (stale depth no longer drops at once).
     #[kani::proof]
     #[kani::unwind(5)]
     fn kani_g8_depth_stale_fails_closed() {
@@ -49328,13 +49330,14 @@ mod g8_kani_proofs {
             let tab = tier_leverage(lev, la, lt);
             let t = target_ceiling_x100(g, stress, la, lt, l_table_x100(tier, tab), stress_cap_x100(stress, tier, tab));
             assert_eq!(t, la.min(lt));
-            // round 3 item 3: the ceiling in force falls toward launch by <= 1x per writer call
-            // (the h-lock at once), so it is <= max(launch, stored - 1x) and never above stored.
-            let f = ceiling_in_force_x100(clamp, stored, t, la, lt, stress);
-            assert!(f <= core::cmp::max(la.min(lt), stored.saturating_sub(RATCHET_STEP_X100)) || !clamp);
+            // F-1 fix A: stale / zero / missing depth -> the ceiling in force is launch AT ONCE
+            // (`min(stored, launch)`), in the same slot, before any writer runs.
+            let f = ceiling_in_force_x100(clamp, stored, t, la, lt);
+            assert!(f <= la.min(lt));
             if !clamp {
                 assert_eq!(f, la.min(lt));
             }
+            kani::cover!(clamp && stored > la.min(lt) && f == la.min(lt), "stored above launch: launch at once");
             let lam: u32 = kani::any();
             assert!(lambda_eff_bps(lam, tier) <= DEFAULT_LAMBDA_BPS);
             let lg: u32 = kani::any();
@@ -49551,15 +49554,14 @@ mod g8_kani_proofs {
     /// `min(L_tier, max(L_launch, min(L_table(tier), stress_cap)))` when graduating and below the
     /// h-lock (launch otherwise), so it is <= min(L_tier, L_table(tier)) on every table
     /// `tier_leverage` builds and <= the stress cap (`L_table(tier - s)`) under a draw (s = 1) or
-    /// real ADL (s = 2) unless that is below launch. The ceiling IN FORCE is never above the stored
-    /// ceiling, never below min(stored, target), and at most ONE step (1x) below the stored ceiling
-    /// unless the h-lock (then the target). The ratchet writer takes <= one +1x step per epoch and
-    /// only after the epoch, and FALLS by <= 1x per call except under the h-lock (to launch at
-    /// once) (round 3 item 6: the retired c_launch snapshot is gone); the fall-only writer never
-    /// rises and falls <= 1x per call except under the h-lock.
-    /// Mutants: `max` with L_tier; `max(stored, target)` in force; round-2 `min(stored, target)` in
-    /// force (a cliff); step 200; `now > prev_slot` without the epoch; climbing in the snapshot
-    /// call (round 2); a fall straight to the target without the h-lock (round 2); the stress cap ignored;
+    /// real ADL (s = 2) unless that is below launch. The ceiling IN FORCE is exactly
+    /// `min(stored, target)` (security review F-1 fix A: up gradually, down at once). The ratchet
+    /// writer takes <= one +1x step per epoch and only after the epoch, and FALLS to the target in
+    /// one call (launch under the h-lock) (round 3 item 6: the retired c_launch snapshot is gone);
+    /// the fall-only writer never rises and falls to its bound in one call.
+    /// Mutants: `max` with L_tier; `max(stored, target)` in force; the round-3 1x-per-call descent
+    /// `max(target, stored - 1x)` in force or in either writer; step 200; `now > prev_slot`
+    /// without the epoch; climbing in the snapshot call (round 2); the stress cap ignored;
     /// `tier - s` without the floor; fall-only writer using `max`.
     #[kani::proof]
     #[kani::unwind(4)]
@@ -49589,18 +49591,9 @@ mod g8_kani_proofs {
             assert_eq!(t, launch);
         }
         let stored: u16 = kani::any();
-        let f = ceiling_in_force_x100(true, stored, t, la, lt, stress);
-        assert!(f <= stored, "in force never above the stored ceiling");
-        assert!(f >= stored.min(t));
-        if stored > t {
-            if stress >= STRESS_HLOCK {
-                assert_eq!(f, t);
-            } else {
-                assert!(stored - f <= RATCHET_STEP_X100, "in force: at most one step below stored");
-            }
-        } else {
-            assert_eq!(f, stored);
-        }
+        let f = ceiling_in_force_x100(true, stored, t, la, lt);
+        // F-1 fix A: up gradually (only via the stored ratchet), down at once
+        assert_eq!(f, stored.min(t), "in force == min(stored, live target)");
         let prev: u16 = kani::any();
         let ps: u32 = kani::any();
         let now: u32 = kani::any();
@@ -49612,29 +49605,31 @@ mod g8_kani_proofs {
         }
         if out < prev {
             assert_eq!(slot, now as u64);
-            if stress < STRESS_HLOCK {
-                assert!(prev - out <= RATCHET_STEP_X100, "<= 1x down per writer call");
-            }
+            // the writer falls to the target in ONE call (stress < h-lock: the target; h-lock: launch)
+            assert_eq!(out, if stress >= STRESS_HLOCK { launch.min(t) } else { t }, "down at once");
+        }
+        if prev > t {
+            assert!(out < prev, "a target below the stored ceiling always lowers it");
         }
         assert!(out <= prev.max(t).max(launch));
         let (fo, fs) = graduation_fall_only(prev, ps as u64, grad, stress, la, lt, lx, cap, now as u64);
         assert!(fo <= prev);
         if fo == prev {
             assert_eq!(fs, ps as u64);
-        } else if stress < STRESS_HLOCK {
-            assert!(prev - fo <= RATCHET_STEP_X100);
+        } else {
+            assert_eq!(fo, t, "fall-only: to the bound at once");
         }
         kani::cover!(grad && stress == 0 && t > launch && t < lt, "graduated between launch and tier");
         kani::cover!(grad && stress == 0 && tier == 2 && t == lx && lx < lt, "capped at L_table(2)");
         kani::cover!(grad && stress == 0 && tier == 3 && t == lt && lx == lt, "L_tier binds");
         kani::cover!(grad && stress == STRESS_DRAW && tier == 3 && t == cap && cap < lx && t > launch, "draw: one knot down");
         kani::cover!(grad && stress == STRESS_ADL && tier == 3 && t == cap && cap < table[2], "real ADL: two knots down");
-        kani::cover!(stored > t && stress < STRESS_HLOCK && stored - f == RATCHET_STEP_X100, "in force one step below stored");
+        kani::cover!(stored > t + RATCHET_STEP_X100 && stress < STRESS_HLOCK && f == t, "in force: more than 1x down at once");
         kani::cover!(stored > t + RATCHET_STEP_X100 && stress == STRESS_HLOCK && f == t, "h-lock: target at once");
         kani::cover!(out > prev, "one-step rise");
-        kani::cover!(out < prev && prev - out == RATCHET_STEP_X100 && stress < STRESS_HLOCK, "one-step fall");
+        kani::cover!(out < prev && prev - out > RATCHET_STEP_X100 && stress < STRESS_HLOCK, "writer: more than 1x down in one call");
         kani::cover!(out < prev && prev - out > RATCHET_STEP_X100 && stress == STRESS_HLOCK, "h-lock fall at once");
-        kani::cover!(fo < prev, "fall-only writer falls");
+        kani::cover!(fo < prev && prev - fo > RATCHET_STEP_X100, "fall-only writer falls more than 1x at once");
     }
 
     /// I-D4: with a cap depth (fresh or sticky) N_cap <= κ·depth/P exactly (cross-multiplied);
@@ -49693,7 +49688,7 @@ mod g8_kani_proofs {
         let la: u16 = kani::any();
         let lt: u16 = kani::any();
         let st: u8 = kani::any();
-        assert_eq!(ceiling_in_force_x100(false, stored, tgt, la, lt, st), la.min(lt));
+        assert_eq!(ceiling_in_force_x100(false, stored, tgt, la, lt), la.min(lt));
         let c_m: u16 = kani::any();
         let lam: u16 = kani::any();
         let tier: u8 = kani::any();
@@ -49841,13 +49836,16 @@ mod r3_kani_proofs {
         kani::cover!(proven && stored > 5_000 && a == stored, "after the flip: the stored dial");
     }
 
-    /// Item 3 (D1(a) + GAP-4): `stress_level` is the highest flag; `real_adl` reads the side
-    /// modes only; `stress_cap_x100` is `L_table(tier - s)` floored at tier 0 for s = 1, 2, launch
-    /// at 3, none at 0, monotone in s and tier; `smooth_fall_x100` is `max(target, prev - 1x)`.
+    /// Item 3 (D1(a) + GAP-4) after security review F-1 fix A: `stress_level` is the highest
+    /// flag; `real_adl` reads the side modes only; `stress_cap_x100` is `L_table(tier - s)`
+    /// floored at tier 0 for s = 1, 2, launch at 3, none at 0, monotone in s and tier. The graded
+    /// stress only chooses the TARGET: the ceiling in force is `min(stored, target)` and the
+    /// ratchet writer falls to the target in one call (down at once, at every stress level).
     /// Mutants: `A != 1` read as ADL (round 2); the draw ranked above ADL; `tier - s` without the
-    /// floor (index underflow); a cap at s = 0; `prev - 2x`; `min` for `max` in the fall.
+    /// floor (index underflow); a cap at s = 0; the 1x-per-call descent restored in the in-force
+    /// read or in the writer (`max(target, prev - 1x)`); the h-lock floor dropped.
     #[kani::proof]
-    fn kani_r3_item3_stress_and_one_step() {
+    fn kani_r3_item3_stress_target_and_down_at_once() {
         let dr: bool = kani::any();
         let adl: bool = kani::any();
         let hl: bool = kani::any();
@@ -49876,17 +49874,23 @@ mod r3_kani_proofs {
         }
         let prev: u16 = kani::any();
         let tg: u16 = kani::any();
-        let f = smooth_fall_x100(prev, tg);
-        assert!(f >= tg);
+        let ps: u64 = kani::any();
+        let now: u64 = kani::any();
+        let la: u16 = kani::any();
+        let f = ceiling_in_force_x100(true, prev, tg, la, u16::MAX);
+        assert_eq!(f, prev.min(tg));
+        let floor = la.min(tg);
+        let (w, ws) = ratchet_ceiling_x100(prev, ps, tg, floor, st, now);
         if prev > tg {
-            assert!(prev - f <= RATCHET_STEP_X100 && f <= prev);
+            assert_eq!(w, if st >= STRESS_HLOCK { floor } else { tg }, "writer: down at once");
+            assert_eq!(ws, now);
         }
         kani::cover!(st == 1 && tier == 3 && c == t[2], "draw at tier 3: one knot");
         kani::cover!(st == 2 && tier == 1 && c == t[0], "ADL at tier 1: floored at launch");
         kani::cover!(st == 2 && tier == 3 && c == t[1], "ADL at tier 3: two knots");
         kani::cover!(st == 3 && c == t[0], "h-lock: launch");
-        kani::cover!(prev > tg + RATCHET_STEP_X100 && f == prev - RATCHET_STEP_X100, "one step");
-        kani::cover!(prev > tg && prev <= tg + RATCHET_STEP_X100 && f == tg, "lands on target");
+        kani::cover!(prev > tg + RATCHET_STEP_X100 && st < 3 && f == tg && w == tg, "more than 1x down at once");
+        kani::cover!(prev > tg && st == 3 && w == floor && floor < tg, "h-lock: to launch");
         kani::cover!(!hl && adl && dr && s == 2, "ADL outranks draw");
     }
 
