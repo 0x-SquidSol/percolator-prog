@@ -49640,8 +49640,8 @@ mod g8_kani_proofs {
         kani::cover!(grad && stress == 0 && tier == 3 && t == lt && lx == lt, "L_tier binds");
         kani::cover!(grad && stress == STRESS_DRAW && tier == 3 && t == cap && cap < lx && t > launch, "draw: one knot down");
         kani::cover!(grad && stress == STRESS_ADL && tier == 3 && t == cap && cap < table[2], "real ADL: two knots down");
-        kani::cover!(stored > t + RATCHET_STEP_X100 && stress < STRESS_HLOCK && f == t, "in force: more than 1x down at once");
-        kani::cover!(stored > t + RATCHET_STEP_X100 && stress == STRESS_HLOCK && f == t, "h-lock: target at once");
+        kani::cover!(stored as u32 > t as u32 + RATCHET_STEP_X100 as u32 && stress < STRESS_HLOCK && f == t, "in force: more than 1x down at once");
+        kani::cover!(stored as u32 > t as u32 + RATCHET_STEP_X100 as u32 && stress == STRESS_HLOCK && f == t, "h-lock: target at once");
         kani::cover!(out > prev, "one-step rise");
         kani::cover!(out < prev && prev - out > RATCHET_STEP_X100 && stress < STRESS_HLOCK, "writer: more than 1x down in one call");
         kani::cover!(out < prev && prev - out > RATCHET_STEP_X100 && stress == STRESS_HLOCK, "h-lock fall at once");
