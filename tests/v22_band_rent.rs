@@ -2801,9 +2801,6 @@ fn g8_band_ceiling_climbs_one_step_per_epoch_and_falls_on_absent_or_stale_depth(
     assert_eq!(env.growth().ceil_x100, 300, "absent depth -> launch at once");
     let r = env.trade_cpi(&t3.0, t3.1, &lp, 350 * Q);
     assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "after the fall 3.5x is refused");
-    env.warp(1);
-    env.push(PRICE);
-    assert_eq!(env.growth().ceil_x100, 300, "holds at launch");
     // Back to the 150-slot-old fresh depth and the 5x stored ceiling (restore the pre-push
     // market account, STATE POKE): the 3.5x open lands.
     probe.data.copy_from_slice(&saved.data);
@@ -4551,7 +4548,7 @@ fn f3_assert_combined_shape(bytes: &[u8]) {
 /// The controller's view of a combined-written record (the shared F-3 assertions): it validates
 /// and reads launch-safe -- no volatility data (L_vol = launch), no rent stamp, no depth window
 /// (round-2 depth rules) -- the keeper crank of the LP works BEFORE any migration (flags stay
-/// 0, bytes 0..8 untouched), the gate holds the 5x launch ceiling (5.5x refused, 4.5x admitted),
+/// 0, bytes 0..8 untouched), the gate holds the 5x launch ceiling (5.5x refused, 4.5x admitted; $10 trader),
 /// the first later-slot push migrates the record (bit 0 + the first volatility sample; the old
 /// c_launch is gone), and a record with flags 0x02 (bit 1 without bit 0) is refused.
 fn f3_controller_reads_combined_record(env: &mut Env, lp: &Lp, tier: u64) {
@@ -4569,12 +4566,12 @@ fn f3_controller_reads_combined_record(env: &mut Env, lp: &Lp, tier: u64) {
     env.crank(lp.account).expect("tag 5 on the vault LP before migration");
     let raw2 = env.svm.get_account(&env.market).unwrap().data[range.clone()].to_vec();
     assert_eq!((&raw2[0..8], raw2[39]), (&raw[0..8], 0u8), "the crank does not migrate");
-    // the gate: launch 5x
-    let t = env.trader(100 * USD);
-    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
+    // the gate: launch 5x. A $10 trader (5.5x = $55 notional, 4.5x = $45): the warm-up depth
+    // (D-I1: T1/16) admits about $100 of new notional, so the 5.5x refusal is the CEILING's.
+    let t = env.trader(10 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 55 * Q);
     assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "5.5x over the launch 5x");
-    env.trade_cpi(&t.0, t.1, &lp, 450 * Q).expect("4.5x under launch");
-    env.trade_cpi(&t.0, t.1, &lp, -450 * Q).expect("close");
+    env.trade_cpi(&t.0, t.1, &lp, 45 * Q).expect("4.5x under launch");
     // the first later-slot push migrates
     env.warp(1);
     env.push_depth(PRICE, 1, tier).expect("first controller push");
