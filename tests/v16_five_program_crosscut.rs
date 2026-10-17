@@ -1298,7 +1298,7 @@ fn x0_lp_vault_lifecycle_at_mainnet() {
 const EXTRA_METAS_SEED: &[u8] = b"extra-account-metas";
 const POSITION_NFT_SEED: &[u8] = b"position_nft";
 const POSITION_NFT_V16_MAGIC: u64 = 0x5045_5243_4E46_5400; // "PERCNFT\0"
-const POSITION_NFT_V16_VERSION: u8 = 2;
+const POSITION_NFT_V16_VERSION: u8 = 3;
 const POSITION_NFT_V16_LEN: usize = 239;
 /// S1-2: portfolio incarnation id the fixtures stamp into crafted portfolios and NFT PDAs.
 const FIXTURE_PORTFOLIO_ID: u64 = 7;
