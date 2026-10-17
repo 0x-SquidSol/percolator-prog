@@ -45315,22 +45315,13 @@ pub mod processor {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
         // 1. Crank-equivalent accrual (band-shaped, rent-bearing) to the authenticated slot.
-        let (caught_up, obs) = adl_wind_down_refresh_asset_price_view(
+        let (_, obs) = adl_wind_down_refresh_asset_price_view(
             &mut cfg,
             &mut group,
             asset_index,
             authenticated_now_slot,
             oracle_accounts,
         )?;
-        // S1 F-1 (2026-10-17): the engine Refresh below accrues AGAIN with rent 0. When the first
-        // (rent-bearing) segment did not reach `now_slot`, that second segment would run a further
-        // capped window rent-free. Commit the segment and stop, exactly as tag 104 does and as the
-        // crank's one-segment catch-up rule (GATE-2) requires.
-        if !caught_up {
-            group.validate_shape().map_err(map_v16_error)?;
-            state::write_wrapper_config(&mut market_data, &cfg)?;
-            return Ok(());
-        }
         // 2. Refresh the portfolio through the engine's permissionless Refresh (settles rent at
         //    the K/F settlement entry, certifies the band epoch; lapsed source backing is
         //    progress, as on the crank).
