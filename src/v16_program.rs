@@ -46707,6 +46707,7 @@ pub mod processor {
     /// for this market group, hence no tag-72 escrow can exist for this portfolio.
     ///
     /// Backport of #497 by @0x-SquidSol onto deployed a9318945.
+    #[allow(clippy::too_many_arguments)]
     fn require_signer_for_escrowed_terminal_payout(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
