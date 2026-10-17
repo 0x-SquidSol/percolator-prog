@@ -29253,7 +29253,6 @@ fn s1_oracle_reconfiguration_keeps_the_creator_fee_claim_and_fee_checkpoint() {
     assert_eq!(profile.maintenance_fee_checkpoint_slot, 55, "S1 A-1: fee checkpoint wiped by tag 35");
     assert_eq!(profile.maintenance_fee_previous_rate, 3, "S1 A-1: previous rate wiped by tag 35");
 }
-||||||| aca02ba6
 
 
 /// GH#555: the #464 checkpoint must apply on EVERY collection route, not just
