@@ -292,7 +292,7 @@ impl World {
             program_id: stake_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new(pool, false),
                 AccountMeta::new_readonly(va, false),
                 AccountMeta::new(m, false),
                 AccountMeta::new_readonly(pid, false),
@@ -2971,7 +2971,7 @@ pub fn p3_legacy_bind() -> bool {
 
 /// CANONICAL_VAULT_LP_MATCHER_PROGRAM (devnet) at 07a1d0eb — the live matcher id.
 pub fn p3_canonical_matcher() -> Pubkey {
-    "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse().unwrap()
+    Pubkey::new_from_array(percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes())
 }
 
 pub fn p3_mode() -> bool {

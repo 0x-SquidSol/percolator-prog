@@ -104,7 +104,7 @@ impl P3 {
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { Pubkey::new_from_array(percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes()) };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -1627,7 +1627,7 @@ fn seed_units(w: &mut P3, insurance: u64) {
 // instructions: bind (19), burn (21), deposit with consent (1), sync (31), withdraw (2),
 // propose/commit target (32/33), the removed flush (3).
 
-const STAKE_PID: Pubkey = solana_sdk::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
+const STAKE_PID: Pubkey = percolator_prog::constants::STAKE_PROGRAM_ID;
 const ST_CONSENT_REQUIRED: u32 = 33;
 const ST_DEPRECATED_V5: u32 = 34;
 const ST_LIQUIDITY_BUFFER: u32 = 36;
@@ -1712,7 +1712,7 @@ fn stake_send(w: &mut P3, data: Vec<u8>, metas: Vec<AccountMeta>, signers: &[&Ke
 fn bind_and_burn(w: &mut P3, p: &Pool) {
     let admin = w.env.admin.insecure_clone();
     let (m, pid) = (w.env.market, w.env.program_id);
-    stake_send(w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 19 bind");
+    stake_send(w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 19 bind");
     stake_send(w, vec![21], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 21 burn");
 }
 

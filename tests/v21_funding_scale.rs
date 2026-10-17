@@ -73,7 +73,7 @@ fn params() -> V16CuMarketParams {
 impl W {
     fn new() -> Self {
         let mut env = V16CuEnv::new_with_init_params(params());
-        let matcher: Pubkey = "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse().unwrap();
+        let matcher: Pubkey = Pubkey::new_from_array(percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes());
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);

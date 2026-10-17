@@ -25491,7 +25491,7 @@ mod p3_vault_lp_skew {
         env.configure_auth_mark_with_cu(1, P3_PRICE);
         // P3 auto-pin: tag 94 accepts only the canonical matcher id (devnet constant).
         let matcher_program =
-            solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
+            percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
         let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
         env.svm.add_program(matcher_program, &matcher_bytes);
         setup_on(env, matcher_program, earn, junior)
@@ -25838,7 +25838,7 @@ mod p3_vault_lp_skew {
         env.svm.warp_to_slot(1);
         env.configure_auth_mark_with_cu(1, P3_PRICE);
         let matcher_program =
-            solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam"); // canonical (auto-pin)
+            percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM; // canonical (auto-pin)
         let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
         env.svm.add_program(matcher_program, &matcher_bytes);
         let creator = Keypair::new();

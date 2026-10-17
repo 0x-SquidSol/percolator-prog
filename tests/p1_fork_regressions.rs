@@ -23,6 +23,13 @@
 //!   live ProgramData prefix `4472b383…`. Candidate bytes: `target/deploy/
 //!   percolator_prog.so` (build with `cargo build-sbf -- --features devnet`).
 //!
+//! KNOWN-RED ON THE v2.2 LINE (T1 audit 2026-10-17, deliberately left as is): the committed
+//! fixtures are v18.2-layout account dumps. The v2.2 wrapper reads them as `InvalidVersion`
+//! (Custom(1)) / finds no matcher LP, so every test here fails AFTER its sha pins pass
+//! (`P1_FORK_MATCHER_SO=<12bd671 matcher> P1_FORK_DEPLOYED_SO=<wrapper-v18.2.so>`). They need
+//! fixtures re-dumped from a v2.2 market (`tests/fixtures/p1_fork/fetch.py`); until then they
+//! prove nothing about v2.2 and are not a regression signal.
+//!
 //! Each test runs the SAME replay on both byte sets. The deployed run is the
 //! negative control and pins the live failure code; the candidate run pins the P1
 //! behaviour.

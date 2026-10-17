@@ -20,6 +20,12 @@
 //!   fee(size, price, bps) = ceil(ceil(size * price / POS_SCALE) * bps / 10_000).
 //! The four-way split of an amount uses the wrapper's `policy_v16::split_trade_fee` at the
 //! default shares (the split itself is not what is under test; its INPUT is).
+// KNOWN-RED AGAINST THE DEPLOYED MATCHER (T1 audit 2026-10-17, deliberately left as is):
+// `p2_fee_channel_on_charges_requested_fee_to_taker_and_credits_lp_exactly` and
+// `p2_fee_channel_refuses_without_taker_consent_or_above_protocol_max` encode the post-
+// percolator-match#37 quote (the expected matcher request is the FLOOR). The deployed matcher
+// 2b08537a still re-ceils, so the taker under-signs and the wrapper answers Custom(9). They go
+// green against a matcher built from PR#37 and must be un-red when #37 is deployed at AsHvEJ8z.
 use litesvm::LiteSVM;
 use percolator::{SideV16, POS_SCALE};
 use percolator_prog::{ix::Instruction as ProgInstruction, policy_v16, state};

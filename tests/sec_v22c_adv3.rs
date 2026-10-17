@@ -41,7 +41,7 @@ const DOMAIN: u16 = 0; // asset 0, long side
 const MATCHER_CONTEXT_LEN: usize = 320;
 /// = `constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM` (devnet build; the test crate's lib is not
 /// built with `devnet`, so the id is restated and checked against the program by tag 94 itself).
-const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
+const CANONICAL_MATCHER: Pubkey = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
 // combined release: Wave A's 1e7 launch floor binds every growth market; launch at $10.00 e6 and one test
 // "unit" is 1/10 token so every notional equals the pre-merge $1 fixtures
 const PRICE: u64 = 10_000_000; // $10.00 e6

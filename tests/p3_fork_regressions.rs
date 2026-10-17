@@ -47,6 +47,9 @@
 //!   - a crank of each live portfolio while stale accounts exist (ANSEM's bankrupt pair).
 //! * The clock advances only inside the price-move helper, as time passing.
 
+// KNOWN-RED ON THE v2.2 LINE (T1 audit 2026-10-17, deliberately left as is): same cause as
+// p1_fork_regressions.rs -- v18.2-layout fixture dumps the v2.2 wrapper cannot parse, plus pins
+// on the retired matcher 12bd671 / wrapper v18.2 bytes. Needs fixtures re-dumped from a v2.2 market.
 use litesvm::LiteSVM;
 use percolator::SideModeV16;
 use percolator_prog::{
@@ -80,7 +83,7 @@ const MATCHER_ID: Pubkey = pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT
 /// RELAUNCH (all-fresh program IDs, 2026-09-30): the candidate wrapper's tag-94 auto-pin matcher
 /// (`CANONICAL_VAULT_LP_MATCHER_PROGRAM`, devnet). The same matcher bytes are mounted at both ids;
 /// every vault-LP bind / trade on the fork uses this one.
-const VAULT_MATCHER_ID: Pubkey = pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
+const VAULT_MATCHER_ID: Pubkey = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
 const STAKE_ID: Pubkey = pubkey!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
 
 const DEPLOYED_SO_DEFAULT: &str = "/Users/khubair/deploycand-v182/out/wrapper-v18.2.so";

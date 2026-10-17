@@ -493,7 +493,8 @@ use solana_sdk::{account::Account, pubkey::Pubkey, signature::Keypair, signer::S
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
 
-const FS_MAX_ASSETS: u16 = 2;
+// Single-asset market: stake v5 BindInsuranceAuthority refuses max_market_slots != 1 (MultiAssetMarketNotSupported).
+const FS_MAX_ASSETS: u16 = 1;
 
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
@@ -831,7 +832,7 @@ impl FeeEnv {
             program_id: STAKE_ID,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new_readonly(pool_pda, false),
+                AccountMeta::new(pool_pda, false),
                 AccountMeta::new_readonly(vault_auth, false),
                 AccountMeta::new(self.market, false),
                 AccountMeta::new_readonly(PERCOLATOR_MAINNET, false),
@@ -1525,6 +1526,13 @@ fn tag87_on_a_resolved_market_is_rejected_without_marking_the_claim_paid() {
     env.unbudget_insurance();
     env.set_reserve_accrued(250_000);
 
+    // P1 F4 (4fe62cda): a RESOLVED market with NO portfolio left is the terminal-empty state in
+    // which tag 87 is deliberately sweepable. The EngineLockActive gate under test applies while a
+    // portfolio is still materialized, so make one live before resolving.
+    let holder = Keypair::new();
+    let holder_portfolio = env.create_portfolio(&holder);
+    env.deposit(&holder, holder_portfolio, 1_000);
+
     let admin = env.admin.insecure_clone();
     let payer = env.payer.insecure_clone();
     env.svm.warp_to_slot(50_000);
@@ -1542,7 +1550,7 @@ fn tag87_on_a_resolved_market_is_rejected_without_marking_the_claim_paid() {
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(env.market, false),
         ],
-        data: ProgInstruction::ResolveMarket { asset_generation_frontier: 2, authority_epoch }.encode(),
+        data: ProgInstruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data).unwrap(), authority_epoch }.encode(),
     };
     send_ixs(&mut env.svm, &payer, vec![ix], &[&admin]).expect("ResolveMarket");
 

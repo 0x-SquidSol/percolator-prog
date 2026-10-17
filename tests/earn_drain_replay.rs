@@ -29,7 +29,8 @@ use solana_sdk::{
     signature::{Keypair, Signer},
 };
 
-const CANONICAL_MATCHER: &str = "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam";
+// canonical matcher id: read from the program constant (not a literal) so the suite follows the devnet id pins
+fn canonical_matcher_pubkey() -> Pubkey { Pubkey::new_from_array(percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes()) }
 
 /// Live market + LP + Earn + trade parameters, all decoded from the market's own transactions.
 #[derive(Clone)]
@@ -280,7 +281,7 @@ struct Replay {
 impl Replay {
     fn new(lm: LiveMarket) -> Self {
         let mut env = V16CuEnv::new_with_init_params(lm.params);
-        let matcher: Pubkey = CANONICAL_MATCHER.parse().unwrap();
+        let matcher: Pubkey = canonical_matcher_pubkey();
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);

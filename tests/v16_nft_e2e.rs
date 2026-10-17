@@ -1376,10 +1376,17 @@ mod e2e {
         // (direct calls) + the immutable extra-metas (real transfers); the binding is belt-and-
         // braces that only matters if the caller guard were bypassed (impossible end-to-end).
         let err_str = format!("{:?}", result.unwrap_err());
+        // Since nft #145 (composability) a DIRECT call no longer dies in
+        // `verify_cpi_caller_is_token2022` (that returns Ok(false) for a non-Token-2022
+        // top-level instruction); the substitution is refused by the PositionNft <-> portfolio
+        // binding check ("portfolio account does not match NFT PDA binding", Custom(2)).
+        // Either guard is an acceptable operative defense; an unrelated early error is not.
         assert!(
-            err_str.contains("Custom(17)") || err_str.contains("0x11"),
-            "cross-portfolio substitution must be rejected by verify_cpi_caller_is_token2022 \
-             (UnauthorizedDirectInvocation = Custom(17)); got: {}",
+            err_str.contains("portfolio account does not match NFT PDA binding")
+                || err_str.contains("Custom(17)")
+                || err_str.contains("0x11"),
+            "cross-portfolio substitution must be rejected by the portfolio binding check \
+             (or, on a pre-#145 nft, UnauthorizedDirectInvocation = Custom(17)); got: {}",
             err_str
         );
 
@@ -1393,13 +1400,19 @@ mod e2e {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Test 3: Direct hook invocation rejects
+    // Test 3: Direct hook invocation changes NO state (nft #145 design)
     // ══════════════════════════════════════════════════════════════════════════
     //
     // Call NFT ExecuteTransferHook directly (not via Token-2022 CPI).
-    // Expects: UnauthorizedDirectInvocation (NftError custom code 16).
+    // Since nft #145 (composability) `verify_cpi_caller_is_token2022` returns Ok(false) for a
+    // non-Token-2022 top-level instruction instead of rejecting, so a direct Execute may
+    // succeed; what keeps theft closed is that NO transfer is in flight and `last_holder` is
+    // never written (nft transfer_hook.rs:141-176). The old assertion (hard reject with
+    // Custom(17)) encoded the pre-#145 design. This test asserts the property that matters:
+    // whatever the outcome, the PositionNft PDA, the portfolio (owner), the registry and the
+    // extra-metas list are BYTE-IDENTICAL afterwards.
     #[test]
-    fn e2e_direct_hook_invocation_rejects() {
+    fn e2e_direct_hook_invocation_changes_no_state() {
         let Env { mut svm, payer } = base_env();
         let (market, registry, _admin) = setup_market_and_registry(&mut svm, &payer);
 
@@ -1437,6 +1450,15 @@ mod e2e {
         )
         .unwrap();
 
+        // Snapshot every account the hook can write or that gates authority.
+        let watched = [nft_pda_key, portfolio_key, registry, extra_metas_key, source_ata_key, dest_ata_key];
+        let before: Vec<Vec<u8>> = watched
+            .iter()
+            .map(|k| svm.get_account(k).expect("watched account").data)
+            .collect();
+        // non-vacuity: the PositionNft PDA is an initialised account the hook COULD write.
+        assert!(before[0].iter().any(|b| *b != 0), "nft PDA must be initialised for this test to mean anything");
+
         let mut hook_data = Vec::with_capacity(16);
         hook_data.extend_from_slice(&EXECUTE_DISCRIMINATOR);
         hook_data.extend_from_slice(&1u64.to_le_bytes());
@@ -1463,14 +1485,17 @@ mod e2e {
             &[],
         );
 
-        assert!(result.is_err(), "Direct hook invocation must be rejected");
-        let err_str = format!("{:?}", result.unwrap_err());
-        // NftError::UnauthorizedDirectInvocation = 17 = Custom(17) = 0x11
-        assert!(
-            err_str.contains("Custom(17)") || err_str.contains("0x11"),
-            "Expected UnauthorizedDirectInvocation (Custom(17)), got: {}",
-            err_str
-        );
+        let outcome = match &result {
+            Ok(_) => "Ok (direct Execute accepted as a no-op, nft #145)".to_string(),
+            Err(e) => format!("Err {:?}", e),
+        };
+        for (k, was) in watched.iter().zip(before.iter()) {
+            let now = svm.get_account(k).expect("watched account").data;
+            assert_eq!(
+                &now, was,
+                "direct hook invocation ({outcome}) changed account {k}: a spoofed Execute must write nothing"
+            );
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════

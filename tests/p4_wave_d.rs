@@ -115,7 +115,7 @@ impl P3 {
         let canonical = if std::env::var("PIN_FLAVOUR").as_deref() == Ok("1") {
             Pubkey::new_from_array([0xA3; 32])
         } else {
-            "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap()
+            Pubkey::new_from_array(percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes())
         };
         let matcher = matcher_override.unwrap_or(if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { canonical });
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
@@ -1918,7 +1918,7 @@ fn rescue_bound_refused_when_not_impaired() {
 // instructions: bind (19), burn (21), deposit with consent (1), sync (31), withdraw (2),
 // propose/commit target (32/33), the removed flush (3).
 
-const STAKE_PID: Pubkey = solana_sdk::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
+const STAKE_PID: Pubkey = percolator_prog::constants::STAKE_PROGRAM_ID;
 const ST_CONSENT_REQUIRED: u32 = 33;
 /// Stake `CONSENT_VERSION_FIRST_LOSS` (v2: S-5 binds the deployment parameters; G9 disclosed).
 const CONSENT: u8 = 2;
@@ -2008,7 +2008,7 @@ fn stake_send(w: &mut P3, data: Vec<u8>, metas: Vec<AccountMeta>, signers: &[&Ke
 fn bind_and_burn(w: &mut P3, p: &Pool) {
     let admin = w.env.admin.insecure_clone();
     let (m, pid) = (w.env.market, w.env.program_id);
-    stake_send(w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 19 bind");
+    stake_send(w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 19 bind");
     stake_send(w, vec![21], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 21 burn");
 }
 
@@ -2296,7 +2296,7 @@ fn xprog_fee_leg_refuses_fee_only_pool() {
     let p = craft_pool(&mut w, 2, 1);
     let admin = w.env.admin.insecure_clone();
     let (m, pid) = (w.env.market, w.env.program_id);
-    stake_send(&mut w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("bind");
+    stake_send(&mut w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("bind");
     let payer = w.env.payer.pubkey();
     let (wv, wva) = (w.env.vault, w.env.vault_authority);
     let r = w.send_raw(vec![87], vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new_readonly(p.pda, false), AccountMeta::new(p.vault, false), AccountMeta::new(wv, false), AccountMeta::new_readonly(wva, false), AccountMeta::new_readonly(spl_token::ID, false)], &[]);
@@ -2532,7 +2532,7 @@ fn w5_sync_refused_while_readings_diverge() {
 #[test]
 fn sec_d5_v5_is_a_fresh_program_not_an_upgrade() {
     assert_ne!(STAKE_PID, solana_sdk::pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w"));
-    assert_eq!(STAKE_PID, solana_sdk::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE"));
+    assert_eq!(STAKE_PID, percolator_prog::constants::STAKE_PROGRAM_ID);
     let mut w = P3::new();
     top_up_9(&mut w, 1_000_000, false).expect("seed");
     init_units(&mut w).expect("116");

@@ -369,7 +369,11 @@ struct CrosscutEnv {
 
 impl CrosscutEnv {
     /// 100% margins, 0 base trade fee — one tradable asset activated.
-    fn new() -> Self {
+    /// A SINGLE-ASSET market (max_market_slots == 1). Stake v5 `BindInsuranceAuthority`
+    /// refuses any market with more than one slot (stake `MultiAssetMarketNotSupported` = 48,
+    /// processor.rs:2322; the bind must happen BEFORE an asset is appended), so every test that
+    /// drives the real stake bind starts here and activates asset 1 only afterwards (if at all).
+    fn new_single_asset() -> Self {
         let matcher_program = Pubkey::new_unique();
         let mut svm = assemble_five_program_svm(matcher_program);
         let program_id = PERCOLATOR_MAINNET;
@@ -479,7 +483,13 @@ impl CrosscutEnv {
             &[&admin],
         )
         .expect("init market @ MAINNET");
+        env
+    }
 
+    /// The standard cross-cut market: the single-asset market from `new_single_asset` plus
+    /// asset 1 activated (a 2-slot market, so a trade has a non-main asset to move).
+    fn new() -> Self {
+        let mut env = Self::new_single_asset();
         env.activate_asset(CROSSCUT_ASSET, 1, 100);
         env
     }
@@ -509,7 +519,13 @@ impl CrosscutEnv {
                 // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this
                 // file, so asset-0's authority_epoch stays at its genesis value (0)
                 // -- the correct LIVE value, not a hardcode.
-                authority_epoch: 0,
+                // LIVE read (a stake bind rotates asset 0's authority and raises the epoch).
+                authority_epoch: state::read_asset_control_sequences(
+                    &self.svm.get_account(&self.market).unwrap().data,
+                    0,
+                )
+                .expect("read control sequences")
+                .authority_epoch,
                 now_slot,
                 initial_price,
                 max_init_fee: u128::MAX,
@@ -2048,7 +2064,7 @@ impl CrosscutEnv {
             program_id: STAKE_ID,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new_readonly(ctx.pool_pda, false),
+                AccountMeta::new(ctx.pool_pda, false),
                 AccountMeta::new_readonly(ctx.vault_auth, false),
                 AccountMeta::new(self.market, false),
                 AccountMeta::new_readonly(self.program_id, false),
@@ -2331,16 +2347,23 @@ fn x5_terminal_reclaim_liveness_via_rotate_no_lockout() {
 /// instance, in the given ordering. Returns (end_insurance, end_vault_token,
 /// short_leg_basis_after). Asserts vault lockstep internally.
 fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i128) {
-    let mut env = CrosscutEnv::new();
+    // Stake v5 binds single-asset markets only (M-4: bind before any asset is appended), so the
+    // stake pool is bound FIRST and asset 1 is activated afterwards. The admin FLUSH itself was
+    // removed in v5 (DeprecatedV5 = 34), so the "race" is now: a refused flush, in either order
+    // around a bankrupt-short liquidation, must move nothing and leave the same end state.
+    let mut env = CrosscutEnv::new_single_asset();
+    let ctx = env.setup_stake_pool(flush_amount);
+    env.stake_bind(&ctx).expect("bind");
+    env.activate_asset(CROSSCUT_ASSET, 1, 100);
     let lp = Keypair::new();
     let weak = Keypair::new();
     let la = env.create_portfolio(&lp);
     let wa = env.create_portfolio(&weak);
     env.deposit(&lp, la, 1_000_000);
-    env.deposit(&weak, wa, 250); // thin short — will go bankrupt
+    env.deposit(&weak, wa, 250); // thin short -- will go bankrupt
     env.try_trade(&lp, la, &weak, wa, POS_SCALE as i128, 100, 0)
         .expect("open lp-long / weak-short");
-    // Walk the mark up so the short's loss (≈300) exceeds its 250 deposit.
+    // Walk the mark up so the short's loss (~300) exceeds its 250 deposit.
     for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
         env.warp(slot);
         env.accrue_mark(slot, price);
@@ -2348,15 +2371,12 @@ fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i1
         let _ = env.crank(la, slot);
     }
 
-    let ctx = env.setup_stake_pool(flush_amount);
-    env.stake_bind(&ctx).expect("bind");
-
     if flush_first {
-        env.stake_flush(&ctx, flush_amount).expect("flush");
-        env.crank(wa, 30).expect("liquidate bankrupt short");
+        assert_custom(env.stake_flush(&ctx, flush_amount), STAKE_DEPRECATED_V5, "v5: admin flush removed");
+        let _ = env.crank(wa, 30);
     } else {
-        env.crank(wa, 30).expect("liquidate bankrupt short");
-        env.stake_flush(&ctx, flush_amount).expect("flush");
+        let _ = env.crank(wa, 30);
+        assert_custom(env.stake_flush(&ctx, flush_amount), STAKE_DEPRECATED_V5, "v5: admin flush removed");
     }
 
     let g = env.group();
@@ -2377,29 +2397,19 @@ fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i1
 /// liquidation actually fires (short leg closes) in both orderings.
 #[test]
 fn x2_flush_race_liquidation_crank_order_independent() {
+    // v5 rewrite. The original scenario flushed 1,000,000 into insurance and then liquidated a
+    // bankrupt short that the flushed insurance absorbed; the admin flush no longer exists
+    // (DeprecatedV5 = 34), so without it no insurance funds that bankruptcy and the crank does
+    // not finish the close in one step. What remains true and is asserted: a REFUSED flush
+    // before or after the crank moves nothing, so both orders reach the identical end state,
+    // and the flush adds no insurance.
     let flush: u64 = 1_000_000;
     let (ins_ff, vault_ff, leg_ff) = run_flush_liquidation(true, flush);
     let (ins_lf, vault_lf, leg_lf) = run_flush_liquidation(false, flush);
-
-    // Executed guard: the bankrupt short was actually liquidated (leg closed) both ways.
-    assert_eq!(leg_ff, 0, "flush-first: bankrupt short liquidated");
-    assert_eq!(leg_lf, 0, "liquidate-first: bankrupt short liquidated");
-
-    // Order independence: identical end state regardless of interleaving.
-    assert_eq!(
-        ins_ff, ins_lf,
-        "insurance order-independent across flush vs liquidation"
-    );
-    assert_eq!(
-        vault_ff, vault_lf,
-        "vault order-independent across flush vs liquidation"
-    );
-
-    // Flush is cleanly additive: the liquidation drew nothing from the flushed insurance.
-    assert_eq!(
-        ins_ff, flush as u128,
-        "insurance == exactly the flushed amount (no liquidation draw)"
-    );
+    assert_eq!(leg_ff, leg_lf, "short leg basis order-independent across refused flush vs crank");
+    assert_eq!(ins_ff, ins_lf, "insurance order-independent across refused flush vs crank");
+    assert_eq!(vault_ff, vault_lf, "vault order-independent across refused flush vs crank");
+    assert_eq!(ins_ff, 0, "a refused flush adds no insurance");
 }
 
 /// X5-TERMINAL (NFT-lock half) — an NFT-bundled portfolio that is LOCKED
@@ -3104,7 +3114,7 @@ const STAKE_NOT_SUPPORTED_ON_FIRST_LOSS: u32 = 41;
 /// I-S1: after a real bind, the admin flush is refused (DeprecatedV5) and moves nothing.
 #[test]
 fn x0_stake_flush_to_insurance_at_mainnet_v5() {
-    let mut env = CrosscutEnv::new();
+    let mut env = CrosscutEnv::new_single_asset();
     let ctx = env.setup_stake_pool(1_000_000);
     env.stake_bind(&ctx).expect("BindInsuranceAuthority");
     let (ins, vault, stake) = (env.group().insurance, env.token_amount(env.vault), env.token_amount(ctx.stake_vault));
@@ -3117,7 +3127,7 @@ fn x0_stake_flush_to_insurance_at_mainnet_v5() {
 /// The removed flush is refused identically in Live and after resolution.
 #[test]
 fn x2_flush_race_resolved_market_reverts_mode_not_live_v5() {
-    let mut env = CrosscutEnv::new();
+    let mut env = CrosscutEnv::new_single_asset();
     let ctx = env.setup_stake_pool(2_000_000);
     env.stake_bind(&ctx).expect("bind");
     assert_custom(env.stake_flush(&ctx, 1_000_000), STAKE_DEPRECATED_V5, "Live");
@@ -3133,7 +3143,7 @@ fn x2_flush_race_resolved_market_reverts_mode_not_live_v5() {
 /// tag 41 through the units ledger instead.
 #[test]
 fn x5_terminal_reclaim_liveness_via_rotate_no_lockout_v5() {
-    let mut env = CrosscutEnv::new();
+    let mut env = CrosscutEnv::new_single_asset();
     let ctx = env.setup_stake_pool(1_000_000);
     env.stake_bind(&ctx).expect("bind");
     let target = Keypair::new();
