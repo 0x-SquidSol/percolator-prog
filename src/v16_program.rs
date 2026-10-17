@@ -24611,30 +24611,6 @@ pub mod processor {
         // sentinel", and refuse outright if any is found. An ordinary market
         // never sets this sentinel, so this never fires for -- and never blocks
         // scan progress on -- the general non-LP-vault case.
-        let lp_vault_dead_share_floor_present = {
-            let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_, group) = state::market_view_mut(&mut market_data)?;
-            let configured_domains =
-                v16_domain_count_for_market_slots(group.header.config.max_market_slots.get())
-                    .map_err(map_v16_error)?;
-            let mut found = false;
-            for domain in 0..configured_domains {
-                let (_, bucket) = backing_domain_parts_view(&group, domain)?;
-                let funded = bucket.status != BackingBucketStatusV16::Empty
-                    || bucket.fresh_unliened_backing_num > 0
-                    || bucket.valid_liened_backing_num > 0
-                    || bucket.consumed_liened_backing_num > 0
-                    || bucket.impaired_liened_backing_num > 0;
-                if funded && bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        if lp_vault_dead_share_floor_present {
-            return Err(PercolatorError::EngineLockActive.into());
-        }
 
         // P1 F4 (+ security review P1-W1): before the "no owed fee leg" refusal below, re-book
         // every leg that has NO claim path left onto the protocol leg (claimable while
@@ -24670,6 +24646,37 @@ pub mod processor {
                 state::write_wrapper_config(&mut market_data, &cfg)?;
                 return Ok(());
             }
+        }
+
+        // S2 audit 2026-10-17 (fee routing): this gate used to run FIRST, so on every market with an Earn
+        // (LP) vault -- all of v2.2 -- the permanent dead-share floor returned 21 before the orphaned-leg
+        // re-book above could run, and the burned-creator pot / FEE_ONLY staker leg that re-book moves onto
+        // the protocol leg stayed unclaimable for ever. The re-book only relabels owed atoms (no token moves,
+        // same authority + epoch checks, terminal-empty Resolved only), so it is safe to run first; the close
+        // itself is still refused by the floor, unchanged.
+        let lp_vault_dead_share_floor_present = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let configured_domains =
+                v16_domain_count_for_market_slots(group.header.config.max_market_slots.get())
+                    .map_err(map_v16_error)?;
+            let mut found = false;
+            for domain in 0..configured_domains {
+                let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+                let funded = bucket.status != BackingBucketStatusV16::Empty
+                    || bucket.fresh_unliened_backing_num > 0
+                    || bucket.valid_liened_backing_num > 0
+                    || bucket.consumed_liened_backing_num > 0
+                    || bucket.impaired_liened_backing_num > 0;
+                if funded && bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if lp_vault_dead_share_floor_present {
+            return Err(PercolatorError::EngineLockActive.into());
         }
 
         let (

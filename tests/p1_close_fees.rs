@@ -367,14 +367,18 @@ impl Env {
             program_id: STAKE_ID,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new_readonly(pool_pda, false),
+                AccountMeta::new(pool_pda, false), // stake 0f88ff1+: a v5 bind records the seed, pool must be writable
                 AccountMeta::new_readonly(vault_auth, false),
                 AccountMeta::new(self.market, false),
                 AccountMeta::new_readonly(PERCOLATOR_MAINNET, false),
             ],
             data: vec![19u8],
         };
+        // Stake 0f88ff1+ binds single-asset markets only (M-1b, error 48). This fixture needs two asset
+        // slots (asset 1 carries a creator pot), so present max_market_slots = 1 for the bind only.
+        self.poke_max_market_slots(1);
         send_ixs(&mut self.svm, &payer, vec![ix], &[&admin]).expect("stake Bind (tag 19)");
+        self.poke_max_market_slots(MAX_ASSETS as u32);
         assert_eq!(
             self.asset0_profile().insurance_authority,
             vault_auth.to_bytes()
@@ -1267,4 +1271,89 @@ fn ws1_first_loss_or_forged_pool_is_not_rebooked() {
     let (res, _) = env.close_slab();
     res.expect("CloseSlab once the staker leg is paid");
     assert!(env.market_closed());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. S2 audit 2026-10-17 (fee routing): the dead-share-floor gate must not pre-empt the
+//    orphaned-leg re-book. Every v2.2 market has an Earn (LP) vault, so its asset-0 long bucket
+//    carries the permanent LP-vault sentinel; CloseSlab then returned 21 BEFORE the P1-W1 / W-S1
+//    re-book ran, so a burned creator pot and a FEE_ONLY staker leg (both "orphaned", both
+//    re-booked onto the protocol leg by design) stayed unclaimable for ever.
+// ─────────────────────────────────────────────────────────────────────────────
+impl Env {
+    fn poke_max_market_slots(&mut self, n: u32) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        {
+            let (_, group) = state::market_view_mut(&mut acct.data).unwrap();
+            group.header.config.max_market_slots = percolator::V16PodU32::new(n);
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+    }
+    /// Same stamp as test 4: asset 0's long bucket looks LP-vault-bound (the Earn dead-share floor).
+    fn stamp_lp_vault_domain(&mut self) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        let market_id = state::read_market_trade_preflight(&acct.data, 0).unwrap().3;
+        {
+            let (_, group) = state::market_view_mut(&mut acct.data).unwrap();
+            let b = &mut group.markets[0].engine.backing_long;
+            b.status = 2; // Expired: the only non-Empty shape that validates with zero atoms
+            b.market_id = percolator::V16PodU64::new(market_id);
+            b.expiry_slot = percolator::V16PodU64::new(
+                percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+            );
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+    }
+}
+
+#[test]
+fn s2_fee_only_staker_leg_rebooks_to_protocol_even_with_an_earn_vault_floor() {
+    let mut e = Env::build(true, false);
+    e.set_pool_risk_mode(0); // v5 RISK_MODE_FEE_ONLY
+    let (mut env, _fees) = terminal_empty_market_with_fees_in(e);
+    assert_custom(env.withdraw_to_stake(), 59, "tag 87 refuses a FEE_ONLY pool");
+    let _ = env.withdraw_protocol_fee().expect("tag 84");
+    let creator_owed = env.legs().creator_owed();
+    let _ = env.withdraw_creator_fee(creator_owed).expect("tag 90");
+    env.stamp_lp_vault_domain();
+    let legs0 = env.legs();
+    let ins_owed = legs0.ins_accrued - legs0.ins_withdrawn;
+    assert!(ins_owed > 0, "the FEE_ONLY staker leg is owed");
+    // BUG on base: Custom(21) here, the leg never moves.
+    env.close_slab_with_pool()
+        .expect("re-book step must run before the dead-share-floor refusal");
+    let legs1 = env.legs();
+    assert_eq!(legs1.ins_withdrawn, legs1.ins_accrued, "staker leg re-booked");
+    assert_eq!(legs1.protocol_accrued, legs0.protocol_accrued + ins_owed, "onto the protocol leg");
+    assert_eq!(legs1.lp_withdrawn, legs0.lp_withdrawn, "LP leg NOT folded: an LP vault is bound");
+    // The protocol authority can now claim it (tag 84) ...
+    let d = env.withdraw_protocol_fee().expect("tag 84 (re-booked staker leg)");
+    assert_eq!(env.token_amount(d) as u128, ins_owed);
+    // ... and the close itself is still refused by the permanent floor (unchanged by this fix).
+    let (res, _) = env.close_slab();
+    assert_custom(res, 21, "CloseSlab with the Earn dead-share floor present");
+}
+
+#[test]
+fn s2_burned_creator_pot_rebooks_to_protocol_even_with_an_earn_vault_floor() {
+    let (mut env, _fees) = terminal_empty_market_with_fees_in(Env::build(true, true));
+    let legs0 = env.legs();
+    let creator_owed = legs0.creator_owed();
+    assert!(creator_owed > 0);
+    assert_custom(
+        env.withdraw_creator_fee(creator_owed).map(|_| ()),
+        8,
+        "tag 90 by the ex-admin after the burn",
+    );
+    env.stamp_lp_vault_domain();
+    // BUG on base: Custom(21) here, the creator pot never moves.
+    let (res, _) = env.close_slab();
+    res.expect("re-book step must run before the dead-share-floor refusal");
+    let legs1 = env.legs();
+    assert_eq!(legs1.creator_owed(), 0, "creator pot re-booked");
+    assert_eq!(legs1.protocol_accrued, legs0.protocol_accrued + creator_owed);
+    let d = env.withdraw_protocol_fee().expect("tag 84");
+    assert_eq!(env.token_amount(d) as u128, legs0.protocol_accrued + creator_owed);
+    let (res, _) = env.close_slab();
+    assert_custom(res, 21, "CloseSlab with the Earn dead-share floor present");
 }

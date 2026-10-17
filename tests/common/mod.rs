@@ -66,7 +66,7 @@ pub const NFT_PROGRAM_ID: Pubkey = percolator_prog::constants::NFT_PROGRAM_ID;
 /// `cargo test --features devnet`. Without the feature the wrapper has no
 /// pinned id at all and tag 87 fails closed with `StakeProgramNotPinned`
 /// (Custom(60)) — correct behaviour, but it makes the tag-87 suite red.
-pub const STAKE_ID: Pubkey = pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
+pub const STAKE_ID: Pubkey = pubkey!("7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V"); // v2.2 fresh-ID pin (was A6DVNubv, the v2.1 id)
 
 /// Token-2022 program id (loaded via `with_spl_programs()`).
 pub const TOKEN_2022: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
