@@ -14770,9 +14770,15 @@ pub mod processor {
         if group.header.mode != 0 || cfg.maintenance_fee_per_slot == 0 {
             return Ok(0);
         }
-        let charged = group
-            .sync_account_fee_to_slot_not_atomic(portfolio, now_slot, cfg.maintenance_fee_per_slot)
-            .map_err(map_v16_error)?;
+        // GH#555: bill through the CHECKPOINTED path, as `SyncMaintenanceFee` does. The raw
+        // `sync_account_fee_to_slot_not_atomic` bills the whole `[last_fee_slot, now]` window at
+        // the CURRENT rate and then advances `last_fee_slot` past the checkpoint, which is the
+        // #444 retroactivity that #464 removed -- so leaving it here meant one rate raise was
+        // still retroactive on every route but SyncMaintenanceFee (Withdraw, the trade paths,
+        // PermissionlessCrank, the tranche/vault/bond withdrawals). Identical behaviour whenever
+        // there is no checkpoint (`checkpoint == 0`) or the account is already past it.
+        let charged =
+            sync_maintenance_fee_checkpointed(group, cfg, portfolio, now_slot, cfg.maintenance_fee_per_slot)?;
         credit_maintenance_fee_to_active_market_budgets_view(cfg, group, charged)?;
         Ok(charged)
     }
@@ -27255,6 +27261,22 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        // S1 A-1 (2026-10-17): the rate may only be RAISED while no portfolio is materialized.
+        // The market authority is the (untrusted) creator on a permissionless market and the cap
+        // is `MAX_PROTOCOL_FEE_ABS` (1e36), so a raise after depositors exist can be turned into
+        // a drain: the GH#444 checkpoint keeps only ONE `(slot, previous_rate)` pair, so a raise
+        // and a revert in the same slot make the next crank bill each account's whole age at the
+        // raised rate, and tag 49 can route 100% of it to a cranker portfolio the creator owns.
+        // With portfolios present the rate can only fall: billing a pre-change window at an
+        // equal-or-higher previous rate can then only under-collect, never confiscate. Depositors
+        // therefore consent to any raise by depositing into a market that already carries it.
+        if maintenance_fee_per_slot > cfg.maintenance_fee_per_slot {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (_cfg_view, group) = state::market_view_mut(&mut data)?;
+            if group.header.materialized_portfolio_count.get() != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+        }
         // v2.2 band: the maintenance fee is an absolute per-slot debit with no health check,
         // which the Band Safety Law does not price; band markets keep it at 0 (105).
         if maintenance_fee_per_slot != 0 && state::market_band_bps(&market_ai.try_borrow_data()?)? != 0 {

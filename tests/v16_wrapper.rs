@@ -1699,29 +1699,22 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
     )
     .unwrap();
 
-    // NOW raise the rate, and crank immediately — the bundled attack.
-    run_ix(
+    // NOW try to raise the rate and crank immediately — the bundled attack. S1 A-1 (2026-10-17):
+    // a raise is refused outright once a portfolio is materialized, so nothing can be billed
+    // retroactively (the checkpoint alone could be bypassed by a second change in the same slot).
+    let raised = run_ix(
         Instruction::UpdateMaintenanceFeePerSlot {
             maintenance_fee_per_slot: 5,
         },
         &mut [&mut admin, &mut market],
-    )
-    .unwrap();
+    );
+    assert_eq!(raised, Err(ProgramError::Custom(21)), "raise with a portfolio present is refused");
     sync_maintenance_fee(&mut market, &mut portfolio, 1_010).unwrap();
 
     let account = state::read_portfolio(&portfolio.data).unwrap();
-    // Only the 10 slots AFTER the raise may be billed: 10 * 5 = 50.
-    //
-    // Without the checkpoint this charged 5 * ~910 = 4_550, clamped to the
-    // account's entire 1_000 capital — i.e. everything.
     assert_eq!(
-        account.capital, 950,
-        "#444: only the window AFTER the rate change may be billed; the 900 slots \
-         at rate 0 must not be billed at the new rate"
-    );
-    assert_ne!(
-        account.capital, 0,
-        "#444: the account must not be drained by a rate raise"
+        account.capital, 1_000,
+        "#444 / S1 A-1: a refused raise bills nothing, the 900 idle slots stay free"
     );
 }
 
@@ -29259,4 +29252,163 @@ fn s1_oracle_reconfiguration_keeps_the_creator_fee_claim_and_fee_checkpoint() {
     assert_eq!(profile.creator_fee_claimable_atoms, 777, "S1 A-2: creator fee claim erased by tag 35");
     assert_eq!(profile.maintenance_fee_checkpoint_slot, 55, "S1 A-1: fee checkpoint wiped by tag 35");
     assert_eq!(profile.maintenance_fee_previous_rate, 3, "S1 A-1: previous rate wiped by tag 35");
+}
+||||||| aca02ba6
+
+
+/// GH#555: the #464 checkpoint must apply on EVERY collection route, not just
+/// `SyncMaintenanceFee`.
+///
+/// Reworked for S1 A-1 (rates can only FALL once a portfolio exists): the market carries rate 10
+/// while the account idles, the rate is then lowered to 5, and the fee is crystallized through
+/// `Withdraw`. The pre-change window must be billed at the rate that was in force (10); billing
+/// the whole window at the new rate (5) under-collects.
+#[test]
+fn v16_wrapper_maintenance_fee_checkpoint_applies_on_the_withdraw_route() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 10;
+            }
+        }),
+    );
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1,
+            asset_index: 0,
+            now_slot: 100,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+            observation_sequence,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 100_000);
+
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1,
+            asset_index: 0,
+            now_slot: 1_000,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+            observation_sequence,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    run_ix(
+        Instruction::UpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot: 5,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    withdraw(&mut owner, &mut market, &mut portfolio, 100);
+
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    assert_eq!(
+        account.capital,
+        100_000 - 100 - 900 * 10,
+        "GH#555: Withdraw must bill the pre-change window at the rate in force (10), not at the \
+         new rate (5): before the fix this was 100_000 - 100 - 900 * 5"
+    );
+}
+
+/// S1 audit 2026-10-17, A-1: the market authority (marketauth, the untrusted creator on a
+/// permissionless market) takes a depositor's whole idle capital through the maintenance fee,
+/// bypassing the GH#444/#464 "not retroactive" checkpoint with two rate changes (0 -> R, R -> 0)
+/// in the same slot, a 100% cranker share (tag 49) and a cranker portfolio it owns (tag 48).
+#[test]
+fn s1_marketauth_cannot_drain_idle_depositors_through_the_maintenance_fee() {
+    let mut admin = signer(); // cfg.marketauth
+    let mut market = market_account();
+    let mut victim = signer();
+    let mut victim_pf = portfolio_account();
+    let mut cranker_owner = signer(); // the creator's second wallet
+    let mut cranker_pf = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket { maintenance_fee_per_slot, .. } = ix {
+                *maintenance_fee_per_slot = 0;
+            }
+        }),
+    );
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 100, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    init_portfolio(&mut victim, &mut market, &mut victim_pf);
+    deposit(&mut victim, &mut market, &mut victim_pf, 1_000_000);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker_pf);
+    deposit(&mut cranker_owner, &mut market, &mut cranker_pf, 1);
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 1_000, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    // Step 1: 100% cranker share.
+    run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 10_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap().maintenance_fee + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    // Steps 2-3: raise to a huge rate and back to 0 in the same slot. The raise must be refused
+    // (S1 A-1 fix); before the fix both succeeded and the crank below confiscated everything.
+    for rate in [1_000_000_000_000u128, 0u128] {
+        let _ = run_ix(
+            Instruction::UpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: rate },
+            &mut [&mut admin, &mut market],
+        );
+    }
+    // Step 4: crank the victim, reward to the creator's own cranker portfolio.
+    let _ = run_ix(
+        Instruction::SyncMaintenanceFee { now_slot: 1_000 },
+        &mut [&mut market, &mut victim_pf, &mut cranker_pf, &mut cranker_owner],
+    );
+    let victim_capital = state::read_portfolio(&victim_pf.data).unwrap().capital;
+    let cranker_capital = state::read_portfolio(&cranker_pf.data).unwrap().capital;
+    assert!(
+        victim_capital == 1_000_000 && cranker_capital == 1,
+        "S1 A-1: victim capital {victim_capital} (was 1_000_000), creator's cranker capital {cranker_capital} (was 1)"
+    );
 }
