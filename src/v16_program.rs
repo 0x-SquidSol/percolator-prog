@@ -26317,6 +26317,12 @@ pub mod processor {
             profile.insurance_operator = existing_profile.insurance_operator;
             profile.backing_bucket_authority = existing_profile.backing_bucket_authority;
             profile.oracle_authority = existing_profile.oracle_authority;
+            // S1 A-3/A-2 (2026-10-17): a restart keeps the permanent portfolio-id allocator (ids are
+            // never reused: replay binding), the creator-fee claim and the fee checkpoint.
+            profile.next_portfolio_id = existing_profile.next_portfolio_id;
+            profile.creator_fee_claimable_atoms = existing_profile.creator_fee_claimable_atoms;
+            profile.maintenance_fee_checkpoint_slot = existing_profile.maintenance_fee_checkpoint_slot;
+            profile.maintenance_fee_previous_rate = existing_profile.maintenance_fee_previous_rate;
             if asset_index == 0 {
                 mirror_manual_profile_to_base_config(&mut cfg, &profile, true);
             }
@@ -27742,9 +27748,11 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
-                creator_fee_claimable_atoms: 0,
-                maintenance_fee_checkpoint_slot: 0,
-                maintenance_fee_previous_rate: 0,
+                // S1 A-2/A-1 (2026-10-17): an oracle reconfiguration must not erase the creator-fee claim or the
+                // maintenance-fee non-retroactivity checkpoint of this asset.
+                creator_fee_claimable_atoms: existing_profile.creator_fee_claimable_atoms,
+                maintenance_fee_checkpoint_slot: existing_profile.maintenance_fee_checkpoint_slot,
+                maintenance_fee_previous_rate: existing_profile.maintenance_fee_previous_rate,
                 // FIX (ADOPT upstream 06192caa, adapted): a fresh Hybrid
                 // reconfiguration has no committed mark yet -- `price` isn't
                 // known until `read_external_price_e6_profile` runs below, so
@@ -27914,9 +27922,11 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
-                creator_fee_claimable_atoms: 0,
-                maintenance_fee_checkpoint_slot: 0,
-                maintenance_fee_previous_rate: 0,
+                // S1 A-2/A-1 (2026-10-17): an oracle reconfiguration must not erase the creator-fee claim or the
+                // maintenance-fee non-retroactivity checkpoint of this asset.
+                creator_fee_claimable_atoms: existing_profile.creator_fee_claimable_atoms,
+                maintenance_fee_checkpoint_slot: existing_profile.maintenance_fee_checkpoint_slot,
+                maintenance_fee_previous_rate: existing_profile.maintenance_fee_previous_rate,
                 // FIX (ADOPT upstream 06192caa, adapted): a fresh EWMA_MARK
                 // reconfiguration commits `initial_mark_e6` immediately (unlike
                 // Hybrid, no external oracle read is needed), so seed the
@@ -28059,9 +28069,11 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
-                creator_fee_claimable_atoms: 0,
-                maintenance_fee_checkpoint_slot: 0,
-                maintenance_fee_previous_rate: 0,
+                // S1 A-2/A-1 (2026-10-17): an oracle reconfiguration must not erase the creator-fee claim or the
+                // maintenance-fee non-retroactivity checkpoint of this asset.
+                creator_fee_claimable_atoms: existing_profile.creator_fee_claimable_atoms,
+                maintenance_fee_checkpoint_slot: existing_profile.maintenance_fee_checkpoint_slot,
+                maintenance_fee_previous_rate: existing_profile.maintenance_fee_previous_rate,
                 // FIX (ADOPT upstream 06192caa, adapted): a fresh AUTH_MARK
                 // reconfiguration commits `initial_mark_e6` immediately, so seed
                 // the checkpoint directly from it (same convention as the
@@ -45227,13 +45239,22 @@ pub mod processor {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
         // 1. Crank-equivalent accrual (band-shaped, rent-bearing) to the authenticated slot.
-        let (_, obs) = adl_wind_down_refresh_asset_price_view(
+        let (caught_up, obs) = adl_wind_down_refresh_asset_price_view(
             &mut cfg,
             &mut group,
             asset_index,
             authenticated_now_slot,
             oracle_accounts,
         )?;
+        // S1 F-1 (2026-10-17): the engine Refresh below accrues AGAIN with rent 0. When the first
+        // (rent-bearing) segment did not reach `now_slot`, that second segment would run a further
+        // capped window rent-free. Commit the segment and stop, exactly as tag 104 does and as the
+        // crank's one-segment catch-up rule (GATE-2) requires.
+        if !caught_up {
+            group.validate_shape().map_err(map_v16_error)?;
+            state::write_wrapper_config(&mut market_data, &cfg)?;
+            return Ok(());
+        }
         // 2. Refresh the portfolio through the engine's permissionless Refresh (settles rent at
         //    the K/F settlement entry, certifies the band epoch; lapsed source backing is
         //    progress, as on the crank).

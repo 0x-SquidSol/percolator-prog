@@ -29229,3 +29229,34 @@ fn unwrap_rejects_a_registry_that_names_a_non_pinned_program() {
     );
     assert_eq!(portfolio.data, before, "ownership unchanged");
 }
+
+/// S1 audit 2026-10-17, A-2: reconfiguring an asset's oracle (tags 34 / 35 / 62) rebuilt the whole
+/// `AssetOracleProfileV16` and zeroed `creator_fee_claimable_atoms`, so the oracle authority (a
+/// different role from the creator's `asset_admin`) could erase the creator's accrued fee claim.
+/// Also pins that the maintenance-fee checkpoint survives the rebuild.
+#[test]
+fn s1_oracle_reconfiguration_keeps_the_creator_fee_claim_and_fee_checkpoint() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    {
+        let mut profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+        profile.creator_fee_claimable_atoms = 777;
+        profile.maintenance_fee_checkpoint_slot = 55;
+        profile.maintenance_fee_previous_rate = 3;
+        state::write_asset_oracle_profile(&mut market.data, 0, &profile).unwrap();
+    }
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 100, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    let profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+    assert_eq!(profile.creator_fee_claimable_atoms, 777, "S1 A-2: creator fee claim erased by tag 35");
+    assert_eq!(profile.maintenance_fee_checkpoint_slot, 55, "S1 A-1: fee checkpoint wiped by tag 35");
+    assert_eq!(profile.maintenance_fee_previous_rate, 3, "S1 A-1: previous rate wiped by tag 35");
+}
