@@ -4810,10 +4810,18 @@ impl World {
         let nft_mint = Pubkey::new_unique();
         let market_id = 1u64;
         let (nft_pda, _) = Pubkey::find_program_address(&[b"position_nft", port.as_ref(), &market_id.to_le_bytes()], &nft_prog);
-        let mut nd = vec![0u8; 199];
+        // percolator-nft layout v3 (239 B, S1-2): [199..231] market group, [231..239] portfolio id.
+        let mut nd = vec![0u8; 239];
         nd[10..42].copy_from_slice(port.as_ref());
         nd[42..74].copy_from_slice(nft_mint.as_ref());
         nd[111..119].copy_from_slice(&market_id.to_le_bytes());
+        nd[199..231].copy_from_slice(m.as_ref());
+        let live_id = {
+            let off = percolator_prog::constants::PORTFOLIO_ID_OFF;
+            let acc = self.env.svm.get_account(&port).unwrap();
+            acc.data[off..off + 8].to_vec()
+        };
+        nd[231..239].copy_from_slice(&live_id);
         self.env.svm.set_account(nft_pda, Account { lamports: 1_000_000_000, data: nd, owner: nft_prog, executable: false, rent_epoch: 0 }).unwrap();
         let holder_nft_ata = Pubkey::new_unique();
         self.env.svm.set_account(holder_nft_ata, Account { lamports: 1_000_000_000, data: make_token_data(nft_mint, holder, nft_amount), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();

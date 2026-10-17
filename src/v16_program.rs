@@ -4044,6 +4044,16 @@ pub mod state {
         Ok(id)
     }
 
+    /// S1-2: the portfolio incarnation id for NFT-holder binding, or 0 when the trailer is
+    /// unreadable / unallocated. 0 is never a valid id, so it can never equal the id an NFT was
+    /// minted with (the NFT program refuses to mint against a 0 id); the NFT-holder verdict
+    /// additionally requires a non-zero id. Lenient on purpose: the owner==signer path never
+    /// reads the id and must not start failing on a portfolio whose trailer is unreadable.
+    #[inline]
+    pub fn portfolio_id_or_zero(data: &[u8]) -> u64 {
+        read_portfolio_id(data).unwrap_or(0)
+    }
+
     #[inline]
     fn write_portfolio_id(data: &mut [u8], id: u64) -> Result<(), ProgramError> {
         check_header(data, KIND_PORTFOLIO)?;
@@ -16641,6 +16651,9 @@ pub mod processor {
                 expected_sequence,
             )?;
             {
+                // S1-2: the portfolio's permanent incarnation id, read BEFORE the mutable view is built
+                // (0 when unreadable; never matches a minted NFT).
+                let portfolio_id_now = state::portfolio_id_or_zero(&portfolio_data);
                 let mut portfolio = state::portfolio_view_mut_for_market_slots(
                     &mut portfolio_data,
                     max_market_slots,
@@ -16653,6 +16666,7 @@ pub mod processor {
                 authorize_owner_or_nft_holder(
                     &portfolio,
                     portfolio_ai.key,
+                    portfolio_id_now,
                     owner.key,
                     nft,
                     program_id,
@@ -16741,6 +16755,9 @@ pub mod processor {
                 expected_sequence,
             )?;
             let withdrawn_amount = {
+                // S1-2: the portfolio's permanent incarnation id, read BEFORE the mutable view is built
+                // (0 when unreadable; never matches a minted NFT).
+                let portfolio_id_now = state::portfolio_id_or_zero(&portfolio_data);
                 let mut portfolio = state::portfolio_view_mut_for_market_slots(
                     &mut portfolio_data,
                     max_market_slots,
@@ -16754,6 +16771,7 @@ pub mod processor {
                 authorize_owner_or_nft_holder(
                     &portfolio,
                     portfolio_ai.key,
+                    portfolio_id_now,
                     owner.key,
                     nft,
                     program_id,
@@ -18883,6 +18901,7 @@ pub mod processor {
             &account_a_owner,
             account_a_ai.key,
             &account_a_header.market_group_id,
+            state::portfolio_id_or_zero(&account_a_ai.try_borrow_data()?),
             signer_a.key,
             if taker_is_owner {
                 None
@@ -20080,6 +20099,7 @@ pub mod processor {
             &account_a_owner,
             account_a_ai.key,
             &account_a_header.market_group_id,
+            state::portfolio_id_or_zero(&account_a_ai.try_borrow_data()?),
             signer_a.key,
             if taker_is_owner {
                 None
@@ -25140,6 +25160,9 @@ pub mod processor {
                 }
             }
             {
+                // S1-2: the portfolio's permanent incarnation id, read BEFORE the mutable view is built
+                // (0 when unreadable; never matches a minted NFT).
+                let portfolio_id_now = state::portfolio_id_or_zero(&portfolio_data);
                 let mut portfolio = state::portfolio_view_mut_for_market_slots(
                     &mut portfolio_data,
                     max_market_slots,
@@ -25150,6 +25173,7 @@ pub mod processor {
                 authorize_owner_or_nft_holder(
                     &portfolio,
                     portfolio_ai.key,
+                    portfolio_id_now,
                     owner.key,
                     nft,
                     program_id,
@@ -28702,12 +28726,15 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         expect_owner(portfolio_ai, program_id)?;
 
-        let (cfg_after, payout, portfolio_owner, market_group) = {
+        let (cfg_after, payout, portfolio_owner, market_group, portfolio_id_now) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let max_market_slots = group.header.config.max_market_slots.get() as usize;
             ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+            // S1-2: the portfolio's permanent incarnation id, read BEFORE the mutable view is built
+            // (0 when unreadable; never matches a minted NFT).
+            let portfolio_id_now = state::portfolio_id_or_zero(&portfolio_data);
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
@@ -28724,6 +28751,7 @@ pub mod processor {
             authorize_owner_or_nft_holder(
                 &portfolio,
                 portfolio_ai.key,
+                portfolio_id_now,
                 owner.key,
                 nft,
                 program_id,
@@ -28794,6 +28822,7 @@ pub mod processor {
                 payout,
                 portfolio.header.owner,
                 portfolio.header.provenance_header.market_group_id,
+                portfolio_id_now,
             )
         };
         if payout != 0 {
@@ -28827,6 +28856,7 @@ pub mod processor {
                 portfolio_ai.key,
                 &portfolio_owner,
                 &market_group,
+                portfolio_id_now,
             )?;
             let payout_u64 = amount_to_u64(payout)?;
             require_token_balance(vault_balance, payout_u64)?;
@@ -28860,10 +28890,13 @@ pub mod processor {
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
-        let (cfg, payout, portfolio_owner, market_group) = {
+        let (cfg, payout, portfolio_owner, market_group, portfolio_id_now) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+            // S1-2: the portfolio's permanent incarnation id, read BEFORE the mutable view is built
+            // (0 when unreadable; never matches a minted NFT).
+            let portfolio_id_now = state::portfolio_id_or_zero(&portfolio_data);
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
@@ -28880,6 +28913,7 @@ pub mod processor {
             authorize_owner_or_nft_holder(
                 &portfolio,
                 portfolio_ai.key,
+                portfolio_id_now,
                 owner.key,
                 nft,
                 program_id,
@@ -28908,6 +28942,7 @@ pub mod processor {
                 payout,
                 portfolio.header.owner,
                 portfolio.header.provenance_header.market_group_id,
+                portfolio_id_now,
             )
         };
         if payout != 0 {
@@ -28938,6 +28973,7 @@ pub mod processor {
                 portfolio_ai.key,
                 &portfolio_owner,
                 &market_group,
+                portfolio_id_now,
             )?;
             let payout_u64 = amount_to_u64(payout)?;
             require_token_balance(vault_balance, payout_u64)?;
@@ -42094,16 +42130,26 @@ pub mod processor {
     // Binding storage = Option (b): the wrapper cross-reads the NFT program's
     // PositionNftV16 PDA (no portfolio-struct growth) to learn the bound mint, then
     // checks the signer holds it. The PositionNftV16 byte offsets below are PINNED
-    // to ~/v17/percolator-nft/src/state_v16.rs (repr(C), align 1, total 199 bytes,
-    // enforced by that crate's `POSITION_NFT_V16_LEN == 199` assert). Any layout
-    // change there MUST update these.
+    // to percolator-nft/src/state_v16.rs (repr(C), align 1, total 239 bytes since S1-2,
+    // enforced by that crate's `POSITION_NFT_V16_LEN == 239` assert and its
+    // `wrapper_pinned_offsets` test). Any layout change there MUST update these.
+    //
+    // S1-2 (audit 2026-10-17): the NFT also carries the portfolio INCARNATION it was minted for
+    // (`portfolio_market_group`, `portfolio_id_at_mint`). The account key alone does not name
+    // an incarnation: a closed portfolio keypair can be re-created while the old PositionNft
+    // PDA survives, so the holder-auth verdict also compares those two fields with the live
+    // portfolio's market group and permanent `portfolio_id`.
     // ════════════════════════════════════════════════════════════════════════
 
     /// PositionNftV16 field offsets (repr(C), align 1) — pinned to percolator-nft.
     const NFT_PDA_OFF_PORTFOLIO_ACCOUNT: usize = 10; // [10..42]
     const NFT_PDA_OFF_NFT_MINT: usize = 42; // [42..74]
     const NFT_PDA_OFF_MARKET_ID_AT_MINT: usize = 111; // [111..119]
-    const NFT_PDA_MIN_LEN: usize = 199;
+    /// S1-2 (percolator-nft layout v3, 239 B): the incarnation binding stamped at mint. A
+    /// version-2 (199 B) account is shorter than `NFT_PDA_MIN_LEN` and so authorizes nothing.
+    const NFT_PDA_OFF_PORTFOLIO_MARKET_GROUP: usize = 199; // [199..231]
+    const NFT_PDA_OFF_PORTFOLIO_ID_AT_MINT: usize = 231; // [231..239]
+    const NFT_PDA_MIN_LEN: usize = 239;
     /// PositionNft PDA seed (percolator-nft `POSITION_NFT_SEED`).
     const NFT_POSITION_SEED: &[u8] = b"position_nft";
 
@@ -42156,6 +42202,7 @@ pub mod processor {
     fn authorize_owner_or_nft_holder(
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
         portfolio_key: &Pubkey,
+        portfolio_id: u64,
         signer: &Pubkey,
         nft: Option<NftHolderAccounts<'_, '_>>,
         program_id: &Pubkey,
@@ -42164,6 +42211,7 @@ pub mod processor {
             &portfolio.header.owner,
             portfolio_key,
             &portfolio.header.provenance_header.market_group_id,
+            portfolio_id,
             signer,
             nft,
             program_id,
@@ -42176,6 +42224,7 @@ pub mod processor {
         portfolio_owner: &[u8; 32],
         portfolio_key: &Pubkey,
         market_group: &[u8; 32],
+        portfolio_id: u64,
         signer: &Pubkey,
         nft: Option<NftHolderAccounts<'_, '_>>,
         program_id: &Pubkey,
@@ -42212,7 +42261,7 @@ pub mod processor {
         // (2) PositionNft PDA — must be NFT-program-owned (so its bytes are
         //     trustworthy). Read its bound portfolio + mint + market_id.
         let pda_owner_is_nft_program = nft.nft_account.owner == &nft_program_id;
-        let (pda_portfolio_account, bound_mint, market_id) = {
+        let (pda_portfolio_account, bound_mint, market_id, pda_market_group, pda_portfolio_id) = {
             let data = nft.nft_account.try_borrow_data()?;
             if data.len() < NFT_PDA_MIN_LEN {
                 return Err(PercolatorError::Unauthorized.into());
@@ -42227,7 +42276,16 @@ pub mod processor {
             mid.copy_from_slice(
                 &data[NFT_PDA_OFF_MARKET_ID_AT_MINT..NFT_PDA_OFF_MARKET_ID_AT_MINT + 8],
             );
-            (pa, mint, u64::from_le_bytes(mid))
+            let mut mg = [0u8; 32];
+            mg.copy_from_slice(
+                &data[NFT_PDA_OFF_PORTFOLIO_MARKET_GROUP
+                    ..NFT_PDA_OFF_PORTFOLIO_MARKET_GROUP + 32],
+            );
+            let mut pid = [0u8; 8];
+            pid.copy_from_slice(
+                &data[NFT_PDA_OFF_PORTFOLIO_ID_AT_MINT..NFT_PDA_OFF_PORTFOLIO_ID_AT_MINT + 8],
+            );
+            (pa, mint, u64::from_le_bytes(mid), mg, u64::from_le_bytes(pid))
         };
         // (3) Canonical PDA for that market_id under the trusted NFT program.
         let (expected_nft_pda, _) = Pubkey::find_program_address(
@@ -42257,6 +42315,10 @@ pub mod processor {
             pda_portfolio_account,
             portfolio_key.to_bytes(),
             pda_is_canonical,
+            pda_market_group,
+            market_group.to_bytes(),
+            pda_portfolio_id,
+            portfolio_id,
             bound_mint,
             ata_mint,
             signer.to_bytes(),
@@ -42276,6 +42338,9 @@ pub mod processor {
     /// genuinely holds the bound NFT of a portfolio escrowed under this NFT program:
     /// the portfolio is owned by the program's mint-authority PDA; the PositionNft
     /// PDA is NFT-program-owned, binds THIS portfolio, and is its canonical address;
+    /// S1-2: the PDA was minted for THIS INCARNATION of the portfolio account (market group +
+    /// permanent `portfolio_id`; a closed-and-recreated keypair gets a new id, so an NFT left
+    /// over from the earlier incarnation never matches);
     /// and the signer's token account holds exactly one unit of the bound mint.
     /// EVERY conjunct is proven load-bearing (flipping any one → false) and the
     /// accept path is proven reachable in tests/v16_kani.rs (anti-vacuity).
@@ -42286,6 +42351,10 @@ pub mod processor {
         pda_portfolio_account: [u8; 32],
         portfolio_key: [u8; 32],
         pda_is_canonical: bool,
+        pda_market_group: [u8; 32],
+        portfolio_market_group: [u8; 32],
+        pda_portfolio_id: u64,
+        portfolio_id: u64,
         bound_mint: [u8; 32],
         ata_mint: [u8; 32],
         signer: [u8; 32],
@@ -42295,8 +42364,11 @@ pub mod processor {
     ) -> bool {
         portfolio_owner == expected_mint_auth      // escrowed under THIS NFT program
             && pda_owner_is_nft_program            // PositionNft PDA is genuine
-            && pda_portfolio_account == portfolio_key // it binds THIS portfolio
+            && pda_portfolio_account == portfolio_key // it binds THIS portfolio ACCOUNT
             && pda_is_canonical                    // and is the canonical PDA
+            && pda_market_group == portfolio_market_group // S1-2: ...of THIS market group
+            && portfolio_id != 0                   // S1-2: a real, allocated incarnation id
+            && pda_portfolio_id == portfolio_id    // S1-2: ...minted for THIS incarnation
             && ata_mint == bound_mint              // token is the BOUND mint
             && ata_owner == signer                 // signer owns the token account
             && ata_amount == 1                     // holds exactly one
@@ -44473,6 +44545,9 @@ pub mod processor {
                 return Err(PercolatorError::EngineProvenanceMismatch.into());
             }
         }
+        // S1-2: the portfolio's permanent incarnation id, read BEFORE the mutable view is built
+        // (0 when unreadable; never matches a minted NFT).
+        let portfolio_id_now = state::portfolio_id_or_zero(&portfolio_data);
         let mut portfolio =
             state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
         expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
@@ -44482,6 +44557,7 @@ pub mod processor {
             authorize_owner_or_nft_holder(
                 &portfolio,
                 portfolio_ai.key,
+                portfolio_id_now,
                 owner.key,
                 nft,
                 program_id,
@@ -46639,6 +46715,7 @@ pub mod processor {
         portfolio_key: &Pubkey,
         portfolio_owner: &[u8; 32],
         market_group: &[u8; 32],
+        portfolio_id: u64,
     ) -> Result<(), ProgramError> {
         if owner.is_signer {
             return Ok(());
@@ -46684,6 +46761,7 @@ pub mod processor {
                     portfolio_owner,
                     portfolio_key,
                     market_group,
+                    portfolio_id,
                     owner.key,
                     nft,
                     program_id,

@@ -2398,8 +2398,7 @@ fn kani_e2_auth_accept_when_all_gates_hold() {
     let signer: [u8; 32] = kani::any(); // ata_owner == signer
     let mint: [u8; 32] = kani::any(); // ata_mint == bound_mint
     let ok = nft_holder_auth_decision(
-        owner, owner, true, pkey, pkey, true, mint, mint, signer, signer, 1, true,
-    );
+        owner, owner, true, pkey, pkey, true, [7u8; 32], [7u8; 32], 5, 5, mint, mint, signer, signer, 1, true);
     assert!(
         ok,
         "a genuine bound-NFT holder of an escrowed position must authorize"
@@ -2425,7 +2424,14 @@ fn kani_e2_auth_accept_implies_all_gates() {
     let ao: [u8; 32] = kani::any();
     let amt: u64 = kani::any();
     let init: bool = kani::any();
-    if nft_holder_auth_decision(po, ema, pob, ppa, pk, can, bm, am, sg, ao, amt, init) {
+    let pmg: [u8; 32] = kani::any();
+    let lmg: [u8; 32] = kani::any();
+    let pid: u64 = kani::any();
+    let lid: u64 = kani::any();
+    if nft_holder_auth_decision(po, ema, pob, ppa, pk, can, pmg, lmg, pid, lid, bm, am, sg, ao, amt, init) {
+        assert!(pmg == lmg, "authorized ⟹ NFT minted for THIS market group (S1-2)");
+        assert!(pid == lid, "authorized ⟹ NFT minted for THIS portfolio incarnation (S1-2)");
+        assert!(lid != 0, "authorized ⟹ the live incarnation id is allocated (S1-2)");
         assert!(
             po == ema,
             "authorized ⟹ portfolio escrowed under this NFT program"
@@ -2453,14 +2459,13 @@ fn kani_e2_auth_reject_not_escrowed() {
         kani::any(),
         kani::any(),
         kani::any(),
+        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
-        kani::any(),
-    );
+        kani::any());
     assert!(!ok, "non-escrowed (owner != mint-auth PDA) must reject");
     // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
     kani::cover!(true, "assume set satisfiable; asserted path reached");
@@ -2474,14 +2479,13 @@ fn kani_e2_auth_reject_fake_pda_owner() {
         false,
         kani::any(),
         kani::any(),
+        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
-        kani::any(),
-    );
+        kani::any());
     assert!(
         !ok,
         "PositionNft PDA not owned by the NFT program must reject"
@@ -2499,14 +2503,13 @@ fn kani_e2_auth_reject_wrong_portfolio() {
         kani::any(),
         ppa,
         pk,
+        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
-        kani::any(),
-    );
+        kani::any());
     assert!(!ok, "an NFT bound to a DIFFERENT portfolio must reject");
     // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
     kani::cover!(true, "assume set satisfiable; asserted path reached");
@@ -2520,14 +2523,13 @@ fn kani_e2_auth_reject_noncanonical_pda() {
         kani::any(),
         kani::any(),
         kani::any(),
-        false,
+        false, [7u8; 32], [7u8; 32], 5, 5,
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
-    );
+        kani::any());
     assert!(!ok, "a non-canonical PositionNft PDA must reject");
 }
 
@@ -2542,14 +2544,13 @@ fn kani_e2_auth_reject_wrong_mint() {
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
+        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
         bm,
         am,
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
-    );
+        kani::any());
     assert!(
         !ok,
         "holding a DIFFERENT mint (not the bound NFT) must reject"
@@ -2569,14 +2570,13 @@ fn kani_e2_auth_reject_wrong_ata_owner() {
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
+        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
         kani::any(),
         kani::any(),
         sg,
         ao,
         kani::any(),
-        kani::any(),
-    );
+        kani::any());
     assert!(!ok, "a token account NOT owned by the signer must reject");
     // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
     kani::cover!(true, "assume set satisfiable; asserted path reached");
@@ -2592,14 +2592,13 @@ fn kani_e2_auth_reject_amount_not_one() {
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
+        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
         amt,
-        kani::any(),
-    );
+        kani::any());
     assert!(!ok, "amount != 1 (zero, or a fungible balance) must reject");
     // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
     kani::cover!(true, "assume set satisfiable; asserted path reached");
@@ -2613,14 +2612,13 @@ fn kani_e2_auth_reject_uninitialized_ata() {
         kani::any(),
         kani::any(),
         kani::any(),
+        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
         kani::any(),
-        kani::any(),
-        false,
-    );
+        false);
     assert!(!ok, "an uninitialized token account must reject");
 }
 
@@ -3373,3 +3371,46 @@ fn kani_fee_split_no_leg_exceeds_fee() {
     assert!(parts.insurance <= fee as u128);
 }
 
+
+
+// ── S1-2 (audit 2026-10-17): portfolio INCARNATION binding of the NFT-holder verdict ──
+// A closed-and-recreated portfolio keypair gets a new permanent `portfolio_id`; an NFT minted
+// for the earlier incarnation must never authorize the new one, whatever every other gate says.
+
+/// A stale NFT (id at mint != live id) is rejected for ALL other inputs, including a fully valid
+/// holder otherwise.
+#[kani::proof]
+fn kani_s12_stale_incarnation_id_rejects() {
+    let (pid, lid): (u64, u64) = (kani::any(), kani::any());
+    kani::assume(pid != lid);
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(), kani::any(), pid, lid,
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "an NFT of an earlier incarnation (different portfolio_id) must reject");
+}
+
+/// An NFT stamped with another market group is rejected (ids are allocated per group).
+#[kani::proof]
+fn kani_s12_other_market_group_rejects() {
+    let (a, b): ([u8; 32], [u8; 32]) = (kani::any(), kani::any());
+    kani::assume(a != b);
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        a, b, kani::any(), kani::any(),
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "an NFT stamped for another market group must reject");
+}
+
+/// An unallocated live id (0) never authorizes, even against an NFT whose stored id is also 0.
+#[kani::proof]
+fn kani_s12_zero_live_id_rejects() {
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(), kani::any(), 0u64, 0u64,
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "a zero portfolio id must never authorize");
+}

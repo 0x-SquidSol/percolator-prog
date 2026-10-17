@@ -139,7 +139,9 @@ mod e2e {
     // PositionNftV16 state layout constants (from state_v16.rs).
     const POSITION_NFT_V16_MAGIC: u64 = 0x5045_5243_4E46_5400; // "PERCNFT\0"
     const POSITION_NFT_V16_VERSION: u8 = 2;
-    const POSITION_NFT_V16_LEN: usize = 199;
+    const POSITION_NFT_V16_LEN: usize = 239;
+    // S1-2: portfolio incarnation id the fixtures stamp into crafted portfolios and NFT PDAs.
+    const FIXTURE_PORTFOLIO_ID: u64 = 7;
 
     // ExtraAccountMetaList layout (from processor.rs).
     const EXTRA_META_ENTRY_LEN: usize = 35;
@@ -260,10 +262,12 @@ mod e2e {
         d
     }
 
-    /// Craft PositionNftV16 state bytes (199 bytes).
+    /// Craft PositionNftV16 state bytes (239 bytes).
     /// Encodes the exact on-chain struct layout (all V16Pod* wrappers = byte-arrays).
     fn nft_pda_data(
         portfolio: &Pubkey,
+        market_group: &Pubkey,
+        portfolio_id: u64,
         nft_mint: &Pubkey,
         asset_index: u16,
         market_id: u64,
@@ -298,6 +302,8 @@ mod e2e {
         // minted_at: V16PodI64 = [u8;8] at offset 159
         d[159..167].copy_from_slice(&1_700_000_000i64.to_le_bytes());
         // _reserved: [u8;32] at offset 167 (zeroed)
+        d[199..231].copy_from_slice(market_group.as_ref());
+        d[231..239].copy_from_slice(&portfolio_id.to_le_bytes());
         d
     }
 
@@ -443,6 +449,8 @@ mod e2e {
         data[8..10].copy_from_slice(&VERSION.to_le_bytes());
         data[10] = KIND_PORTFOLIO;
         data[HEADER_LEN..HEADER_LEN + pod_len].copy_from_slice(bytemuck::bytes_of(&p));
+        data[percolator_prog::constants::PORTFOLIO_ID_OFF..percolator_prog::constants::PORTFOLIO_ID_OFF + 8]
+            .copy_from_slice(&FIXTURE_PORTFOLIO_ID.to_le_bytes());
         data
     }
 
@@ -821,6 +829,8 @@ mod e2e {
                 lamports: 2_000_000,
                 data: nft_pda_data(
                     &portfolio_key,
+                    market,
+                    FIXTURE_PORTFOLIO_ID,
                     &nft_mint_key,
                     asset_index,
                     market_id,
@@ -927,6 +937,8 @@ mod e2e {
                 lamports: 2_000_000,
                 data: nft_pda_data(
                     &portfolio_key,
+                    market,
+                    FIXTURE_PORTFOLIO_ID,
                     &nft_mint_key,
                     asset_index,
                     market_id,
@@ -2514,5 +2526,256 @@ mod e2e {
             holder_lamports_before,
             holder_lamports_after,
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // S1-2 (audit 2026-10-17): the NFT is bound to the portfolio INCARNATION
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // A portfolio keypair can be closed (the wrapper never touches the NFT program) and
+    // re-created; the PositionNft PDA of the earlier incarnation survives. The fixtures stamp
+    // FIXTURE_PORTFOLIO_ID (7) into the NFT; `set_live_portfolio_id` makes the portfolio a LATER
+    // incarnation (a different permanent id), which is exactly the on-chain state after
+    // close + re-create.
+
+    fn set_live_portfolio_id(data: &mut Vec<u8>, id: u64) {
+        let off = percolator_prog::constants::PORTFOLIO_ID_OFF;
+        data[off..off + 8].copy_from_slice(&id.to_le_bytes());
+    }
+
+    fn escrow_to_mint_auth(data: &mut Vec<u8>) {
+        let mint_auth_bytes = mint_auth_pda().0.to_bytes();
+        data[HEADER_LEN + 100..HEADER_LEN + 132].copy_from_slice(&mint_auth_bytes);
+        data[HEADER_LEN + 64..HEADER_LEN + 96].copy_from_slice(&mint_auth_bytes);
+    }
+
+    fn emergency_burn_accounts(
+        market: &Pubkey,
+        holder: &Keypair,
+        nft_pda_key: Pubkey,
+        nft_mint_key: Pubkey,
+        source_ata_key: Pubkey,
+        portfolio_key: Pubkey,
+        mint_auth_key: Pubkey,
+        extra_metas_key: Pubkey,
+    ) -> Vec<AccountMeta> {
+        let (nft_registry_key, _) = nft_registry_pda(market);
+        vec![
+            AccountMeta::new(holder.pubkey(), true),
+            AccountMeta::new(nft_pda_key, false),
+            AccountMeta::new(nft_mint_key, false),
+            AccountMeta::new(source_ata_key, false),
+            AccountMeta::new(portfolio_key, false),
+            AccountMeta::new_readonly(mint_auth_key, false),
+            AccountMeta::new_readonly(TOKEN_2022, false),
+            AccountMeta::new(extra_metas_key, false),
+            AccountMeta::new_readonly(nft_registry_key, false),
+            AccountMeta::new_readonly(PERCOLATOR_MAINNET, false),
+        ]
+    }
+
+    /// The scenario: the portfolio is escrowed to the mint-authority PDA by the CURRENT
+    /// incarnation's NFT (held by somebody else); `stale_holder` holds a leftover NFT of an
+    /// earlier incarnation and EmergencyBurns it. The burn must reclaim the dead NFT's rent but
+    /// must NOT release the live escrow to the stale holder (before S1-2 it did, and the stale
+    /// holder became `portfolio.owner` of the buyer's portfolio).
+    #[test]
+    fn s12_stale_nft_emergency_burn_does_not_release_the_current_escrow() {
+        let Env { mut svm, payer } = base_env();
+        let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
+        let stale_holder = Keypair::new();
+        svm.airdrop(&stale_holder.pubkey(), 10_000_000_000).unwrap();
+        let mint_auth = mint_auth_pda().0.to_bytes();
+
+        let (portfolio_key, nft_pda_key, nft_mint_key, ata_key, extra_metas_key, (mint_auth_key, _)) =
+            place_nft_bundle_real_mint(
+                &mut svm, &payer, &market, &registry, &stale_holder, 0, 42,
+                0, // flat: would be emergency-burn eligible on the (old) market_id rule
+                |data| {
+                    escrow_to_mint_auth(data);
+                    set_live_portfolio_id(data, 9); // a LATER incarnation than the NFT's 7
+                },
+            );
+        let nft_pda_lamports = svm.get_balance(&nft_pda_key).unwrap();
+        let before = svm.get_balance(&stale_holder.pubkey()).unwrap();
+
+        let res = send(
+            &mut svm, NFT_PROGRAM_ID, &payer, vec![5u8],
+            emergency_burn_accounts(&market, &stale_holder, nft_pda_key, nft_mint_key, ata_key, portfolio_key, mint_auth_key, extra_metas_key),
+            &[&stale_holder],
+        );
+        assert!(res.is_ok(), "a stale NFT must still be burnable (rent reclaim): {res:?}");
+
+        let port = svm.get_account(&portfolio_key).unwrap();
+        assert_eq!(
+            read_portfolio_owner(&port.data),
+            mint_auth,
+            "S1-2: the stale holder must NOT receive the live escrow"
+        );
+        assert_eq!(read_provenance_owner(&port.data), mint_auth);
+        assert!(
+            svm.get_account(&nft_pda_key).map(|a| a.lamports == 0).unwrap_or(true),
+            "the dead NFT's PDA is closed"
+        );
+        assert!(
+            svm.get_balance(&stale_holder.pubkey()).unwrap() + 30_000 >= before + nft_pda_lamports,
+            "the stale holder recovered the NFT-side rent"
+        );
+    }
+
+    /// Control for the test above: the SAME burn with the NFT bound to the live incarnation
+    /// releases the escrow to the holder (the legitimate flow still works).
+    #[test]
+    fn s12_current_nft_emergency_burn_releases_the_escrow_to_the_holder() {
+        let Env { mut svm, payer } = base_env();
+        let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
+        let holder = Keypair::new();
+        svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
+        let (portfolio_key, nft_pda_key, nft_mint_key, ata_key, extra_metas_key, (mint_auth_key, _)) =
+            place_nft_bundle_real_mint(
+                &mut svm, &payer, &market, &registry, &holder, 0, 42, 0,
+                |data| escrow_to_mint_auth(data), // live id stays 7 == the NFT's
+            );
+        let res = send(
+            &mut svm, NFT_PROGRAM_ID, &payer, vec![5u8],
+            emergency_burn_accounts(&market, &holder, nft_pda_key, nft_mint_key, ata_key, portfolio_key, mint_auth_key, extra_metas_key),
+            &[&holder],
+        );
+        assert!(res.is_ok(), "{res:?}");
+        let port = svm.get_account(&portfolio_key).unwrap();
+        assert_eq!(read_portfolio_owner(&port.data), holder.pubkey().to_bytes());
+    }
+
+    /// Normal Burn (which releases the escrow) refuses a stale NFT; nothing is closed.
+    #[test]
+    fn s12_stale_nft_burn_is_rejected_and_the_current_nft_burn_releases() {
+        for (live_id, expect_ok) in [(9u64, false), (7u64, true)] {
+            let Env { mut svm, payer } = base_env();
+            let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
+            let holder = Keypair::new();
+            svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
+            let mint_auth = mint_auth_pda().0.to_bytes();
+            let (portfolio_key, nft_pda_key, nft_mint_key, ata_key, extra_metas_key, (mint_auth_key, _)) =
+                place_nft_bundle_real_mint(
+                    &mut svm, &payer, &market, &registry, &holder, 0, 42,
+                    1_000_000, // open leg, same market_id: only the incarnation differs
+                    |data| {
+                        escrow_to_mint_auth(data);
+                        set_live_portfolio_id(data, live_id);
+                    },
+                );
+            let res = send(
+                &mut svm, NFT_PROGRAM_ID, &payer, vec![1u8],
+                emergency_burn_accounts(&market, &holder, nft_pda_key, nft_mint_key, ata_key, portfolio_key, mint_auth_key, extra_metas_key),
+                &[&holder],
+            );
+            let port = svm.get_account(&portfolio_key).unwrap();
+            if expect_ok {
+                assert!(res.is_ok(), "current NFT Burn must work: {res:?}");
+                assert_eq!(read_portfolio_owner(&port.data), holder.pubkey().to_bytes());
+            } else {
+                let e = format!("{res:?}");
+                assert!(res.is_err() && e.contains("Custom(28)"), "stale Burn must fail with StalePortfolioIncarnation: {e}");
+                assert_eq!(read_portfolio_owner(&port.data), mint_auth, "escrow untouched");
+                assert!(svm.get_account(&nft_pda_key).map(|a| a.lamports > 0).unwrap_or(false), "NFT PDA untouched");
+            }
+        }
+    }
+
+    /// The transfer hook refuses to move a stale NFT (a dead token), and still moves a current one.
+    #[test]
+    fn s12_transfer_hook_refuses_a_stale_nft_and_moves_a_current_one() {
+        for (live_id, expect_ok) in [(9u64, false), (7u64, true)] {
+            let Env { mut svm, payer } = base_env();
+            let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
+            let src = Keypair::new();
+            let dst = Keypair::new();
+            svm.airdrop(&src.pubkey(), 10_000_000_000).unwrap();
+            svm.airdrop(&dst.pubkey(), 10_000_000_000).unwrap();
+            let (portfolio_key, nft_pda_key, nft_mint_key, src_ata, extra_metas_key, (mint_auth_key, _)) =
+                place_nft_bundle_real_mint(
+                    &mut svm, &payer, &market, &registry, &src, 0, 42, 1_000_000,
+                    |data| set_live_portfolio_id(data, live_id),
+                );
+            let dst_ata = create_ata(&mut svm, &payer, &dst.pubkey(), &nft_mint_key);
+            let ix = transfer_checked_ix(
+                &src_ata, &nft_mint_key, &dst_ata, &src.pubkey(), &extra_metas_key,
+                &nft_pda_key, &portfolio_key, &mint_auth_key, &registry,
+            );
+            let tx = Transaction::new_signed_with_payer(
+                &[
+                    ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+                    ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                    ix,
+                ],
+                Some(&payer.pubkey()),
+                &[&payer, &src],
+                svm.latest_blockhash(),
+            );
+            let r = svm.send_transaction(tx);
+            assert_eq!(r.is_ok(), expect_ok, "live_id={live_id}: {:?}", r.err());
+        }
+    }
+
+    /// Real MintPositionNft stamps `(market_group, portfolio_id)` and refuses a portfolio whose
+    /// id slot is unallocated (0).
+    #[test]
+    fn s12_real_mint_stamps_the_incarnation_and_refuses_an_unallocated_id() {
+        for (id, expect_ok) in [(7u64, true), (0u64, false)] {
+            let Env { mut svm, payer } = base_env();
+            let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
+            let owner = Keypair::new();
+            svm.airdrop(&owner.pubkey(), 10_000_000_000).unwrap();
+            let portfolio_key = Pubkey::new_unique();
+            let mut pdata = portfolio_data(&portfolio_key, &market, &owner.pubkey().to_bytes(), 0, 42, 1_000_000);
+            set_live_portfolio_id(&mut pdata, id);
+            svm.set_account(
+                portfolio_key,
+                Account { lamports: 10_000_000_000, data: pdata, owner: PERCOLATOR_MAINNET, executable: false, rent_epoch: 0 },
+            )
+            .unwrap();
+            let nft_mint_kp = Keypair::new();
+            let nft_mint = nft_mint_kp.pubkey();
+            let (nft_pda, _) = position_nft_pda(&portfolio_key, 42);
+            let (extra_metas, _) = extra_metas_pda(&nft_mint);
+            let (mint_auth, _) = mint_auth_pda();
+            let ata = ata_address(&owner.pubkey(), &nft_mint);
+            let (nft_registry_key, _) = nft_registry_pda(&market);
+            let _ = registry;
+            let res = send(
+                &mut svm, NFT_PROGRAM_ID, &payer, vec![0u8, 0u8, 0u8],
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(nft_pda, false),
+                    AccountMeta::new(nft_mint, true),
+                    AccountMeta::new(ata, false),
+                    AccountMeta::new(portfolio_key, false),
+                    AccountMeta::new_readonly(mint_auth, false),
+                    AccountMeta::new_readonly(TOKEN_2022, false),
+                    AccountMeta::new_readonly(ATA_PROGRAM, false),
+                    AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                    AccountMeta::new(extra_metas, false),
+                    AccountMeta::new_readonly(nft_registry_key, false),
+                    AccountMeta::new_readonly(PERCOLATOR_MAINNET, false),
+                ],
+                &[&owner, &nft_mint_kp],
+            );
+            if expect_ok {
+                assert!(res.is_ok(), "real mint must succeed: {res:?}");
+                let d = svm.get_account(&nft_pda).unwrap().data;
+                assert_eq!(d.len(), POSITION_NFT_V16_LEN, "239-byte layout");
+                assert_eq!(&d[199..231], market.as_ref(), "market group stamped");
+                assert_eq!(u64::from_le_bytes(d[231..239].try_into().unwrap()), 7, "portfolio id stamped");
+                // The wrapper escrowed the portfolio to the mint authority.
+                assert_eq!(
+                    read_portfolio_owner(&svm.get_account(&portfolio_key).unwrap().data),
+                    mint_auth.to_bytes()
+                );
+            } else {
+                let e = format!("{res:?}");
+                assert!(res.is_err() && e.contains("Custom(28)"), "unallocated id must be refused: {e}");
+                assert!(svm.get_account(&nft_pda).map(|a| a.data.is_empty()).unwrap_or(true));
+            }
+        }
     }
 }
