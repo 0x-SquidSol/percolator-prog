@@ -22954,6 +22954,53 @@ fn v16_bpf_update_asset_authority_rejects_stale_authority_epoch() {
     );
 }
 
+/// AUD-S1-14 (fix-all 2026-10-18): tags 52 and 53 pin the domain's backing-ledger PDA, as tag 50
+/// does. Anyone can create a zeroed account of the ledger's length owned by the wrapper (system
+/// `assign`), and before the fix tag 53 initialised and synced THAT account as the domain's
+/// ledger (bookkeeping drift: the real ledger was left behind). Control: the PDA is accepted.
+#[test]
+fn s1_14_backing_ledger_sync_pins_the_domain_pda() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.top_up_backing_bucket(0, 100, 1_000_000);
+    let fake = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            fake,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; state::backing_domain_ledger_account_len()],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let sync = |env: &mut V16CuEnv, ledger: Pubkey| {
+        env.svm.expire_blockhash();
+        send_tx(
+            &mut env.svm,
+            env.program_id,
+            &env.payer.insecure_clone(),
+            ProgInstruction::SyncBackingDomainLedger { domain: 0 },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(ledger, false),
+            ],
+            &[&admin],
+        )
+    };
+    let r = sync(&mut env, fake);
+    assert!(r.is_err(), "a non-PDA ledger must be refused: {r:?}");
+    assert!(
+        env.svm.get_account(&fake).unwrap().data.iter().all(|b| *b == 0),
+        "the impostor account was not written"
+    );
+    let pda = state::derive_lp_backing_ledger(&env.program_id, &env.market, 0).0;
+    sync(&mut env, pda).expect("control: the domain's own ledger PDA syncs");
+}
+
 /// AUD-S1-9 (fix-all 2026-10-18): an asset-0 sub-authority (here the oracle key) rotating to
 /// the key it already holds must be refused and must NOT advance the asset-0 `authority_epoch`
 /// lane, which the market authority's own instructions bind. Before the fix this no-op rotation

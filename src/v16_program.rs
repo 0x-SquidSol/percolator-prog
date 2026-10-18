@@ -22330,6 +22330,9 @@ pub mod processor {
         expect_writable(vault_token)?;
         expect_owner(market_ai, program_id)?;
         expect_owner(ledger_ai, program_id)?;
+        // AUD-S1-14 (fix-all 2026-10-18): pin the domain's backing-ledger PDA, as tag 50 does.
+        let (ledger_pda, _) = state::derive_lp_backing_ledger(program_id, market_ai.key, domain);
+        expect_key(ledger_ai, &ledger_pda)?;
         verify_token_program(token_program)?;
         if amount == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
@@ -22453,6 +22456,9 @@ pub mod processor {
         expect_writable(ledger_ai)?;
         expect_owner(market_ai, program_id)?;
         expect_owner(ledger_ai, program_id)?;
+        // AUD-S1-14 (fix-all 2026-10-18): pin the domain's backing-ledger PDA, as tag 50 does.
+        let (ledger_pda, _) = state::derive_lp_backing_ledger(program_id, market_ai.key, domain);
+        expect_key(ledger_ai, &ledger_pda)?;
 
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (cfg, group) = state::market_view_mut(&mut market_data)?;
