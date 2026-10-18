@@ -27601,6 +27601,19 @@ fn x1g_shape(n: u16, shape: u8) -> (u64, u64, u64, bool) {
             group.full_account_refresh_not_atomic(short).unwrap();
             group.full_account_refresh_not_atomic(long).unwrap();
             // flip: `long` becomes short q, `short` becomes long q, at 108
+            // engine #126 (fix-all 2026-10-18): a flip is risk-increasing, so the loss-stale gate
+            // applies to it like any other risk increase. Here every asset's `slot_last` trails the
+            // market clock (slot_last 2 vs clock 4 measured), which is loss-stale; before the fix the flips skipped
+            // the gate. Catch every asset up to the clock at the flip price first (no price move).
+            let now = group.header.current_slot.get();
+            for asset_index in 0..nn {
+                // one capped segment per accrual (max_accrual_dt_slots)
+                while group.markets[asset_index].engine.asset.slot_last.get() < now {
+                    group.accrue_asset_to_not_atomic(asset_index, now, 108, funding, true).unwrap();
+                }
+            }
+            group.full_account_refresh_not_atomic(short).unwrap();
+            group.full_account_refresh_not_atomic(long).unwrap();
             for asset_index in 0..nn {
                 group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
                     short, long,

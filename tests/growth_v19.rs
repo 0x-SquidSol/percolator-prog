@@ -1713,7 +1713,13 @@ fn legacy_parity_run(so: &PathBuf, deployed_layout: bool, with_cohort: bool) -> 
         steps.push(("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))));
     }
     steps.push(("crank", env.crank(xp)));
-    steps.push(("cpi_close", env.trade_cpi(&x, xp, &lp, -units(610))));
+    // x holds 610 in the zero case (600 + the nocpi 10) but 590 in the cohort case (600 - the
+    // reduce 10). engine #126 (fix-all 2026-10-18): -610 on 590 is a SIDE FLIP, which is
+    // risk-increasing and refused while y's cohort is loss-stale (121) -- the intended #126
+    // change, not a legacy-parity property (same rule as the omitted cohort `nocpi` above). Close
+    // exactly what x holds in each case.
+    let x_close = if with_cohort { units(590) } else { units(610) };
+    steps.push(("cpi_close", env.trade_cpi(&x, xp, &lp, -x_close)));
     for (what, r) in steps {
         let outcome = match r {
             Ok(_) => "ok".to_string(),
