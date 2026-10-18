@@ -11622,6 +11622,54 @@ fn s1_23_crank_liquidation_advances_position_epoch_and_refuses_a_stale_owner_act
     assert_eq!(epoch_of(&env, long_account), long_epoch0, "a plain refresh does not advance");
 }
 
+/// AUD-S1-24 (fix-all 2026-10-18; ADOPT upstream bba6bab4): a successful Live insurance debit
+/// (WithdrawInsuranceAsset, tag 57) consumes the authority epoch it was bound to, so the same
+/// signed withdrawal cannot land twice. Before the fix tag 57 only checked the epoch.
+#[test]
+fn s1_24_tag57_consumes_its_authority_epoch_and_refuses_a_replay() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.top_up_insurance_domain_with_authority_and_cu(&admin, 0, 250);
+    let epoch0 = env.insurance_withdraw_authority_epoch(0, &admin.pubkey());
+    let dest = env.token_account(admin.pubkey(), 0);
+    let ix = || ProgInstruction::WithdrawInsuranceAsset {
+        market_id: 1,
+        asset_index: 0,
+        amount: 50,
+        authority_epoch: epoch0,
+    };
+    let metas = |env: &V16CuEnv| {
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ]
+    };
+    let m = metas(&env);
+    send_tx(&mut env.svm, env.program_id, &env.payer, ix(), m, &[&admin]).expect("first withdrawal");
+    assert_eq!(env.token_amount(dest), 50);
+    assert_eq!(
+        env.insurance_withdraw_authority_epoch(0, &admin.pubkey()),
+        epoch0 + 1,
+        "S1-24: the debit consumed its authority epoch"
+    );
+    // The same signed withdrawal again (a durable-nonce copy): refused, nothing paid.
+    let slot = env.svm.get_sysvar::<Clock>().slot;
+    env.svm.warp_to_slot(slot + 1_000_000);
+    env.svm.expire_blockhash();
+    let m = metas(&env);
+    let r = send_tx(&mut env.svm, env.program_id, &env.payer, ix(), m, &[&admin]);
+    assert_eq!(
+        r.as_ref().err().and_then(|e| custom_code(e)),
+        Some(PercolatorError::EngineStale as u32),
+        "S1-24: a replayed tag 57 is refused by the authority-epoch CAS: {r:?}"
+    );
+    assert_eq!(env.token_amount(dest), 50, "nothing more was paid");
+}
+
 #[test]
 fn v16_bpf_permissionless_liquidation_is_bounded() {
     // FIX E3 (upstream #92) fixture repair: the original fixture (short deposits

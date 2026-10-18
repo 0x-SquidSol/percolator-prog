@@ -22913,6 +22913,11 @@ pub mod processor {
                     units_ai, &group, &cfg, market_ai.key, operator.key, INS_OP_BURN, amount, 0,
                 )?;
             debit_market_insurance_budget_view(&mut group, asset_index, amount)?;
+            // AUD-S1-24 (ADOPT upstream bba6bab4, "consume live insurance debit epochs"): a
+            // successful Live insurance debit CONSUMES the authority epoch it was bound to, so the
+            // same signed withdrawal (e.g. a durable-nonce copy held by the operator or anyone it
+            // was shared with) cannot land a second time. Same lane as the check above.
+            advance_authority_epoch_view(&mut group, epoch_asset_index, expected_authority_epoch)?;
             if units_on {
                 ins_units_post_op(units_ai, &group)?;
             }
