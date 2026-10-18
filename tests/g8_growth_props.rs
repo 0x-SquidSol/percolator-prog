@@ -67,36 +67,46 @@ proptest! {
     /// forced it IS launch; monotone non-decreasing in the tier; the table is monotone, starts at
     /// launch and never exceeds L_tier.
     #[test]
-    fn target_bounds_and_monotone(la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), t1 in 0u8..=3, t2 in 0u8..=3, grad in any::<bool>(), force in any::<bool>()) {
+    fn target_bounds_and_monotone(la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), t1 in 0u8..=3, t2 in 0u8..=3, grad in any::<bool>(), stress in 0u8..=3) {
         let launch = la.min(lt);
         let tab = tier_leverage(lev, la, lt);
         prop_assert_eq!(tab[0], launch);
         for i in 0..3 { prop_assert!(tab[i] <= tab[i + 1] && tab[i + 1] <= lt.max(launch)); }
         let (lo, hi) = if t1 <= t2 { (t1, t2) } else { (t2, t1) };
-        let a = target_ceiling_x100(grad, force, la, lt, l_table_x100(lo, tab));
-        let b = target_ceiling_x100(grad, force, la, lt, l_table_x100(hi, tab));
+        let a = target_ceiling_x100(grad, stress, la, lt, l_table_x100(lo, tab), stress_cap_x100(stress, lo, tab));
+        let b = target_ceiling_x100(grad, stress, la, lt, l_table_x100(hi, tab), stress_cap_x100(stress, hi, tab));
         prop_assert!(a >= launch && a <= lt.max(launch) && a <= launch.max(l_table_x100(lo, tab)));
         prop_assert!(a <= l_table_x100(lo, tab).max(launch));
         prop_assert!(a <= b);
-        if !grad || force { prop_assert_eq!(a, launch); }
+        if !grad || stress >= STRESS_HLOCK { prop_assert_eq!(a, launch); }
+        // round 3 item 3: stress is graded and monotone (more stress never raises the target)
+        if stress >= 1 { prop_assert!(a <= stress_cap_x100(stress, lo, tab).max(launch)); }
+        let more = target_ceiling_x100(grad, (stress + 1).min(3), la, lt, l_table_x100(lo, tab), stress_cap_x100((stress + 1).min(3), lo, tab));
+        prop_assert!(more <= a);
     }
 
     /// Ratchet: <= +1x per epoch, only after the epoch; never climbs in the snapshot call;
     /// fall-only never rises.
     #[test]
-    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), cl in any::<u64>(), cm in any::<u128>(), grad in any::<bool>(), force in any::<bool>(), la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), tier in 0u8..=3, now in any::<u64>()) {
-        let lx = l_table_x100(tier, tier_leverage(lev, la, lt));
-        let (c, s, cl2) = graduation_ratchet(prev, ps, cl, cm, grad, force, la, lt, lx, now);
+    fn ratchet_writer(prev in any::<u16>(), ps in any::<u64>(), grad in any::<bool>(), stress in 0u8..=3, la in any::<u16>(), lt in any::<u16>(), lev in any::<[u16; 3]>(), tier in 0u8..=3, now in any::<u64>(), stored in any::<u16>()) {
+        let tab = tier_leverage(lev, la, lt);
+        let lx = l_table_x100(tier, tab);
+        let cap = stress_cap_x100(stress, tier, tab);
+        let (c, s) = graduation_ratchet(prev, ps, grad, stress, la, lt, lx, cap, now);
+        let t = target_ceiling_x100(grad, stress, la, lt, lx, cap);
+        // security review F-1 fix A: down at once (the writer lands on the target in one call)
+        if prev > t { prop_assert_eq!((c, s), (t, now)); }
+        let f = ceiling_in_force_x100(true, stored, t, la, lt);
+        prop_assert_eq!(f, stored.min(t));
         if c > prev {
-            prop_assert!(cl != 0);
             prop_assert!(c as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
             prop_assert!(now >= ps.saturating_add(RATCHET_EPOCH_SLOTS));
             prop_assert_eq!(s, now);
         }
-        if c == prev && cl != 0 { prop_assert!(s == ps || s == now); }
-        if cl != 0 { prop_assert_eq!(cl2, cl); } else { prop_assert_eq!(cl2 == 0, cm == 0); }
-        let (f, _) = graduation_fall_only(prev, ps, grad, force, la, lt, lx, now);
+        if c == prev { prop_assert!(s == ps || s == now); }
+        let (f, _) = graduation_fall_only(prev, ps, grad, stress, la, lt, lx, cap, now);
         prop_assert!(f <= prev);
+        if prev > t { prop_assert_eq!(f, t); }
     }
 
     /// I-D4 at full width: with a cap depth, N_cap * 1e4 * P <= depth * κ * POS_SCALE (checked in
@@ -123,44 +133,54 @@ proptest! {
 
     /// W-M1 (R2.1 §1): once DEPTH_EVER is set the cap depth is ALWAYS Some (never uncapped), it
     /// is the fresh reading when there is one (a real 0 included), and the sticky depth is <=
-    /// last_good and monotone non-increasing in staleness, halving per 9,000 slots.
+    /// last_good (and, round 3, <= the window minimum) and monotone non-increasing in
+    /// staleness, halving per 9,000 slots.
     #[test]
-    fn sticky_cap_never_uncapped(src in any::<u8>(), fresh in prop::option::of(any::<u64>()), lg in any::<u64>(), lgs in any::<u64>(), n1 in any::<u64>(), n2 in any::<u64>()) {
+    fn sticky_cap_never_uncapped(src in any::<u8>(), fresh in prop::option::of(any::<u64>()), lg in any::<u64>(), lgs in any::<u64>(), n1 in any::<u64>(), n2 in any::<u64>(), tw in prop::option::of(any::<u64>())) {
         let ever = src | DEPTH_EVER;
-        let c = cap_depth_e6(ever, fresh, lg, lgs, n1);
+        let c = cap_depth_e6(ever, fresh, lg, lgs, n1, tw);
         prop_assert!(c.is_some());
-        if fresh.is_some() { prop_assert_eq!(c, fresh); } else { prop_assert!(c.unwrap() <= lg); }
+        if fresh.is_some() { prop_assert_eq!(c, fresh); } else {
+            prop_assert!(c.unwrap() <= lg);
+            if let Some(t) = tw { prop_assert!(c.unwrap() <= t); }
+        }
         let (a, b) = if n1 <= n2 { (n1, n2) } else { (n2, n1) };
         prop_assert!(sticky_depth_e6(lg, lgs, a) >= sticky_depth_e6(lg, lgs, b));
         let k = a.saturating_sub(lgs) / DEPTH_STICKY_EPOCH_SLOTS;
         if k < 64 { prop_assert_eq!(sticky_depth_e6(lg, lgs, a), lg >> k); }
         // without DEPTH_EVER and no fresh reading: no cap (the market is not closed before its
         // first reading)
-        prop_assert_eq!(cap_depth_e6(src & !DEPTH_EVER, None, lg, lgs, n1), None);
+        prop_assert_eq!(cap_depth_e6(src & !DEPTH_EVER, None, lg, lgs, n1, tw), None);
     }
 
     /// The one depth writer: a same-slot push never raises the depth; DEPTH_EVER is never cleared
     /// by it; the last good depth changes exactly when the result is a fresh reading (and then
-    /// equals it); the source bits are a known source and NONE for an absent sample. Coordinator
-    /// ruling: a later-slot REAL reading of 0 is fresh at once (Some(0), last good 0).
+    /// is the rate-limited WINDOW minimum); the window changes exactly then; the source bits are
+    /// a known source and NONE for an absent sample. Coordinator ruling: a later-slot REAL
+    /// reading of 0 is fresh at once (Some(0)), and every reader reads 0 at once (round 3: the
+    /// last good depth is held, gated through the window).
     #[test]
-    fn depth_writer(d in any::<u64>(), s in any::<u64>(), p in any::<u64>(), src_lo in 0u8..=2, prev_real in any::<bool>(), ever in any::<bool>(), lg in any::<u64>(), lgs in any::<u64>(), new_src in 0u8..=4, nd in any::<u64>(), now in any::<u64>()) {
+    fn depth_writer(d in any::<u64>(), s in any::<u64>(), p in any::<u64>(), src_lo in 0u8..=2, prev_real in any::<bool>(), ever in any::<bool>(), lg in any::<u64>(), lgs in any::<u64>(), new_src in 0u8..=4, nd in any::<u64>(), now in any::<u64>(), cur in any::<u32>(), prv in any::<u32>(), bk in any::<u16>(), unit in 1u64..=1_000_000_000_000) {
         let srcb = src_lo | if ever { DEPTH_EVER } else { 0 } | if prev_real { DEPTH_PREV_REAL } else { 0 };
-        let st = DepthState { depth_e6: d, depth_slot: s, depth_prev_e6: p, depth_source: srcb, last_good_e6: lg, last_good_slot: lgs, rise_slot64: 0 };
-        let o = depth_push_update(st, new_src, nd, now, u64::MAX);
+        let tw = if bk == 0 { DepthWindow::default() } else { DepthWindow { cur_tokens: cur.min(u32::MAX - 1), prev_tokens: prv, bucket_p1: bk } };
+        let st = DepthState { depth_e6: d, depth_slot: s, depth_prev_e6: p, depth_source: srcb, last_good_e6: lg, last_good_slot: lgs, rise_slot64: 0, tw };
+        let o = depth_push_update(st, new_src, nd, now, u64::MAX, unit);
         if s != 0 && now <= s { prop_assert!(o.depth_e6 <= d); prop_assert_eq!(o.depth_prev_e6, p); prop_assert_eq!(o.depth_slot, s); }
         if depth_ever(srcb) { prop_assert!(depth_ever(o.depth_source)); }
         let fresh = fresh_depth_e6(o.depth_e6, o.depth_prev_e6, o.depth_slot, o.depth_source, now);
         match fresh {
             Some(f) => {
                 prop_assert!(depth_ever(o.depth_source));
-                // R2-M1: last good is the RATE-LIMITED fresh reading
-                let (exp, er) = depth_rate_limited(depth_ever(srcb), lg, 0, f, o.depth_slot, u64::MAX);
-                prop_assert_eq!((o.last_good_e6, o.rise_slot64), (exp, er));
-                prop_assert!(o.last_good_e6 <= f && f <= o.depth_e6);
+                let w2 = depth_tw_update(tw, depth_tokens_floor(f, unit), o.depth_slot);
+                prop_assert_eq!(o.tw, w2);
+                let w = depth_tw_min_atoms(w2, unit).unwrap().min(f);
+                let (exp, er, es) = depth_rate_limited(depth_ever(srcb), lg, lgs, 0, w, depth_tw_full(w2), o.depth_slot, u64::MAX);
+                prop_assert_eq!((o.last_good_e6, o.rise_slot64, o.last_good_slot), (exp, er, es));
+                let u = usable_depth_e6(Some(f), o.last_good_e6, depth_tw_min_atoms(o.tw, unit)).unwrap();
+                prop_assert!(u <= f && u <= o.last_good_e6);
             }
             None => {
-                prop_assert_eq!((o.last_good_e6, o.last_good_slot), (lg, lgs));
+                prop_assert_eq!((o.last_good_e6, o.last_good_slot, o.tw), (lg, lgs, tw));
                 prop_assert_eq!(depth_ever(o.depth_source), depth_ever(srcb));
             }
         }
@@ -170,56 +190,59 @@ proptest! {
         if !real && !same_slot { prop_assert_eq!(depth_source_of(o.depth_source), DEPTH_SOURCE_NONE); prop_assert_eq!(fresh, None); }
         if real && nd == 0 && !same_slot {
             prop_assert_eq!(fresh, Some(0), "a later-slot real 0 is fresh at once");
-            prop_assert_eq!(o.last_good_e6, 0);
+            prop_assert_eq!(usable_depth_e6(fresh, o.last_good_e6, depth_tw_min_atoms(o.tw, unit)), Some(0), "every reader reads 0 at once");
+            prop_assert_eq!(depth_tw_min_atoms(o.tw, unit), Some(0), "and the window holds the zero");
         }
     }
 
-    /// Security review R2-M1 (one step): the rate-limited depth never exceeds the reading; falls
-    /// to the reading at once; a market's FIRST reading is below its T1 (`seed` = T1 - 1); after
-    /// that it rises at most 2x (or to the T1/16 bootstrap floor), and only in a LATER epoch than
-    /// the last rise.
+    /// Security review R2-M1 (one step) + round 3 item 4: the rate-limited depth never exceeds
+    /// the window minimum `w` unless it is HELD through a zero; falls to `w` at once (w > 0); a
+    /// market's FIRST reading is <= T1/16 (D-I1); a real zero holds it (D2); after that it rises
+    /// at most 2x of the (decayed) base (or to the T1/16 bootstrap floor), only on a full window,
+    /// and only >= 9,000 slots after the last rise.
     #[test]
-    fn depth_rate_limit_one_step(ever in any::<bool>(), lg in any::<u64>(), re in any::<u32>(), r in any::<u64>(), slot in any::<u64>(), seed in any::<u64>()) {
-        let (out, re2) = depth_rate_limited(ever, lg, re, r, slot, seed);
-        prop_assert!(out <= r);
-        if !ever { prop_assert!(out <= seed); prop_assert_eq!(out, r.min(seed)); }
-        if ever && r <= lg { prop_assert_eq!((out, re2), (r, re)); }
-        if ever && out > lg {
-            // a rise: one doubling (or the bootstrap floor out of ~0), in a later epoch only
-            prop_assert!(out <= lg.saturating_mul(2).max(seed / DEPTH_BOOTSTRAP_DIV));
-            prop_assert!(depth_rise_window_open(re, slot), "only once the window is open");
-            prop_assert!(slot >= re as u64 * DEPTH_RISE_STAMP_SLOTS + 9_000, ">= 9,000 slots after any slot of the stamp's start");
+    fn depth_rate_limit_one_step(ever in any::<bool>(), lg in any::<u64>(), lgs in any::<u64>(), re in any::<u32>(), w in any::<u64>(), full in any::<bool>(), slot in any::<u64>(), seed in any::<u64>()) {
+        let (out, re2, s2) = depth_rate_limited(ever, lg, lgs, re, w, full, slot, seed);
+        let floor = seed / DEPTH_BOOTSTRAP_DIV;
+        if !ever { prop_assert_eq!(out, w.min(floor)); prop_assert!(out <= seed); prop_assert_eq!(s2, slot); return Ok(()); }
+        if w == 0 { prop_assert_eq!((out, re2, s2), (lg, re, lgs), "D2: held"); return Ok(()); }
+        let base = sticky_depth_e6(lg, lgs, slot);
+        prop_assert!(out <= w.max(base));
+        prop_assert!(out <= base.saturating_mul(2).max(floor).max(base));
+        if w <= base { prop_assert_eq!((out, re2), (w, re)); }
+        if out > base {
+            prop_assert!(full, "a rise needs a full window");
+            prop_assert!(out <= base.saturating_mul(2).max(floor));
+            prop_assert!(depth_rise_window_open(re, slot));
+            prop_assert!(slot >= re as u64 * DEPTH_RISE_STAMP_SLOTS + 9_000);
             prop_assert_eq!(re2, depth_rise_stamp(slot));
         }
-        if ever && !depth_rise_window_open(re, slot) { prop_assert!(out <= lg, "no second rise inside the window"); }
+        if !full || !depth_rise_window_open(re, slot) { prop_assert!(out <= base); }
     }
 
-    /// R2-M1 (sequence, the reviewer's flash-liquidity shape): a market whose real depth is
-    /// `real` sees an inflated reading `big` on some pushes. Over ANY sequence of fresh
-    /// readings, the rate-limited depth after the sequence is <= max(seed, max reading) and,
-    /// above the seed, at most `max(seed, start) * 2^(epochs spanned)`; a real reading after
-    /// the spike takes it back down at once.
+    /// R2-M1 (sequence, the reviewer's flash-liquidity shape) at the limiter: over ANY sequence
+    /// of window minima, the rate-limited depth stays <= max(floor, start) * 2^(9,000-slot
+    /// windows spanned); a real reading after the spike takes it back down at once.
     #[test]
     fn depth_rate_limit_sequence(real in 1u64..1_000_000_000_000, big_mul in 2u64..1_000_000, picks in prop::collection::vec(any::<bool>(), 1..40), gap in 1u64..20_000, t1 in 1_000_000u64..1_000_000_000_000) {
         let seed = t1 - 1;
         let big = real.saturating_mul(big_mul);
-        let (mut lg, mut re, mut ever) = (0u64, 0u32, false);
+        let (mut lg, mut lgs, mut re, mut ever) = (0u64, 0u64, 0u32, false);
         let mut slot = 1_000u64;
         let start_slot = slot;
         for &spike in &picks {
             let r = if spike { big } else { real };
-            let (a, b) = depth_rate_limited(ever, lg, re, r, slot, seed);
-            lg = a; re = b; ever = true;
+            let (a, b, c) = depth_rate_limited(ever, lg, lgs, re, r, true, slot, seed);
+            lg = a; re = b; lgs = c; ever = true;
             slot += gap;
         }
-        // D-L2: rises need >= 9,000 slots between them: at most span / 9,000 after the first
         let epochs = ((slot - gap - start_slot) / 9_000) as u32;
-        let bound = seed.saturating_mul(1u64.checked_shl(epochs.min(63)).unwrap_or(u64::MAX).max(1)).max(seed);
-        prop_assert!(lg <= bound.max(seed), "lg {lg} bound {bound} epochs {epochs}");
-        // an honest reading takes it down at once
-        let (after, _) = depth_rate_limited(true, lg, re, real, slot, seed);
-        prop_assert!(after <= real);
-        if lg >= real { prop_assert_eq!(after, real, "down at once to the honest reading"); }
+        let start = seed / DEPTH_BOOTSTRAP_DIV;
+        let bound = start.saturating_mul(1u64.checked_shl(epochs.min(63)).unwrap_or(u64::MAX).max(1)).max(start);
+        prop_assert!(lg <= bound, "lg {lg} bound {bound} epochs {epochs}");
+        let (after, _, _) = depth_rate_limited(true, lg, lgs, re, real, true, slot, seed);
+        prop_assert!(after <= real.max(sticky_depth_e6(lg, lgs, slot)).min(lg.max(real)));
+        if sticky_depth_e6(lg, lgs, slot) >= real { prop_assert_eq!(after, real, "down at once to the honest reading"); }
     }
 
     /// R2.1 §2: `tier_config_ok` is exactly the stated bounds; an accepted explicit table is used
@@ -271,15 +294,15 @@ fn g8_props_mutants_are_caught() {
     assert_eq!(effective_depth_e6(DEPTH_TIER1_E6, DEPTH_TIER1_E6, 0, 151), 0);
     // W-M1: the round-1 rule leaves a market that once had depth uncapped when it goes stale.
     assert_eq!(cap_depth_mutant_round1(0), None);
-    assert!(cap_depth_e6(DEPTH_EVER, None, DEPTH_TIER1_E6, 0, 1_000).is_some());
+    assert!(cap_depth_e6(DEPTH_EVER, None, DEPTH_TIER1_E6, 0, 1_000, None).is_some());
     // Fresh-zero ruling: the "zero = absent" mutant leaves a market with a real 0 reading open.
     let zero_as_absent = |d: u64| if d == 0 { None } else { Some(d) };
     assert_eq!(zero_as_absent(0), None);
-    let z = depth_push_update(DepthState::default(), DEPTH_SOURCE_ATTESTED, 0, 5, u64::MAX);
+    let z = depth_push_update(DepthState::default(), DEPTH_SOURCE_ATTESTED, 0, 5, u64::MAX, USD_ATOMS);
     assert_eq!(fresh_depth_e6(z.depth_e6, z.depth_prev_e6, z.depth_slot, z.depth_source, 5), Some(0));
     // I-D2: a `max` with L_tier instead of `min` would graduate past L_tier.
     let tab = tier_leverage([0; 3], 500, 1_000);
     let mutant = 1_000u16.max(500u16.max(l_table_x100(3, [500, 500, 1_000, 2_000])));
     assert!(mutant > 1_000);
-    assert_eq!(target_ceiling_x100(true, false, 500, 1_000, l_table_x100(3, tab)), 1_000);
+    assert_eq!(target_ceiling_x100(true, STRESS_NONE, 500, 1_000, l_table_x100(3, tab), u16::MAX), 1_000);
 }

@@ -142,18 +142,71 @@ pub fn graduated_ceiling_x100(
     }
 }
 
-/// Ratchet the stored ceiling toward `target_x100`. Falls immediately (to the target, or to
-/// `floor_x100` when `force_down`: a draw outstanding, the h-lock or ADL). Rises by at most one
-/// `RATCHET_STEP_X100` per `RATCHET_EPOCH_SLOTS`. Returns `(ceil_x100, ceil_slot)`.
+// ── v2.2 round 3 item 3 (design D1(a) GAP-2a + GAP-4): graded stress target ─────────────────────
+
+/// Stress level 0: none.
+pub const STRESS_NONE: u8 = 0;
+/// Stress level 1: a senior draw / G9 backstop outstanding (a routine event once the F3 backing
+/// top-up draw exists): the target is capped ONE tier (knot) below the current tier.
+pub const STRESS_DRAW: u8 = 1;
+/// Stress level 2: REAL ADL -- an engine side mode is not Normal (DrainOnly / ResetPending).
+/// TWO tiers below. (`A != 1` alone, e.g. the LP side scaled by a matched band liquidation with
+/// both modes Normal, is NOT ADL: design D1(a).)
+pub const STRESS_ADL: u8 = 2;
+/// Stress level 3: the bankruptcy h-lock is latched: the target is launch. (Every stress level
+/// binds at once: the ceiling in force is `min(stored, target)`, security review F-1 fix A.)
+pub const STRESS_HLOCK: u8 = 3;
+
+/// D1(a): real ADL is an engine side mode other than Normal (`SideModeV16::Normal` == 0) on
+/// either side; the A factor alone is not read.
+pub fn real_adl(mode_long: u8, mode_short: u8) -> bool {
+    mode_long != 0 || mode_short != 0
+}
+
+/// The graded stress level from the three flags (the highest one wins).
+pub fn stress_level(draw_outstanding: bool, real_adl: bool, hlock: bool) -> u8 {
+    if hlock {
+        STRESS_HLOCK
+    } else if real_adl {
+        STRESS_ADL
+    } else if draw_outstanding {
+        STRESS_DRAW
+    } else {
+        STRESS_NONE
+    }
+}
+
+/// The stress cap on the ceiling target (x100): none (`u16::MAX`) at level 0; `L_table(tier - s)`
+/// for `s` = 1 (draw) and 2 (real ADL) -- `s` knots below the current tier, floored at tier 0
+/// (launch); launch (`table[0]`) under the h-lock. Monotone non-increasing in `stress`,
+/// non-decreasing in `tier`, and never above `L_table(tier)` once `stress >= 1`.
+pub fn stress_cap_x100(stress: u8, tier: u8, table: [u16; 4]) -> u16 {
+    if stress == STRESS_NONE {
+        return u16::MAX;
+    }
+    if stress >= STRESS_HLOCK {
+        return table[0];
+    }
+    let t = if tier > MAX_TIER { MAX_TIER } else { tier };
+    table[t.saturating_sub(stress) as usize]
+}
+
+/// Ratchet the stored ceiling toward `target_x100`: UP GRADUALLY, DOWN AT ONCE (Khubair's
+/// 12:52 rule; security review F-1 fix A). A fall goes to the target in the same call, stamped
+/// `now`; under the bankruptcy h-lock (`stress >= STRESS_HLOCK`) the target is `floor_x100`
+/// (launch). Rises by at most one `RATCHET_STEP_X100` per `RATCHET_EPOCH_SLOTS`. Round 3 item 3's
+/// graded stress only chooses the TARGET (`stress_cap_x100`); there is no per-call descent limit.
+/// Returns `(ceil_x100, ceil_slot)`.
 pub fn ratchet_ceiling_x100(
     prev_ceil_x100: u16,
     prev_slot: u64,
     target_x100: u16,
     floor_x100: u16,
-    force_down: bool,
+    stress: u8,
     now_slot: u64,
 ) -> (u16, u64) {
-    let target = if force_down && floor_x100 < target_x100 {
+    let hlock = stress >= STRESS_HLOCK;
+    let target = if hlock && floor_x100 < target_x100 {
         floor_x100
     } else {
         target_x100
@@ -900,14 +953,54 @@ pub fn growth_dials_ok_for(band: Option<(u64, u64)>, lambda_bps: u32, kink_bps: 
 pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 7_000;
 #[cfg(not(feature = "devnet"))]
 pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 6_000;
-/// v2.2 growth overnight §1.1: `band_on` is the per-market CLAMP predicate (`clamp_enforced`),
-/// not the band alone (callers: tag 99's dial trailer).
-pub fn alloc_alpha_max_bps(band_on: bool) -> u16 {
-    if band_on {
+/// v2.2 round 3 (adaptive-controller design GAP-8 / LP-plan audit §4 item 8): the backing top-up
+/// draw (F3) is what lets Earn take a loss in the designed order (junior, bonds, seniors) BEFORE
+/// winners are stuck. Until it is PROVEN (Kani on the draw rule + the +90% / +100% / cascade sims
+/// show every layer moving money), Earn allocation stays at the growth-1 50% on EVERY market,
+/// band or not: a protocol cap neither the creator nor the upgrade authority can exceed. Flipping
+/// this to `true` (a code change, reviewed) restores the band maximum `ALLOC_ALPHA_MAX_BAND_BPS`.
+pub const F3_PROVEN: bool = false;
+/// The protocol alpha cap while `F3_PROVEN` is false (the growth-1 / off-band 50%).
+pub const ALLOC_ALPHA_MAX_UNPROVEN_BPS: u16 = 5_000;
+const _: () = assert!(ALLOC_ALPHA_MAX_UNPROVEN_BPS == crate::vault_lp_v18::ALLOC_ALPHA_MAX_BPS);
+const _: () = assert!(ALLOC_ALPHA_MAX_UNPROVEN_BPS <= ALLOC_ALPHA_MAX_BAND_BPS);
+
+/// The alpha dial ceiling (pure core, both values of the switch; Kani / proptest target):
+/// band (clamp-enforced) markets may go to `ALLOC_ALPHA_MAX_BAND_BPS` only once `f3_proven`;
+/// every other case is the 50% cap.
+pub fn alloc_alpha_max_bps_for(f3_proven: bool, band_on: bool) -> u16 {
+    if band_on && f3_proven {
         ALLOC_ALPHA_MAX_BAND_BPS
+    } else if band_on {
+        ALLOC_ALPHA_MAX_UNPROVEN_BPS
     } else {
         crate::vault_lp_v18::ALLOC_ALPHA_MAX_BPS
     }
+}
+
+/// v2.2 growth overnight §1.1: `band_on` is the per-market CLAMP predicate (`clamp_enforced`),
+/// not the band alone (callers: tag 99's dial trailer). Round 3: capped at 50% everywhere until
+/// `F3_PROVEN`.
+pub fn alloc_alpha_max_bps(band_on: bool) -> u16 {
+    alloc_alpha_max_bps_for(F3_PROVEN, band_on)
+}
+
+/// Round 3: the alpha tag 103 actually allocates with: the stored dial, capped by the protocol
+/// cap in force (`min(stored, 50%)` until `F3_PROVEN`). A record written before round 3 with a
+/// band alpha above 50% stays VALID (the validator's ceiling is the band maximum, so no read
+/// fails) but cannot allocate past 50%. After the flip the stored dial is used as written (the
+/// setter already bounded it per market).
+pub fn alloc_alpha_in_force_bps_for(f3_proven: bool, stored_alpha_bps: u16) -> u16 {
+    if f3_proven || stored_alpha_bps <= ALLOC_ALPHA_MAX_UNPROVEN_BPS {
+        stored_alpha_bps
+    } else {
+        ALLOC_ALPHA_MAX_UNPROVEN_BPS
+    }
+}
+
+/// `alloc_alpha_in_force_bps_for` at the program's `F3_PROVEN`.
+pub fn alloc_alpha_in_force_bps(stored_alpha_bps: u16) -> u16 {
+    alloc_alpha_in_force_bps_for(F3_PROVEN, stored_alpha_bps)
 }
 
 /// v2.2 (security review I-1): the graduation reference `c_launch` is never below $1,000 of
@@ -930,7 +1023,10 @@ pub fn c_launch_atoms_for(c_m: u128) -> u128 {
 /// r_gap, the dials, the rent snapshot) is the market's CONFIGURATION and survives a restart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GraduationFields {
-    pub c_launch_atoms: u64,
+    /// Round 3 item 6: the volatility EWMA (bytes 0..4; was `c_launch_atoms` 0..8 -- retired).
+    pub vol_var_x100: u32,
+    /// Round 3 item 7: the rent-snapshot stamp (bytes 4..8, `slot / 64`).
+    pub rent_stamp64: u32,
     pub ceil_x100: u16,
     pub ceil_slot: u64,
     pub depth_e6: u64,
@@ -943,6 +1039,8 @@ pub struct GraduationFields {
     pub depth_last_good_slot: u64,
     /// R2-M1 / D-L2: the last-rise stamp (`slot / 64`) of the rate-limited depth.
     pub depth_rise_slot64: u32,
+    /// Round 3 item 4: the time-weighted depth window (bytes 30..38, 118..120).
+    pub depth_tw: DepthWindow,
 }
 
 /// Security review I-1 (security-review-v21-combination §8): a restarted asset, a reused slot,
@@ -955,7 +1053,8 @@ pub struct GraduationFields {
 /// `kani_g8_i1_reset_postconditions`.
 pub fn graduation_reset(l_launch_x100: u16, l_tier_x100: u16, now_slot: u64) -> GraduationFields {
     GraduationFields {
-        c_launch_atoms: 0,
+        vol_var_x100: 0,
+        rent_stamp64: 0,
         ceil_x100: if l_launch_x100 < l_tier_x100 {
             l_launch_x100
         } else {
@@ -969,6 +1068,7 @@ pub fn graduation_reset(l_launch_x100: u16, l_tier_x100: u16, now_slot: u64) -> 
         depth_last_good_e6: 0,
         depth_last_good_slot: 0,
         depth_rise_slot64: 0,
+        depth_tw: DepthWindow { cur_tokens: 0, prev_tokens: 0, bucket_p1: 0 },
     }
 }
 
@@ -1122,6 +1222,8 @@ pub struct DepthState {
     /// Security review R2-M1 + D-L2: the slot of the last RISE of `last_good_e6`, in units of
     /// `DEPTH_RISE_STAMP_SLOTS` (64) slots (`slot / 64`, bytes 114..118 of the record).
     pub rise_slot64: u32,
+    /// Round 3 item 4 (GAP-5): the time-weighted two-bucket window (bytes 30..38, 118..120).
+    pub tw: DepthWindow,
 }
 
 /// D-L2: the unit of the stored last-rise stamp. A u32 of 64-slot units wraps after 2^32 * 64 =
@@ -1146,55 +1248,163 @@ pub fn depth_rise_window_open(rise_slot64: u32, slot: u64) -> bool {
     rise_slot64 != u32::MAX && slot >= last.saturating_add(DEPTH_STICKY_EPOCH_SLOTS)
 }
 
-/// Security review R2-M1 ("up slowly, down at once" for the depth itself). The rate-limited
-/// depth `last_good` after a FRESH reading `r` (sample slot `slot`). `seed_e6` = the market's
-/// T1 in atoms minus 1 (the highest tier-0 depth). Returns `(last_good, rise_slot64)`:
-/// * the market's FIRST fresh reading (`DEPTH_EVER` not yet set): `min(r, seed)`, a rise -> it
-///   starts at tier 0 whatever the pool shows;
-/// * `r <= last_good`: `r` at once (down at once; a real 0 included); the rise clock is kept;
-/// * `r > last_good`, at least 9,000 slots after the last rise (`depth_rise_window_open`, D-L2):
-///   `min(r, max(2 * last_good, seed / 16))`, a rise -- at most one doubling per epoch (the
-///   `seed / 16` bootstrap floor only lets a market climb out of a real 0);
-/// * otherwise (a second rise in the same epoch): unchanged.
-///
-/// Two refinements of the proposed `max(last_good, seed) * 2^e` (e = epochs since the last
-/// rise), both closing a jump the rule would allow:
-/// * `2^e`: a market whose depth was steady for e epochs would accept one `2^e` jump at a
-///   single push -- exactly a flash-liquidity spike after a quiet period. Here a rise is one
-///   doubling per epoch whatever the gap.
-/// * `max(last_good, seed)`: a genuinely thin market ($2k, seed $25k) would jump 12.5x to the
-///   tier-0 ceiling in one push (its κ cap with it). Here it doubles per epoch like any other.
-///
-/// So a jump of more than 2x needs a fresh reading in each of several epochs, and any honest
-/// reading in between (the min-of-two of the real pool) takes it down at once.
+// ── v2.2 round 3 item 4 (design GAP-5, D-I1, D2): time-weighted depth minimum ──────────────────
+
+/// The time-weighted window's bucket: 750 slots (~5 min at 400 ms). The window is the current and
+/// the previous bucket, i.e. the minimum of every fresh sample over the last 5-10 minutes.
+/// Liveness (security review F-8): a RISE needs a full adjacent bucket pair, so the keeper must
+/// push depth at least once per 750 slots or the rate-limited depth can never rise.
+pub const DEPTH_TW_BUCKET_SLOTS: u64 = 750;
+/// The stored bucket index is `(slot / 750) % DEPTH_TW_BUCKET_RING + 1` (u16; 0 = no window
+/// history yet). The ring wraps after 65,535 buckets (~49M slots, ~227 days at 400 ms); a wrapped false
+/// "same" / "adjacent" match only ever folds an OLDER minimum in (a min), never raises anything.
+pub const DEPTH_TW_BUCKET_RING: u64 = 65_535;
+/// `depth_tw_prev_tokens` value meaning "no previous bucket in the window" (a gap of more than
+/// one bucket, or the window's first bucket). Real readings saturate at `u32::MAX - 1`.
+pub const DEPTH_TW_ABSENT: u32 = u32::MAX;
+
+/// The stored time-weighted window (`AssetGrowthV19` bytes 30..34, 34..38, 118..120).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DepthWindow {
+    /// The minimum fresh reading in the current bucket, whole collateral tokens (floor).
+    pub cur_tokens: u32,
+    /// The minimum of the previous (adjacent) bucket, or `DEPTH_TW_ABSENT`.
+    pub prev_tokens: u32,
+    /// `bucket % ring + 1`; 0 = no window history (a record from before round 3, or reset).
+    pub bucket_p1: u16,
+}
+
+/// The stored bucket code of `slot`.
+pub fn depth_tw_bucket_p1(slot: u64) -> u16 {
+    ((slot / DEPTH_TW_BUCKET_SLOTS) % DEPTH_TW_BUCKET_RING + 1) as u16
+}
+
+/// Atoms -> whole tokens (floor), saturating at `u32::MAX - 1` (never the absent marker).
+pub fn depth_tokens_floor(depth_atoms: u64, unit_atoms: u64) -> u32 {
+    if unit_atoms == 0 {
+        return 0;
+    }
+    let t = depth_atoms / unit_atoms;
+    if t >= DEPTH_TW_ABSENT as u64 {
+        DEPTH_TW_ABSENT - 1
+    } else {
+        t as u32
+    }
+}
+
+/// Fold one FRESH sample (`r_tokens`, at `slot`) into the window:
+/// * same bucket: `cur = min(cur, r)`;
+/// * the next bucket: `prev = cur`, `cur = r`;
+/// * otherwise (the first sample, or a gap of more than one bucket): `prev = ABSENT`, `cur = r`.
+pub fn depth_tw_update(w: DepthWindow, r_tokens: u32, slot: u64) -> DepthWindow {
+    let b = depth_tw_bucket_p1(slot);
+    if w.bucket_p1 != 0 && b == w.bucket_p1 {
+        return DepthWindow {
+            cur_tokens: if r_tokens < w.cur_tokens { r_tokens } else { w.cur_tokens },
+            ..w
+        };
+    }
+    let next = if w.bucket_p1 == 0 {
+        0
+    } else if w.bucket_p1 as u64 == DEPTH_TW_BUCKET_RING {
+        1
+    } else {
+        w.bucket_p1 + 1
+    };
+    let prev = if w.bucket_p1 != 0 && b == next { w.cur_tokens } else { DEPTH_TW_ABSENT };
+    DepthWindow { cur_tokens: r_tokens, prev_tokens: prev, bucket_p1: b }
+}
+
+/// The window minimum in ATOMS: `min(cur, prev)` (absent prev ignored), `None` without history.
+/// Saturating multiply (a saturated value is an upper bound only ever min-ed with real ones).
+pub fn depth_tw_min_atoms(w: DepthWindow, unit_atoms: u64) -> Option<u64> {
+    if w.bucket_p1 == 0 {
+        return None;
+    }
+    let m = if w.prev_tokens < w.cur_tokens { w.prev_tokens } else { w.cur_tokens };
+    Some((m as u64).saturating_mul(unit_atoms))
+}
+
+/// Validator: no history (bucket 0) means an all-zero window (every pre-round-3 record: bytes
+/// 30..38 were validated 0); with history the current minimum is a real reading (never the
+/// absent marker) and the bucket code is in `1..=ring`.
+pub fn depth_tw_window_ok(w: DepthWindow) -> bool {
+    if w.bucket_p1 == 0 {
+        w.cur_tokens == 0 && w.prev_tokens == 0
+    } else {
+        w.cur_tokens != DEPTH_TW_ABSENT && (w.bucket_p1 as u64) <= DEPTH_TW_BUCKET_RING
+    }
+}
+
+/// Whether the window spans a full adjacent bucket pair (a RISE of the rate-limited depth needs
+/// it: liquidity must have been the minimum over >= one whole previous bucket, not one push).
+pub fn depth_tw_full(w: DepthWindow) -> bool {
+    w.bucket_p1 != 0 && w.prev_tokens != DEPTH_TW_ABSENT
+}
+
+/// Security review R2-M1 ("up slowly, down at once" for the depth itself) + round 3 item 4
+/// (GAP-5: fed the TIME-WEIGHTED window minimum `w`, D-I1, D2). The rate-limited depth
+/// `last_good` after a fresh sample folded into the window (sample slot `slot`). `seed_e6` = the
+/// market's T1 in atoms minus 1. `rise_ok` = the window spans a full adjacent bucket pair
+/// (`depth_tw_full`). Returns `(last_good, rise_slot64, last_good_slot)`:
+/// * the market's FIRST fresh reading (`DEPTH_EVER` not yet set): `min(w, seed / 16)` (D-I1:
+///   round 2 seeded `T1 - 1`, ~12x a $2k pool's honest κ cap on a first-pair flash), a rise;
+/// * `w == 0` (a REAL zero inside the window): `last_good` and its slot are HELD (D2). The zero
+///   still caps every reader at 0 at once through the window (`usable_depth_e6`,
+///   `cap_depth_e6`), and keeps doing so while it is inside the 5-10 min window, so a one-sample
+///   glitch no longer costs a deep market ~7 h of doublings from T1/16;
+/// * otherwise against `base = sticky_depth_e6(last_good, last_good_slot, slot)` (equal to
+///   `last_good` in steady state; a value held through a long zero decays at the sticky rate,
+///   halving per 9,000 slots of zero, so a zero lasting hours recovers only to `last_good / 2^k`):
+///   * `w <= base`: `w` at once (down at once); the rise clock is kept;
+///   * `w > base`, `rise_ok` and >= 9,000 slots after the last rise (`depth_rise_window_open`,
+///     D-L2): `min(w, max(2 * base, seed / 16))`, a rise -- at most one doubling per 9,000 slots;
+///   * otherwise: `base`.
+#[allow(clippy::too_many_arguments)]
 pub fn depth_rate_limited(
     ever: bool,
     last_good_e6: u64,
+    last_good_slot: u64,
     rise_slot64: u32,
-    r: u64,
+    w: u64,
+    rise_ok: bool,
     slot: u64,
     seed_e6: u64,
-) -> (u64, u32) {
+) -> (u64, u32, u64) {
     let e = depth_rise_stamp(slot);
+    let floor = seed_e6 / DEPTH_BOOTSTRAP_DIV;
     if !ever {
-        return (if r < seed_e6 { r } else { seed_e6 }, e);
+        return (if w < floor { w } else { floor }, e, slot);
     }
-    if r <= last_good_e6 {
-        return (r, rise_slot64);
+    if w == 0 {
+        return (last_good_e6, rise_slot64, last_good_slot);
     }
-    if depth_rise_window_open(rise_slot64, slot) {
-        let doubled = last_good_e6.saturating_mul(2);
-        let floor = seed_e6 / DEPTH_BOOTSTRAP_DIV;
+    let base = sticky_depth_e6(last_good_e6, last_good_slot, slot);
+    if w <= base {
+        return (w, rise_slot64, slot);
+    }
+    if rise_ok && depth_rise_window_open(rise_slot64, slot) {
+        let doubled = base.saturating_mul(2);
         let up = if doubled > floor { doubled } else { floor };
-        return (if r < up { r } else { up }, e);
+        return (if w < up { w } else { up }, e, slot);
     }
-    (last_good_e6, rise_slot64)
+    (base, rise_slot64, slot)
 }
 
 /// The depth every reader uses (tiers and the κ cap): `min(fresh reading, rate-limited
-/// last_good)`; `None` while there is no fresh reading (the sticky path then applies).
-pub fn usable_depth_e6(fresh: Option<u64>, last_good_e6: u64) -> Option<u64> {
-    fresh.map(|f| if f < last_good_e6 { f } else { last_good_e6 })
+/// last_good, time-weighted window minimum)`; `None` while there is no fresh reading (the
+/// sticky path then applies). `tw_min_e6` `None` = no window history (a pre-round-3 record):
+/// round 2's `min(fresh, last_good)` exactly.
+pub fn usable_depth_e6(fresh: Option<u64>, last_good_e6: u64, tw_min_e6: Option<u64>) -> Option<u64> {
+    let tw = tw_min_e6.unwrap_or(u64::MAX);
+    fresh.map(|f| {
+        let m = if f < last_good_e6 { f } else { last_good_e6 };
+        if m < tw {
+            m
+        } else {
+            tw
+        }
+    })
 }
 
 /// THE depth writer (every PushAuthMark form: 35 B, 44 B mode 0/1, and the on-chain DEX mode 2,
@@ -1224,6 +1434,7 @@ pub fn depth_push_update(
     new_depth_e6: u64,
     now_slot: u64,
     seed_e6: u64,
+    unit_atoms: u64,
 ) -> DepthState {
     let (source, new_depth_e6) = if source == DEPTH_SOURCE_NONE || source > DEPTH_SOURCE_DEX {
         (DEPTH_SOURCE_NONE, 0)
@@ -1259,15 +1470,32 @@ pub fn depth_push_update(
         last_good_e6: st.last_good_e6,
         last_good_slot: st.last_good_slot,
         rise_slot64: st.rise_slot64,
+        tw: st.tw,
     };
     if let Some(f) = fresh_depth_e6(d, prev, slot, out.depth_source, now_slot) {
-        // R2-M1: last_good is the RATE-LIMITED depth (rises <= 2x per epoch, falls at once).
-        let (lg, re) = depth_rate_limited(depth_ever(st.depth_source), st.last_good_e6, st.rise_slot64, f, slot, seed_e6);
+        // Round 3 item 4: the fresh reading enters the time-weighted window (whole tokens,
+        // floor); the rate limiter is fed the WINDOW minimum, so a rise needs liquidity held over
+        // the whole window (>= one full bucket), not two pushes.
+        out.tw = depth_tw_update(st.tw, depth_tokens_floor(f, unit_atoms), slot);
+        let w = depth_tw_min_atoms(out.tw, unit_atoms).unwrap_or(0);
+        let w = if w < f { w } else { f };
+        // R2-M1: last_good is the RATE-LIMITED depth (rises <= 2x per 9,000 slots, falls at
+        // once, a real zero held and gated through the window -- D2).
+        let (lg, re, lgs) = depth_rate_limited(
+            depth_ever(st.depth_source),
+            st.last_good_e6,
+            st.last_good_slot,
+            st.rise_slot64,
+            w,
+            depth_tw_full(out.tw),
+            slot,
+            seed_e6,
+        );
         out.depth_source |= DEPTH_EVER;
         out.last_good_e6 = lg;
-        // The sticky decay clock: the slot of the last FRESH sample (not the last rise, not
-        // the moment the reading went stale): the first halving is 9,000 slots after it.
-        out.last_good_slot = slot;
+        // The sticky decay clock: the slot of the last fresh POSITIVE sample (held through a
+        // real zero, D2): the first halving is 9,000 slots after it.
+        out.last_good_slot = lgs;
         out.rise_slot64 = re;
     }
     out
@@ -1298,11 +1526,16 @@ pub fn cap_depth_e6(
     last_good_e6: u64,
     last_good_slot: u64,
     now_slot: u64,
+    tw_min_e6: Option<u64>,
 ) -> Option<u64> {
     if fresh_depth_e6.is_some() {
         fresh_depth_e6
     } else if depth_ever(depth_source_byte) {
-        Some(sticky_depth_e6(last_good_e6, last_good_slot, now_slot))
+        // Round 3 item 4: never above the last window minimum either (a real zero still in the
+        // window keeps the sticky cap at 0: the fresh-zero ruling survives the held last_good).
+        let st = sticky_depth_e6(last_good_e6, last_good_slot, now_slot);
+        let tw = tw_min_e6.unwrap_or(u64::MAX);
+        Some(if st < tw { st } else { tw })
     } else {
         None
     }
@@ -1606,6 +1839,235 @@ pub fn attested_max_tier_ok(v: u8) -> bool {
     v <= MAX_TIER
 }
 
+// ── v2.2 round 3 item 5 (design GAP-3): smooth leverage / κ / λ_depth across the thresholds ──
+
+/// The ramp above each threshold `T_i` spans `T_i / TIER_RAMP_DIV` (25%), capped at the next
+/// threshold.
+pub const TIER_RAMP_DIV: u64 = 4;
+
+/// Piecewise-linear "tier ramp" of a monotone 4-entry table (index = tier) at depth `d` over
+/// thresholds `th` (atoms). With `i = depth_tier_for(d, th)`:
+/// * `i == 0`: `table[0]`;
+/// * on the ramp `[T_i, E_i)`, `E_i = min(T_i + T_i / 4, T_{i+1})` (T_4 = infinity): linear from
+///   `table[i-1]` at `T_i` up to `table[i]` at `E_i` (floor);
+/// * past the ramp, up to the next threshold: `table[i]` (today's step value exactly).
+///
+/// NEVER LOOSER than today's step table anywhere (`<= table[tier(d)]` for every `d`), equal to it
+/// everywhere outside the 25% ramp above each threshold, CONTINUOUS (the value just below `T_i`
+/// is `table[i-1]`, the ramp starts there), and monotone non-decreasing in `d`. Khubair's "equal
+/// to today's table AT each threshold, never looser anywhere" cannot both hold for a continuous
+/// curve (the step jumps at `T_i`); never-looser is kept, so the jump at `T_i` becomes a ramp
+/// that reaches the table value 25% later. A pool oscillating ±2% around a threshold moves the
+/// target by <= 8% of that step, not the whole step. A non-monotone table (never produced by
+/// `tier_leverage`, whose output is monotone) returns the step value on its ramps.
+pub fn tier_ramp_u64(d: u64, th: [u64; 3], table: [u64; 4]) -> u64 {
+    let i = depth_tier_for(d, th) as usize;
+    if i == 0 {
+        return table[0];
+    }
+    let lo_x = th[i - 1];
+    let next = if i < 3 { th[i] } else { u64::MAX };
+    let ramp_end = core::cmp::min(lo_x.saturating_add(lo_x / TIER_RAMP_DIV), next);
+    let (lo, hi) = (table[i - 1], table[i]);
+    if d >= ramp_end || ramp_end <= lo_x || hi <= lo {
+        return hi;
+    }
+    // lo + (hi - lo) * (d - lo_x) / (ramp_end - lo_x), floor; < hi because d < ramp_end
+    let num = ((hi - lo) as u128) * ((d - lo_x) as u128);
+    let add = num / ((ramp_end - lo_x) as u128);
+    lo + add as u64
+}
+
+// ── v2.2 round 3 item 6 (design GAP-6): a volatility input to the leverage target ───────────
+
+/// The EWMA weight of a new sample: `1 / 2^4`, PER PUSH (not per unit of time): the memory is
+/// ~16 pushes whatever their spacing (security review F-4, accepted for devnet).
+pub const VOL_EWMA_SHIFT: u32 = 4;
+/// z of the volatility term (protocol constant, conservative).
+pub const VOL_Z: u64 = 3;
+/// One move is capped at 100% for the arithmetic (u64 squares never overflow); a larger move
+/// still saturates the variance far above any leverage it could allow.
+pub const VOL_MOVE_CAP_BPS: u64 = 10_000;
+/// The variance a market's FIRST sample is seeded at (no data -> no loosening): (5 bps)^2 per
+/// slot, x100 -- about 5x a calm major's per-slot volatility, so the EWMA can only fall toward the
+/// measured level (~16 calm pushes per e-fold), never start below it.
+pub const VOL_VAR_SEED_X100: u32 = 2_500;
+/// `AssetGrowthV19::flags` bit 0 (round 3): bytes 0..8 hold round-3 data (the variance 0..4 and
+/// the rent-snapshot stamp 4..8). Clear = a record from before round 3 whose 0..8 are the
+/// retired `c_launch_atoms`: no volatility data, no rent stamp.
+pub const GROWTH_FLAG_R3_LAYOUT: u8 = 0x01;
+/// `flags` bit 1: the variance has at least one sample (requires bit 0).
+pub const GROWTH_FLAG_VOL_DATA: u8 = 0x02;
+
+/// Validator for the `flags` byte: only bits 0-1, and bit 1 only with bit 0.
+pub fn growth_flags_ok(flags: u8) -> bool {
+    flags & !(GROWTH_FLAG_R3_LAYOUT | GROWTH_FLAG_VOL_DATA) == 0
+        && (flags & GROWTH_FLAG_VOL_DATA == 0 || flags & GROWTH_FLAG_R3_LAYOUT != 0)
+}
+
+/// One squared move, bps^2 per slot x100: `min(|p - p0| * 1e4 / p0, cap)^2 * 100 / dt` (ceil:
+/// never understates). `None` (no sample) with no previous mark or `dt == 0` (same-slot pushes
+/// are skipped).
+pub fn vol_sample_x100(prev_mark_e6: u64, mark_e6: u64, dt_slots: u64) -> Option<u64> {
+    if prev_mark_e6 == 0 || dt_slots == 0 {
+        return None;
+    }
+    let diff = (mark_e6 as u128).abs_diff(prev_mark_e6 as u128);
+    let mv = (diff * BPS).div_ceil(prev_mark_e6 as u128);
+    let mv = if mv > VOL_MOVE_CAP_BPS as u128 { VOL_MOVE_CAP_BPS as u128 } else { mv };
+    Some(((mv * mv * 100).div_ceil(dt_slots as u128)) as u64)
+}
+
+/// The EWMA update (stored u32, saturating): the first sample seeds `max(sample, seed)`; later
+/// `var + (sample - var) / 16` (rounded toward the sample on a rise, toward var on a fall: never
+/// understates).
+pub fn vol_update_x100(var_x100: u32, has_data: bool, sample_x100: u64) -> u32 {
+    let sample = if sample_x100 > u32::MAX as u64 { u32::MAX } else { sample_x100 as u32 };
+    if !has_data {
+        return if sample > VOL_VAR_SEED_X100 { sample } else { VOL_VAR_SEED_X100 };
+    }
+    if sample >= var_x100 {
+        let up = (sample - var_x100) as u64;
+        let step = up.div_ceil(1u64 << VOL_EWMA_SHIFT);
+        let v = var_x100 as u64 + step;
+        if v > u32::MAX as u64 { u32::MAX } else { v as u32 }
+    } else {
+        var_x100 - (var_x100 - sample) / (1u32 << VOL_EWMA_SHIFT)
+    }
+}
+
+/// `ceil(sqrt(x))` for u128 (Newton from above; exact). Security review F-8: the first iterate
+/// is now `ceil(x / 2) = (x + x / x) / 2` (was `x / 2 + 1`, which equals `x` at `x = 2` and stopped
+/// the loop at once: `isqrt_ceil(2)` was 3).
+pub fn isqrt_ceil_u128(x: u128) -> u128 {
+    if x < 2 {
+        return x;
+    }
+    // floor sqrt by Newton
+    let mut r = x;
+    let mut y = x / 2 + (x & 1); // ceil(x / 2) < x for x >= 2, and never overflows
+    while y < r {
+        r = y;
+        y = (r + x / r) / 2;
+    }
+    if r * r == x { r } else { r + 1 }
+}
+
+/// σ over the horizon, bps: `ceil(sqrt(var_x100 * h / 100))`.
+pub fn sigma_h_bps(var_x100: u32, h_slots: u64) -> u64 {
+    let v = (var_x100 as u128) * (h_slots as u128);
+    let s = isqrt_ceil_u128(v.div_ceil(100));
+    if s > u64::MAX as u128 { u64::MAX } else { s as u64 }
+}
+
+/// The volatility leverage ceiling (x100): `floor(1e6 / max(engine IMR, z * σ_H + liq fee))`,
+/// saturating at u16. `None` (no data) -> the caller uses LAUNCH (fails closed: no volatility
+/// measured, no loosening above launch). Monotone non-increasing in σ.
+pub fn l_vol_x100(engine_imr_bps: u64, sigma_h_bps: u64, liq_fee_bps: u64) -> u16 {
+    let need = VOL_Z.saturating_mul(sigma_h_bps).saturating_add(liq_fee_bps);
+    let den = if need > engine_imr_bps { need } else { engine_imr_bps };
+    if den == 0 {
+        return u16::MAX;
+    }
+    let l = 1_000_000u64 / den;
+    if l > u16::MAX as u64 { u16::MAX } else { l as u16 }
+}
+
+/// The leverage signal with the volatility term: `min(l_signal, L_vol)`; no data -> `launch`.
+pub fn l_signal_with_vol(l_signal_x100: u16, vol: Option<u16>, launch_x100: u16) -> u16 {
+    let v = vol.unwrap_or(launch_x100);
+    if v < l_signal_x100 { v } else { l_signal_x100 }
+}
+
+/// The κ table (bps of the depth) by tier: 0.5 / 1 / 1 / 2 (`kappa_depth_bps`).
+pub const KAPPA_TABLE_BPS: [u64; 4] = [5_000, 10_000, 10_000, 20_000];
+/// The λ_depth table (bps) by tier: 1x / 1x / 2x / 3x (`lambda_depth_bps`).
+pub const LAMBDA_DEPTH_TABLE_BPS: [u64; 4] = [10_000, 10_000, 20_000, 30_000];
+const _: () = assert!(KAPPA_TABLE_BPS[0] == 5_000 && KAPPA_TABLE_BPS[3] == 20_000);
+
+/// Round 3 item 5: the venue depth the ramps read: a DEX reading as is; a keeper-attested one
+/// clamped to just below the threshold above `attested_max_tier` (`T_{m+1} - 1`, so its ramp
+/// value never exceeds `L_m` -- the same cap `venue_tier` applies to the tier integer); no
+/// source: 0.
+pub fn venue_depth_capped(effective_depth_e6: u64, depth_source_byte: u8, thresholds_e6: [u64; 3], attested_max_tier_stored: u8) -> u64 {
+    match depth_source_of(depth_source_byte) {
+        DEPTH_SOURCE_DEX => effective_depth_e6,
+        DEPTH_SOURCE_ATTESTED => {
+            let m = attested_max_tier_eff(attested_max_tier_stored) as usize;
+            if m >= MAX_TIER as usize {
+                effective_depth_e6
+            } else {
+                let cap = thresholds_e6[m].saturating_sub(1);
+                if effective_depth_e6 < cap {
+                    effective_depth_e6
+                } else {
+                    cap
+                }
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// The smoothed growth dials of one market at a (venue, book) depth pair: the leverage signal
+/// `min(ramp_L(venue), ramp_L(book))` (x100), and κ / λ_depth as the same min of ramps. Each is
+/// <= its step value at `min(venue tier, book tier)`, so never looser than round 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmoothDials {
+    pub l_signal_x100: u16,
+    pub kappa_bps: u32,
+    pub lambda_depth_bps: u32,
+}
+
+pub fn smooth_dials(venue_depth_e6: u64, book_depth_e6: u64, thresholds_e6: [u64; 3], l_table_x100: [u16; 4]) -> SmoothDials {
+    let lt = [l_table_x100[0] as u64, l_table_x100[1] as u64, l_table_x100[2] as u64, l_table_x100[3] as u64];
+    let m2 = |t: [u64; 4]| {
+        let a = tier_ramp_u64(venue_depth_e6, thresholds_e6, t);
+        let b = tier_ramp_u64(book_depth_e6, thresholds_e6, t);
+        if a < b {
+            a
+        } else {
+            b
+        }
+    };
+    SmoothDials {
+        l_signal_x100: m2(lt) as u16,
+        kappa_bps: m2(KAPPA_TABLE_BPS) as u32,
+        lambda_depth_bps: m2(LAMBDA_DEPTH_TABLE_BPS) as u32,
+    }
+}
+
+/// `N_cap` with explicit (smoothed) dials: `min(n_cap_q(C_m, min(stored λ, λ_depth)), κ·depth/P)`
+/// on a clamp-enforced market; growth-1's `n_cap_q(C_m, stored λ)` off it. `n_cap_g8_q` is this at
+/// the step dials of a tier.
+#[allow(clippy::too_many_arguments)]
+pub fn n_cap_g8_q_dials(
+    clamp: bool,
+    c_m: u128,
+    stored_lambda_bps: u32,
+    lambda_depth_bps: u32,
+    kappa_bps: u32,
+    cap_depth_e6: Option<u64>,
+    price_e6: u64,
+    pos_scale: u128,
+) -> Option<u128> {
+    if !clamp {
+        return n_cap_q(c_m, stored_lambda_bps, price_e6, pos_scale);
+    }
+    let lam = if stored_lambda_bps < lambda_depth_bps { stored_lambda_bps } else { lambda_depth_bps };
+    let n = n_cap_q(c_m, lam, price_e6, pos_scale)?;
+    let d = depth_cap_q_kappa(kappa_bps, cap_depth_e6, price_e6, pos_scale);
+    Some(if n < d { n } else { d })
+}
+
+/// `depth_cap_q` with an explicit κ (bps).
+pub fn depth_cap_q_kappa(kappa_bps: u32, cap_depth_e6: Option<u64>, price_e6: u64, pos_scale: u128) -> u128 {
+    match cap_depth_e6 {
+        None => u128::MAX,
+        Some(d) => n_cap_q((d as u128) * (kappa_bps as u128) / BPS, DEFAULT_LAMBDA_BPS, price_e6, pos_scale).unwrap_or(0),
+    }
+}
+
 /// `λ_depth` (bps): 1x at tiers 0 and 1, 2x at tier 2, 3x at tier 3 (protocol constants).
 pub fn lambda_depth_bps(tier: u8) -> u32 {
     match tier {
@@ -1645,10 +2107,7 @@ pub fn depth_notional_cap_e6(tier: u8, cap_depth_e6: Option<u64>) -> Option<u128
 /// DOWN, so `<= κ·depth/P`, I-D4), `u128::MAX` only when there is no cap depth (never had a
 /// fresh one), and 0 (fail closed) on a zero price.
 pub fn depth_cap_q(tier: u8, cap_depth_e6: Option<u64>, price_e6: u64, pos_scale: u128) -> u128 {
-    match depth_notional_cap_e6(tier, cap_depth_e6) {
-        None => u128::MAX,
-        Some(nd) => n_cap_q(nd, DEFAULT_LAMBDA_BPS, price_e6, pos_scale).unwrap_or(0),
-    }
+    depth_cap_q_kappa(kappa_depth_bps(tier), cap_depth_e6, price_e6, pos_scale)
 }
 
 /// G8 `N_cap` (every reader: the post-fill gate, the TradeCpi open-room clip, the matcher ext
@@ -1665,12 +2124,16 @@ pub fn n_cap_g8_q(
     price_e6: u64,
     pos_scale: u128,
 ) -> Option<u128> {
-    if !clamp {
-        return n_cap_q(c_m, stored_lambda_bps, price_e6, pos_scale);
-    }
-    let n = n_cap_q(c_m, lambda_eff_bps(stored_lambda_bps, tier), price_e6, pos_scale)?;
-    let d = depth_cap_q(tier, cap_depth_e6, price_e6, pos_scale);
-    Some(if n < d { n } else { d })
+    n_cap_g8_q_dials(
+        clamp,
+        c_m,
+        stored_lambda_bps,
+        lambda_depth_bps(tier),
+        kappa_depth_bps(tier),
+        cap_depth_e6,
+        price_e6,
+        pos_scale,
+    )
 }
 
 /// G8 ext-v3 `(inventory_cap_q, liquidity_notional_e6)`. Off a clamp-enforced market, or with
@@ -1690,6 +2153,34 @@ pub fn growth_matcher_caps_g8(
     pos_scale: u128,
     max_position_abs_q: u128,
 ) -> (u128, u128) {
+    growth_matcher_caps_g8_dials(
+        hlock_active,
+        clamp,
+        c_m,
+        stored_lambda_bps,
+        lambda_depth_bps(tier),
+        kappa_depth_bps(tier),
+        cap_depth_e6,
+        price_e6,
+        pos_scale,
+        max_position_abs_q,
+    )
+}
+
+/// `growth_matcher_caps_g8` with explicit (round 3: smoothed) λ_depth / κ dials.
+#[allow(clippy::too_many_arguments)]
+pub fn growth_matcher_caps_g8_dials(
+    hlock_active: bool,
+    clamp: bool,
+    c_m: u128,
+    stored_lambda_bps: u32,
+    lambda_depth_bps: u32,
+    kappa_bps: u32,
+    cap_depth_e6: Option<u64>,
+    price_e6: u64,
+    pos_scale: u128,
+    max_position_abs_q: u128,
+) -> (u128, u128) {
     if !clamp {
         return growth_matcher_caps(
             hlock_active,
@@ -1700,8 +2191,8 @@ pub fn growth_matcher_caps_g8(
             max_position_abs_q,
         );
     }
-    let lam = lambda_eff_bps(stored_lambda_bps, tier);
-    let nd = match depth_notional_cap_e6(tier, cap_depth_e6) {
+    let lam = if stored_lambda_bps < lambda_depth_bps { stored_lambda_bps } else { lambda_depth_bps };
+    let nd = match cap_depth_e6.map(|d| (d as u128) * (kappa_bps as u128) / BPS) {
         None => {
             return growth_matcher_caps(hlock_active, c_m, lam, price_e6, pos_scale, max_position_abs_q)
         }
@@ -1710,7 +2201,7 @@ pub fn growth_matcher_caps_g8(
     if hlock_active {
         return (0, 0);
     }
-    let cap = n_cap_g8_q(true, c_m, stored_lambda_bps, tier, cap_depth_e6, price_e6, pos_scale)
+    let cap = n_cap_g8_q_dials(true, c_m, stored_lambda_bps, lambda_depth_bps, kappa_bps, cap_depth_e6, price_e6, pos_scale)
         .unwrap_or(0);
     let cap = if cap > max_position_abs_q {
         max_position_abs_q
@@ -1727,38 +2218,43 @@ pub fn growth_matcher_caps_g8(
 
 // ── v2.2 growth overnight §1.2 + R2.1 amendment (13:10): ceiling target, force-down, ratchet ──
 
-/// The live ceiling target (x100), R2.1 amendment (13:10 coordinator ruling):
+/// The live ceiling target (x100), R2.1 amendment (13:10 coordinator ruling) + round 3 item 3:
 /// ```text
-/// graduation on, no force-down: min(L_tier, max(L_launch, L_table(tier)))
-/// otherwise:                    min(L_launch, L_tier)
+/// graduation on, stress < h-lock: min(L_tier, max(L_launch, min(L_signal, stress_cap)))
+/// otherwise:                      min(L_launch, L_tier)
 /// ```
+/// `l_table_tier_x100` is the SIGNAL leverage (today `L_table(tier)`) and `stress_cap_x100` the
+/// graded stress cap (`stress_cap_x100`: none / one tier down for a draw / two for real ADL);
+/// the h-lock is launch.
 /// with `tier = min(venue_tier, book_tier)` (the book tier IS the capital term now: absolute LP
 /// book depth vs the per-market thresholds) and `l_table_tier_x100 = L_table(tier)`
 /// (`tier_leverage`). Round 1's doublings term `L_launch + floor(log2(C_m / C_launch))·1x` is
-/// gone from the target (it made 10x need 32x the launch capital and 20x ~32,768x); `c_launch`
-/// is still recorded and reset (I-1) but no longer read here. Never above `L_tier` or
-/// `max(launch, L_table(tier))` (I-D2), never below the launch ceiling. `force_down`: a senior
-/// draw / backstop outstanding, the bankruptcy h-lock latched, or ADL on either side.
+/// gone from the target (it made 10x need 32x the launch capital and 20x ~32,768x); round 3
+/// item 6 retired `c_launch` (its bytes carry the volatility EWMA and the rent stamp). Never above `L_tier` or
+/// `max(launch, L_table(tier))` (I-D2), never below the launch ceiling, and never above the
+/// stress cap unless that is below launch.
 pub fn target_ceiling_x100(
     graduation: bool,
-    force_down: bool,
+    stress: u8,
     l_launch_x100: u16,
     l_tier_x100: u16,
     l_table_tier_x100: u16,
+    stress_cap_x100: u16,
 ) -> u16 {
     let launch = if l_launch_x100 < l_tier_x100 {
         l_launch_x100
     } else {
         l_tier_x100
     };
-    if !graduation || force_down {
+    if !graduation || stress >= STRESS_HLOCK {
         return launch;
     }
-    let up = if l_table_tier_x100 > launch {
+    let sig = if l_table_tier_x100 < stress_cap_x100 {
         l_table_tier_x100
     } else {
-        launch
+        stress_cap_x100
     };
+    let up = if sig > launch { sig } else { launch };
     if up < l_tier_x100 {
         up
     } else {
@@ -1767,9 +2263,12 @@ pub fn target_ceiling_x100(
 }
 
 /// The ceiling the gate applies (x100). Off a clamp-enforced market: `min(L_launch, L_tier)`,
-/// exactly growth-1 (off-band identity). On one: `min(stored ratcheted ceil, live target)`, so
-/// it is never looser than the target now (a stale stored ceiling cannot outlive the depth,
-/// capital or force-down that justified it).
+/// exactly growth-1 (off-band identity). On one: `min(stored, live target)` -- leverage goes UP
+/// gradually (the stored ceiling climbs only through the ratchet, +1x per epoch) and DOWN AT
+/// ONCE: a depth collapse, stale / zero / missing depth (tier 0 -> launch), draw or real-ADL
+/// stress (graded target), the h-lock (launch) or a lower upper-authority tier table all bind in
+/// the same slot, before any writer runs (security review F-1, fix A; round 3's 1x-per-call
+/// descent is removed).
 pub fn ceiling_in_force_x100(
     clamp: bool,
     stored_ceil_x100: u16,
@@ -1784,7 +2283,7 @@ pub fn ceiling_in_force_x100(
             l_tier_x100
         };
     }
-    if stored_ceil_x100 < target_x100 {
+    if stored_ceil_x100 <= target_x100 {
         stored_ceil_x100
     } else {
         target_x100
@@ -1792,67 +2291,64 @@ pub fn ceiling_in_force_x100(
 }
 
 /// The ratchet WRITER at a site with the bound vault LP's `C_m` in hand (clamp-enforced markets
-/// only). Returns `(ceil_x100, ceil_slot, c_launch_atoms)`:
-/// * `c_launch == 0` (never recorded, or reset by I-1): snapshot `c_launch_atoms_for(C_m)` when
-///   `C_m > 0`, and the ceiling does NOT climb in this call (it can only fall to launch). The
-///   snapshot is kept (I-1 / ledger record) although the R2.1 target no longer reads it;
-/// * otherwise ratchet toward `target_ceiling_x100` (falls at once, rises <= +1x per epoch).
+/// only; the target's book tier was built from it). Returns `(ceil_x100, ceil_slot)`: ratchet
+/// toward `target_ceiling_x100` (falls to it at once; rises <= +1x per epoch). Round 3 item 6: the retired `c_launch` snapshot (R2.1 stopped reading it; its
+/// "no climb in the snapshot call" hold is redundant with the I-1 / bind stamp `ceil_slot = now`,
+/// which already makes the first climb wait a full epoch) is gone, and its bytes 0..8 carry the
+/// volatility EWMA and the rent stamp.
 #[allow(clippy::too_many_arguments)]
 pub fn graduation_ratchet(
     prev_ceil_x100: u16,
     prev_slot: u64,
-    c_launch_atoms: u64,
-    c_m: u128,
     graduation: bool,
-    force_down: bool,
+    stress: u8,
     l_launch_x100: u16,
     l_tier_x100: u16,
     l_table_tier_x100: u16,
+    stress_cap_x100: u16,
     now_slot: u64,
-) -> (u16, u64, u64) {
+) -> (u16, u64) {
     let launch = if l_launch_x100 < l_tier_x100 {
         l_launch_x100
     } else {
         l_tier_x100
     };
-    if c_launch_atoms == 0 {
-        let c_launch = if c_m > 0 {
-            u64::try_from(c_launch_atoms_for(c_m)).unwrap_or(u64::MAX)
-        } else {
-            0
-        };
-        // No climb in this call, not even toward launch from a ceiling below it: the target is
-        // min(prev, launch), so the ceiling can only fall (to launch) or stay.
-        let hold = if launch < prev_ceil_x100 {
-            launch
-        } else {
-            prev_ceil_x100
-        };
-        let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, hold, launch, force_down, now_slot);
-        return (c, s, c_launch);
-    }
-    let target = target_ceiling_x100(graduation, force_down, l_launch_x100, l_tier_x100, l_table_tier_x100);
-    let (c, s) = ratchet_ceiling_x100(prev_ceil_x100, prev_slot, target, launch, force_down, now_slot);
-    (c, s, c_launch_atoms)
+    let target = target_ceiling_x100(
+        graduation,
+        stress,
+        l_launch_x100,
+        l_tier_x100,
+        l_table_tier_x100,
+        stress_cap_x100,
+    );
+    ratchet_ceiling_x100(prev_ceil_x100, prev_slot, target, launch, stress, now_slot)
 }
 
 /// The FALL-ONLY ratchet (PushAuthMark: the depth changed but no `C_m` is in hand). The caller
-/// passes the VENUE tier's graduation and `L_table(venue_tier)`: the venue tier bounds
-/// `min(venue, book)` from above, so this upper bound is never below the real target and the
-/// stored ceiling only ever falls here (at once, stamped `now`); it never rises without the
-/// LP's equity.
+/// passes the VENUE tier's graduation, `L_table(venue_tier)` and the stress cap at the venue
+/// tier: the venue tier bounds `min(venue, book)` from above, so this upper bound is never below
+/// the real target and the stored ceiling only ever falls here, stamped `now`, to that bound at
+/// once (security review F-1 fix A); it never rises without the LP's equity.
 #[allow(clippy::too_many_arguments)]
 pub fn graduation_fall_only(
     prev_ceil_x100: u16,
     prev_slot: u64,
     graduation: bool,
-    force_down: bool,
+    stress: u8,
     l_launch_x100: u16,
     l_tier_x100: u16,
     l_table_tier_x100: u16,
+    stress_cap_x100: u16,
     now_slot: u64,
 ) -> (u16, u64) {
-    let upper = target_ceiling_x100(graduation, force_down, l_launch_x100, l_tier_x100, l_table_tier_x100);
+    let upper = target_ceiling_x100(
+        graduation,
+        stress,
+        l_launch_x100,
+        l_tier_x100,
+        l_table_tier_x100,
+        stress_cap_x100,
+    );
     if upper < prev_ceil_x100 {
         (upper, now_slot)
     } else {
@@ -1928,6 +2424,53 @@ pub fn rent_snapshot_n_cap_q(n_cap_q: u128, depth_cap_zero: bool) -> u64 {
         return 1;
     }
     u64::try_from(n_cap_q).unwrap_or(u64::MAX)
+}
+
+/// Round 3 item 7 (design GAP-10): the rent `N_cap` snapshot may FALL (rent rises on open
+/// positions) at most 2x per this many slots since its last applied fall.
+pub const RENT_SNAPSHOT_FALL_SLOTS: u64 = 900;
+
+/// Round 3 item 7 (GAP-10, "never cliff-edge on open positions"): the snapshot a writer stores.
+/// `stamp64` = `slot / 64 + 1` of the last applied FALL (bytes 4..8; 0 = never -- the `+ 1` keeps a
+/// fall in slots 0..63 distinguishable from "never").
+/// * a rise (rent falls) or a first measurement (`prev == 0`): `new` at once, stamp kept;
+/// * a fall: `max(new, prev >> k)` with `k` = whole 900-slot windows since the latest slot the
+///   stamp can stand for (`(stamp - 1) * 64 + 63`; a never-stamped snapshot gets one halving at once),
+///   stamped `now`; `k == 0` holds `prev`.
+///
+/// So rent on open positions climbs at most 2x per 900 slots (~6 min) toward the new rate --
+/// a real 0 depth (snapshot 1 = maximum rent, R2-L1) is still reached, in about log2(N_cap / OI)
+/// windows. The capacity GATE still uses the instant `N_cap` (opens are refused at once).
+pub fn rent_snapshot_smooth(prev: u64, stamp64: u32, new: u64, now_slot: u64) -> (u64, u32) {
+    if prev == 0 || new >= prev {
+        return (new, stamp64);
+    }
+    let k = if stamp64 == 0 {
+        1
+    } else {
+        let last = ((stamp64 - 1) as u64).saturating_mul(DEPTH_RISE_STAMP_SLOTS).saturating_add(DEPTH_RISE_STAMP_SLOTS - 1);
+        now_slot.saturating_sub(last) / RENT_SNAPSHOT_FALL_SLOTS
+    };
+    if k == 0 {
+        return (prev, stamp64);
+    }
+    let floor = if k >= 64 { 0 } else { prev >> k };
+    (if new > floor { new } else { floor }, rent_stamp64_of(now_slot))
+}
+
+/// The rent stamp of `slot`: `slot / 64 + 1`, saturating (never 0).
+pub fn rent_stamp64_of(slot: u64) -> u32 {
+    depth_rise_stamp(slot).saturating_add(1)
+}
+
+/// Round 3 item 7 (design GAP-13c): the bind-time guard -- on a clamp-enforced market with a
+/// measured depth, one minimum band leg must fit in the tier-0 depth capacity:
+/// `band_min_leg_notional <= floor(κ0 * cap_depth)`. `None` (never measured) passes.
+pub fn band_min_leg_fits_depth(band_min_leg_notional: u64, cap_depth_e6: Option<u64>) -> bool {
+    match cap_depth_e6 {
+        None => true,
+        Some(d) => (band_min_leg_notional as u128) <= (d as u128) * (KAPPA_TABLE_BPS[0] as u128) / BPS,
+    }
 }
 
 /// v2.2 item 2 (design §2.1): the per-side holding-fee rent rate, e9 of notional per slot.
@@ -2205,6 +2748,120 @@ mod tests {
 
     const PS: u128 = 1_000_000;
 
+    /// Round 3 item 7 (GAP-10, GAP-13c).
+    #[test]
+    fn r3_item7_rent_snapshot_and_min_leg() {
+        // rises at once; a first measurement at once
+        assert_eq!(rent_snapshot_smooth(100, 0, 500, 10), (500, 0));
+        assert_eq!(rent_snapshot_smooth(0, 0, 1, 10), (1, 0));
+        // a never-stamped fall: one halving at once, stamped slot/64 + 1
+        assert_eq!(rent_snapshot_smooth(1_000, 0, 1, 6_400), (500, 101));
+        // a fall in slots 0..63 is stamped 1, not "never": the next call holds
+        assert_eq!(rent_snapshot_smooth(1_000, 0, 1, 5), (500, 1));
+        assert_eq!(rent_snapshot_smooth(500, 1, 1, 6), (500, 1));
+        // inside 900 slots of the last fall (stamp 101 = slots 6,400..6,463): held
+        assert_eq!(rent_snapshot_smooth(500, 101, 1, 6_463 + 899), (500, 101));
+        // one window later: one more halving; three windows: an eighth
+        assert_eq!(rent_snapshot_smooth(500, 101, 1, 6_463 + 900), (250, rent_stamp64_of(6_463 + 900)));
+        assert_eq!(rent_snapshot_smooth(800, 101, 1, 6_463 + 2_700), (100, rent_stamp64_of(6_463 + 2_700)));
+        // never below the new value
+        assert_eq!(rent_snapshot_smooth(800, 101, 300, 6_463 + 2_700).0, 300);
+        // k >= 64: straight to the new value
+        assert_eq!(rent_snapshot_smooth(u64::MAX, 1, 1, 64 * 900 + 200).0, 1);
+        // min leg guard: 10 tokens fit in 0.5 x $40 = $20; not in 0.5 x $10
+        assert!(band_min_leg_fits_depth(10_000_000, Some(40_000_000)));
+        assert!(!band_min_leg_fits_depth(10_000_000, Some(10_000_000)));
+        assert!(band_min_leg_fits_depth(10_000_000, None), "never measured: passes");
+    }
+
+    /// Round 3 item 6 (GAP-6): the volatility term.
+    #[test]
+    fn r3_item6_vol_term() {
+        assert_eq!(vol_sample_x100(0, 5, 1), None, "no previous mark");
+        assert_eq!(vol_sample_x100(5, 6, 0), None, "same slot");
+        // 1% over 10 slots: 100^2 * 100 / 10 = 100,000
+        assert_eq!(vol_sample_x100(1_000_000, 1_010_000, 10), Some(100_000));
+        // capped at 100%
+        assert_eq!(vol_sample_x100(1_000_000, 9_000_000, 1), Some(10_000u64 * 10_000 * 100));
+        // seed and EWMA
+        assert_eq!(vol_update_x100(0, false, 0), VOL_VAR_SEED_X100);
+        assert_eq!(vol_update_x100(0, false, 99_999), 99_999);
+        assert_eq!(vol_update_x100(1_600, true, 0), 1_500);
+        assert_eq!(vol_update_x100(0, true, 17), 2, "ceil toward a rise");
+        // sigma over 1,200 slots of the seed: sqrt(2,500 * 1,200 / 100) = sqrt(30,000) -> 174
+        assert_eq!(sigma_h_bps(VOL_VAR_SEED_X100, 1_200), 174);
+        assert_eq!(isqrt_ceil_u128(u128::MAX), 1u128 << 64);
+        assert_eq!(isqrt_ceil_u128(16), 4);
+        assert_eq!(isqrt_ceil_u128(17), 5);
+        assert_eq!(isqrt_ceil_u128(2), 2, "F-8: was 3");
+        for x in 0u128..200_000 {
+            let r = isqrt_ceil_u128(x);
+            assert!(r * r >= x && (r == 0 || (r - 1) * (r - 1) < x), "ceil sqrt({x}) = {r}");
+        }
+        for k in [u64::MAX as u128, (1u128 << 64) + 1, u128::MAX - 1, (1u128 << 127) + 12_345] {
+            let r = isqrt_ceil_u128(k);
+            assert!(r.checked_mul(r).is_none_or(|p| p >= k) && (r - 1) * (r - 1) < k, "ceil sqrt({k}) = {r}");
+        }
+        // L_vol: 1e6 / max(IMR 500, 3 * 174 + 50 = 572) = 1,748 (17.48x)
+        assert_eq!(l_vol_x100(500, 174, 50), 1_748);
+        assert_eq!(l_vol_x100(500, 0, 50), 2_000, "calm: the engine IMR binds (20x)");
+        assert_eq!(l_vol_x100(500, 1_000, 50), 327, "storm: 1e6 / 3,050 = 3.27x");
+        assert_eq!(l_signal_with_vol(2_000, None, 500), 500, "no data: launch");
+        assert_eq!(l_signal_with_vol(2_000, Some(1_748), 500), 1_748);
+        assert!(growth_flags_ok(0) && growth_flags_ok(1) && growth_flags_ok(3));
+        assert!(!growth_flags_ok(2) && !growth_flags_ok(4));
+    }
+
+    /// Round 3 item 5 (GAP-3): the tier ramp.
+    #[test]
+    fn r3_item5_tier_ramp() {
+        let th = [25_000u64, 100_000, 500_000];
+        let l = [500u64, 500, 1_000, 2_000];
+        // below T1, and the step value past each ramp
+        assert_eq!(tier_ramp_u64(0, th, l), 500);
+        assert_eq!(tier_ramp_u64(24_999, th, l), 500);
+        assert_eq!(tier_ramp_u64(99_999, th, l), 500);
+        assert_eq!(tier_ramp_u64(125_000, th, l), 1_000, "T2 + 25%: the table value");
+        assert_eq!(tier_ramp_u64(499_999, th, l), 1_000);
+        assert_eq!(tier_ramp_u64(625_000, th, l), 2_000);
+        assert_eq!(tier_ramp_u64(u64::MAX, th, l), 2_000);
+        // on the ramp: linear from the tier below (never the step's higher value)
+        assert_eq!(tier_ramp_u64(100_000, th, l), 500, "AT T2: the value just below (continuous)");
+        assert_eq!(tier_ramp_u64(110_000, th, l), 700, "T2 + 10%: 5x + 5x * 0.4");
+        assert_eq!(tier_ramp_u64(124_999, th, l), 999);
+        // a ramp capped at a close next threshold
+        assert_eq!(tier_ramp_u64(110, [100, 120, 1_000], [1, 2, 3, 4]), 1, "floor of 1 + 1 * 10/20");
+        assert_eq!(tier_ramp_u64(119, [100, 120, 1_000], [1, 2, 3, 4]), 1);
+        assert_eq!(tier_ramp_u64(120, [100, 120, 1_000], [1, 2, 3, 4]), 2, "next ramp starts at the table value");
+        // venue cap: attested (default tier 1) clamps to T2 - 1 -> never above L1
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 0), 99_999);
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_DEX, th, 0), 600_000);
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 3), 600_000);
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_NONE, th, 3), 0);
+        // the dials: min of the two ramps
+        let d = smooth_dials(110_000, 600_000, th, [500, 500, 1_000, 2_000]);
+        assert_eq!(d, SmoothDials { l_signal_x100: 700, kappa_bps: 10_000, lambda_depth_bps: 14_000 });
+        // the step functions are the dials at a tier
+        for t in 0..=3u8 {
+            assert_eq!(n_cap_g8_q(true, 1_000_000, 30_000, t, Some(777), 1_000_000, PS), n_cap_g8_q_dials(true, 1_000_000, 30_000, lambda_depth_bps(t), kappa_depth_bps(t), Some(777), 1_000_000, PS));
+        }
+    }
+
+    /// Round 3 item 1 (GAP-8): alpha <= 50% on every market until F3 is proven.
+    #[test]
+    fn r3_gap8_alpha_cap_truth_table() {
+        for band in [false, true] {
+            assert_eq!(alloc_alpha_max_bps_for(false, band), 5_000);
+        }
+        assert_eq!(alloc_alpha_max_bps_for(true, false), 5_000);
+        assert_eq!(alloc_alpha_max_bps_for(true, true), ALLOC_ALPHA_MAX_BAND_BPS);
+        assert_eq!(alloc_alpha_max_bps(true), 5_000, "F3 not proven in this round");
+        assert_eq!(alloc_alpha_in_force_bps(7_000), 5_000);
+        assert_eq!(alloc_alpha_in_force_bps(5_000), 5_000);
+        assert_eq!(alloc_alpha_in_force_bps(1), 1);
+        assert_eq!(alloc_alpha_in_force_bps_for(true, 7_000), 7_000);
+    }
+
     #[test]
     fn leverage_imr_roundtrip_never_looser() {
         assert_eq!(imr_bps_for_leverage_x100(1_000), Some(1_000));
@@ -2406,15 +3063,18 @@ mod tests {
         );
         // ratchet: +1x per epoch, falls at once
         assert_eq!(
-            ratchet_ceiling_x100(500, 0, 800, 500, false, 8_999),
+            ratchet_ceiling_x100(500, 0, 800, 500, STRESS_NONE, 8_999),
             (500, 0)
         );
         assert_eq!(
-            ratchet_ceiling_x100(500, 0, 800, 500, false, 9_000),
+            ratchet_ceiling_x100(500, 0, 800, 500, STRESS_NONE, 9_000),
             (600, 9_000)
         );
-        assert_eq!(ratchet_ceiling_x100(800, 0, 600, 500, false, 1), (600, 1));
-        assert_eq!(ratchet_ceiling_x100(800, 0, 900, 500, true, 1), (500, 1));
+        // F-1 fix A: a fall goes to the target AT ONCE (800 -> 600 in one call); the h-lock goes
+        // to the floor (launch); draw / ADL stress falls to its (graded) target at once
+        assert_eq!(ratchet_ceiling_x100(800, 0, 600, 500, STRESS_NONE, 1), (600, 1));
+        assert_eq!(ratchet_ceiling_x100(800, 0, 900, 500, STRESS_HLOCK, 1), (500, 1));
+        assert_eq!(ratchet_ceiling_x100(800, 0, 500, 500, STRESS_ADL, 1), (500, 1));
     }
 
     #[test]
@@ -2423,7 +3083,8 @@ mod tests {
         assert_eq!(
             r,
             GraduationFields {
-                c_launch_atoms: 0,
+                vol_var_x100: 0,
+                rent_stamp64: 0,
                 ceil_x100: 550,
                 ceil_slot: 77,
                 ..Default::default()
@@ -2518,6 +3179,20 @@ mod tests {
         assert_eq!((attested_max_tier_eff(0), attested_max_tier_eff(2), attested_max_tier_eff(9)), (1, 2, 3));
     }
 
+    /// Round 3 item 4: the one depth writer at 6-decimal collateral.
+    fn up(st: DepthState, src: u8, d: u64, now: u64, seed: u64) -> DepthState {
+        depth_push_update(st, src, d, now, seed, USD_ATOMS)
+    }
+
+    /// Every reader's depth from a state at `now`.
+    fn usable_of(x: DepthState, now: u64) -> Option<u64> {
+        usable_depth_e6(
+            fresh_depth_e6(x.depth_e6, x.depth_prev_e6, x.depth_slot, x.depth_source, now),
+            x.last_good_e6,
+            depth_tw_min_atoms(x.tw, USD_ATOMS),
+        )
+    }
+
     #[test]
     fn g8_wl2_same_slot_push_is_not_a_second_sample() {
         let t1 = DEPTH_TIER1_E6;
@@ -2525,146 +3200,208 @@ mod tests {
         let st = |d, p, s| DepthState { depth_e6: d, depth_prev_e6: p, depth_slot: s, depth_source: if d == 0 { 0 } else { a }, ..Default::default() };
         let tri = |x: DepthState| (x.depth_e6, x.depth_prev_e6, x.depth_slot);
         // later slot: rotate
-        assert_eq!(tri(depth_push_update(st(t1, 0, 10), a, 2 * t1, 11, u64::MAX)), (2 * t1, t1, 11));
+        assert_eq!(tri(up(st(t1, 0, 10), a, 2 * t1, 11, u64::MAX)), (2 * t1, t1, 11));
         // first ever push (slot 0 = never): rotate
-        assert_eq!(tri(depth_push_update(st(0, 0, 0), a, t1, 5, u64::MAX)), (t1, 0, 5));
+        assert_eq!(tri(up(st(0, 0, 0), a, t1, 5, u64::MAX)), (t1, 0, 5));
         // same slot: prev kept, depth can only fall
-        assert_eq!(tri(depth_push_update(st(t1, 0, 10), a, 2 * t1, 10, u64::MAX)), (t1, 0, 10), "cannot raise");
-        assert_eq!(tri(depth_push_update(st(2 * t1, 7, 10), a, t1, 10, u64::MAX)), (t1, 7, 10), "can fall");
-        assert_eq!(tri(depth_push_update(st(2 * t1, 7, 10), 0, 0, 10, u64::MAX)), (0, 7, 10), "35 B in the same slot zeroes");
+        assert_eq!(tri(up(st(t1, 0, 10), a, 2 * t1, 10, u64::MAX)), (t1, 0, 10), "cannot raise");
+        assert_eq!(tri(up(st(2 * t1, 7, 10), a, t1, 10, u64::MAX)), (t1, 7, 10), "can fall");
+        assert_eq!(tri(up(st(2 * t1, 7, 10), 0, 0, 10, u64::MAX)), (0, 7, 10), "35 B in the same slot zeroes");
         // a same-slot DEX push that does not lower the value keeps the attested label
-        let x = depth_push_update(st(t1, 7, 10), DEPTH_SOURCE_DEX, 2 * t1, 10, u64::MAX);
+        let x = up(st(t1, 7, 10), DEPTH_SOURCE_DEX, 2 * t1, 10, u64::MAX);
         assert_eq!(depth_source_of(x.depth_source), a);
-        let x = depth_push_update(st(2 * t1, 7, 10), DEPTH_SOURCE_DEX, t1, 10, u64::MAX);
+        let x = up(st(2 * t1, 7, 10), DEPTH_SOURCE_DEX, t1, 10, u64::MAX);
         assert_eq!(depth_source_of(x.depth_source), DEPTH_SOURCE_DEX);
         // two same-slot attested pushes from nothing: still one sample -> effective 0
-        let s = depth_push_update(st(0, 0, 0), a, 5 * t1, 20, u64::MAX);
-        let s = depth_push_update(s, a, 5 * t1, 20, u64::MAX);
+        let s = up(st(0, 0, 0), a, 5 * t1, 20, u64::MAX);
+        let s = up(s, a, 5 * t1, 20, u64::MAX);
         assert_eq!(effective_depth_e6(s.depth_e6, s.depth_prev_e6, s.depth_slot, 20), 0, "W-L2: one slot is one sample");
         assert!(!depth_ever(s.depth_source), "no fresh depth yet");
-        let s = depth_push_update(s, a, 5 * t1, 21, u64::MAX);
+        assert_eq!(s.tw, DepthWindow::default(), "no fresh sample: the window is untouched");
+        let s = up(s, a, 5 * t1, 21, u64::MAX);
         assert_eq!(effective_depth_e6(s.depth_e6, s.depth_prev_e6, s.depth_slot, 21), 5 * t1, "two slots: effective");
         // regression stamp: fall only
-        assert_eq!(tri(depth_push_update(st(t1, 3, 10), a, 2 * t1, 9, u64::MAX)), (t1, 3, 10));
+        assert_eq!(tri(up(st(t1, 3, 10), a, 2 * t1, 9, u64::MAX)), (t1, 3, 10));
         // unknown source stores nothing
-        assert_eq!(tri(depth_push_update(st(t1, 3, 10), 3, 2 * t1, 11, u64::MAX)), (0, t1, 11));
+        assert_eq!(tri(up(st(t1, 3, 10), 3, 2 * t1, 11, u64::MAX)), (0, t1, 11));
+    }
+
+    /// Round 3 item 4: the two-bucket window primitives.
+    #[test]
+    fn r3_item4_window_primitives() {
+        let b = DEPTH_TW_BUCKET_SLOTS;
+        let w0 = DepthWindow::default();
+        assert_eq!(depth_tw_min_atoms(w0, USD_ATOMS), None, "no history");
+        assert!(!depth_tw_full(w0) && depth_tw_window_ok(w0));
+        // first sample: prev absent, min = the sample
+        let w = depth_tw_update(w0, 100, 5);
+        assert_eq!(w, DepthWindow { cur_tokens: 100, prev_tokens: DEPTH_TW_ABSENT, bucket_p1: 1 });
+        assert_eq!(depth_tw_min_atoms(w, USD_ATOMS), Some(100 * USD_ATOMS));
+        assert!(!depth_tw_full(w));
+        // same bucket: min
+        let w = depth_tw_update(w, 300, b - 1);
+        assert_eq!(w.cur_tokens, 100);
+        let w = depth_tw_update(w, 40, b - 1);
+        assert_eq!(w.cur_tokens, 40);
+        // the next bucket rotates: prev = 40, cur = the new sample
+        let w = depth_tw_update(w, 500, b);
+        assert_eq!((w.cur_tokens, w.prev_tokens, w.bucket_p1), (500, 40, 2));
+        assert!(depth_tw_full(w));
+        assert_eq!(depth_tw_min_atoms(w, USD_ATOMS), Some(40 * USD_ATOMS), "the older bucket's min still binds");
+        // a gap of more than one bucket: prev absent again
+        let g = depth_tw_update(w, 700, 3 * b);
+        assert_eq!((g.cur_tokens, g.prev_tokens), (700, DEPTH_TW_ABSENT));
+        // ring wrap: bucket 65,535 -> 1 is adjacent
+        let r = DepthWindow { cur_tokens: 9, prev_tokens: DEPTH_TW_ABSENT, bucket_p1: 65_535 };
+        let r2 = depth_tw_update(r, 11, 65_535 * b);
+        assert_eq!((r2.bucket_p1, r2.prev_tokens), (1, 9));
+        // tokens: floor, saturating below the absent marker
+        assert_eq!(depth_tokens_floor(1_999_999, USD_ATOMS), 1);
+        assert_eq!(depth_tokens_floor(u64::MAX, 1), DEPTH_TW_ABSENT - 1);
+        // validator
+        assert!(!depth_tw_window_ok(DepthWindow { cur_tokens: 1, prev_tokens: 0, bucket_p1: 0 }));
+        assert!(!depth_tw_window_ok(DepthWindow { cur_tokens: DEPTH_TW_ABSENT, prev_tokens: 0, bucket_p1: 3 }));
+        assert!(depth_tw_window_ok(DepthWindow { cur_tokens: 0, prev_tokens: DEPTH_TW_ABSENT, bucket_p1: 3 }));
     }
 
     #[test]
     fn r2_sticky_depth_cap_w_m1() {
         let t1 = DEPTH_TIER1_E6;
         let a = DEPTH_SOURCE_ATTESTED;
-        // two later-slot pushes: fresh -> DEPTH_EVER + last good
-        let s = depth_push_update(DepthState::default(), a, 4 * t1, 100, u64::MAX);
-        let s = depth_push_update(s, a, 2 * t1, 101, u64::MAX);
+        // two later-slot pushes: fresh -> DEPTH_EVER + last good (seed MAX: no D-I1 clamp here)
+        let s = up(DepthState::default(), a, 4 * t1, 100, u64::MAX);
+        let s = up(s, a, 2 * t1, 101, u64::MAX);
         assert!(depth_ever(s.depth_source));
         assert_eq!((s.last_good_e6, s.last_good_slot), (2 * t1, 101));
-        // 35 B push: depth 0, DEPTH_EVER and last good kept
-        let z = depth_push_update(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
+        // 35 B push: depth 0, DEPTH_EVER, last good and the window kept
+        let z = up(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
         assert_eq!(z.depth_e6, 0);
         assert_eq!(z.depth_source, DEPTH_EVER | DEPTH_PREV_REAL, "absent current, real previous");
-        assert_eq!((z.last_good_e6, z.last_good_slot), (2 * t1, 101));
+        assert_eq!((z.last_good_e6, z.last_good_slot, z.tw), (2 * t1, 101, s.tw));
         // first push of a new pair (prev 0): effective 0, sticky stays
-        let f = depth_push_update(z, a, 9 * t1, 103, u64::MAX);
+        let f = up(z, a, 9 * t1, 103, u64::MAX);
         assert_eq!(effective_depth_e6(f.depth_e6, f.depth_prev_e6, f.depth_slot, 103), 0);
         assert_eq!(f.last_good_e6, 2 * t1);
         // next pair: a LOWER fresh reading replaces it
-        let g = depth_push_update(f, a, t1, 104, u64::MAX);
+        let g = up(f, a, t1, 104, u64::MAX);
         assert_eq!((g.last_good_e6, g.last_good_slot), (t1, 104), "fresh replaces, lower too");
-        // cap depth: fresh -> eff; absent + ever -> last_good >> k; never -> None
-        assert_eq!(cap_depth_e6(a, Some(7), 0, 0, 0), Some(7));
-        assert_eq!(cap_depth_e6(a | DEPTH_EVER, Some(0), 1_000, 0, 0), Some(0), "a fresh real 0 caps at 0");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 8_999), Some(1_000));
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 9_000), Some(500), "halves per epoch");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 18_000), Some(250));
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, u64::MAX, 0, 64 * 9_000), Some(0), "k >= 64 -> 0");
-        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 500, 100), Some(1_000), "future stamp: no decay, still capped");
-        assert_eq!(cap_depth_e6(0, None, 1_000, 100, 200), None, "never had depth: no cap");
+        // cap depth: fresh -> eff; absent + ever -> min(last_good >> k, window min); never -> None
+        assert_eq!(cap_depth_e6(a, Some(7), 0, 0, 0, None), Some(7));
+        assert_eq!(cap_depth_e6(a | DEPTH_EVER, Some(0), 1_000, 0, 0, None), Some(0), "a fresh real 0 caps at 0");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 8_999, None), Some(1_000));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 9_000, None), Some(500), "halves per epoch");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 100 + 18_000, None), Some(250));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, u64::MAX, 0, 64 * 9_000, None), Some(0), "k >= 64 -> 0");
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 500, 100, None), Some(1_000), "future stamp: no decay, still capped");
+        assert_eq!(cap_depth_e6(0, None, 1_000, 100, 200, None), None, "never had depth: no cap");
+        // round 3: the sticky cap is never above the last window minimum (a zero in it: 0)
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 200, Some(300)), Some(300));
+        assert_eq!(cap_depth_e6(DEPTH_EVER, None, 1_000, 100, 200, Some(0)), Some(0));
         // N_cap at the sticky depth, tier 0 (κ 0.5): never uncapped, 0 closes opens
         let c_m = 1_000_000_000_000u128;
         assert_eq!(n_cap_g8_q(true, c_m, 10_000, 0, Some(100_000_000), 1_000_000, PS), Some(50_000_000));
         assert_eq!(n_cap_g8_q(true, c_m, 10_000, 0, Some(0), 1_000_000, PS), Some(0));
         assert_eq!(growth_matcher_caps_g8(false, true, c_m, 10_000, 0, Some(0), 1_000_000, PS, u128::MAX), (0, 0));
-        // I-1 reset clears the sticky state
+        // I-1 reset clears the sticky state and the window
         let r = graduation_reset(500, 2_000, 9);
         assert_eq!((r.depth_source, r.depth_last_good_e6, r.depth_last_good_slot), (0, 0, 0));
+        assert_eq!(r.depth_tw, DepthWindow::default());
         // MUTANT (round-1 rule: absent depth = no cap): the market goes uncapped
         let mutant = |eff: u64| if eff > 0 { Some(eff) } else { None };
         assert_eq!(depth_cap_q(0, mutant(0), 1_000_000, PS), u128::MAX, "mutant: uncapped");
-        assert_ne!(depth_cap_q(0, cap_depth_e6(DEPTH_EVER, None, 1, 0, 0), 1_000_000, PS), u128::MAX);
+        assert_ne!(depth_cap_q(0, cap_depth_e6(DEPTH_EVER, None, 1, 0, 0, None), 1_000_000, PS), u128::MAX);
     }
 
+    /// R2-M1 + D-L2 kept, plus round 3 item 4 (GAP-5, D-I1, D2): the rate-limited depth rises
+    /// at most 2x per 9,000 slots and ONLY on liquidity held over a full window (>= one whole
+    /// 750-slot bucket), falls at once, starts at T1 / 16, and a real zero glitch recovers in
+    /// one window instead of ~7 h.
     #[test]
     fn r2m1_depth_rises_at_most_2x_per_epoch_and_falls_at_once() {
         let th = tier_thresholds([0; 3], 6);
         let seed = th[0] - 1; // $24,999.999999
+        let floor = seed / DEPTH_BOOTSTRAP_DIV; // ~$1,562.5
         let a = DEPTH_SOURCE_DEX;
-        let usable = |x: DepthState, now: u64| usable_depth_e6(fresh_depth_e6(x.depth_e6, x.depth_prev_e6, x.depth_slot, x.depth_source, now), x.last_good_e6);
-        // The reviewer's flash-liquidity scenario: real $2k, a $51M-per-side whale held for two
-        // adjacent-slot DEX reads. Round 2 (no limiter) read tier 3 at once.
+        let b = DEPTH_TW_BUCKET_SLOTS;
         let real = 2_000 * USD_ATOMS;
         let inflated = 500_000_000 * USD_ATOMS;
-        let s0 = depth_push_update(DepthState::default(), a, real, 1_000, seed);
-        let s1 = depth_push_update(s0, a, real, 1_001, seed);
-        assert_eq!(usable(s1, 1_001), Some(real));
-        let w1 = depth_push_update(s1, a, inflated, 1_014, seed);
-        let w2 = depth_push_update(w1, a, inflated, 1_015, seed);
-        let u = usable(w2, 1_015).unwrap();
-        assert_eq!(u, real, "same epoch as the last rise: the spike adds nothing");
-        assert_eq!(venue_tier(u, w2.depth_source, th, 0), 0, "tier 0, not 3");
-        // the whale withdraws: the next honest pair takes it down at once
-        let h1 = depth_push_update(w2, a, real, 1_016, seed);
-        assert_eq!(usable(h1, 1_016), Some(real), "min(real, inflated) and min with last_good");
-        assert_eq!(h1.last_good_e6, real);
-        // a following 35 B push: sticky at the RATE-LIMITED value, not the inflated one
-        let z = depth_push_update(h1, DEPTH_SOURCE_NONE, 0, 1_017, seed);
-        assert_eq!(cap_depth_e6(z.depth_source, None, z.last_good_e6, z.last_good_slot, 1_200), Some(real));
-        // Repeating the spike once per epoch: one doubling per epoch at most (above the seed).
-        let mut st = depth_push_update(DepthState::default(), a, inflated, 9_000, seed);
-        st = depth_push_update(st, a, inflated, 9_001, seed);
-        assert_eq!(st.last_good_e6, seed, "first reading: tier-0 level");
+        // D-I1: a market's FIRST reading is min(r, T1/16): a first-pair flash of $500M reads
+        // ~$1,562 (round 2: T1 - 1, ~12x a $2k pool), tier 0.
+        let f0 = up(up(DepthState::default(), a, inflated, 1_000, seed), a, inflated, 1_001, seed);
+        assert_eq!(f0.last_good_e6, floor);
+        assert_eq!(venue_tier(usable_of(f0, 1_001).unwrap(), f0.depth_source, th, 0), 0);
+        // The reviewer's flash scenario on a real $2k pool: two adjacent-slot inflated reads in
+        // the same bucket add nothing (the window minimum is still the real $2k and a rise needs
+        // a full window anyway).
+        let s1 = up(up(DepthState::default(), a, real, 1_000, seed), a, real, 1_001, seed);
+        assert_eq!(s1.last_good_e6, floor, "first reading: T1/16");
+        let w2 = up(up(s1, a, inflated, 1_014, seed), a, inflated, 1_015, seed);
+        assert_eq!(usable_of(w2, 1_015), Some(floor), "the spike adds nothing");
+        assert_eq!(depth_tw_min_atoms(w2.tw, USD_ATOMS), Some(real), "the window keeps the real min");
+        // A whale must HOLD the liquidity over a whole bucket pair AND wait 9,000 slots per
+        // doubling: pushes every 10 slots from the window opening through the next bucket.
+        let mut st = s1;
+        // the first rise window opens at stamp(1,001) * 64 + 63 + 9,000 = 10,023
+        let mut s = 10_100u64;
+        let hold = |mut st: DepthState, from: u64, to: u64, d: u64| {
+            let mut x = from;
+            while x <= to {
+                st = up(st, a, d, x, seed);
+                x += 10;
+            }
+            st
+        };
         let mut prev = st.last_good_e6;
-        for k in 1..=6u64 {
-            let s = 9_000 + 9_100 * k; // D-L2: >= 9,000 slots after the previous rise
-            st = depth_push_update(st, a, inflated, s, seed);
-            st = depth_push_update(st, a, inflated, s + 1, seed);
-            assert_eq!(st.last_good_e6, prev * 2, "epoch {k}: exactly one doubling");
-            // a second spike in the same epoch adds nothing
-            let again = depth_push_update(st, a, inflated, s + 2, seed);
-            assert_eq!(again.last_good_e6, st.last_good_e6, "epoch {k}: no second rise");
-            st = again;
+        for k in 1..=4u64 {
+            // fill the window with the held liquidity BEFORE the rise window opens (the first
+            // sample of a new window is min-of-two with the previous, honest-or-not, sample)
+            st = hold(st, s - 2 * b, s - 80, inflated);
+            assert_eq!(st.last_good_e6, prev, "window {k}: no rise before 9,000 slots");
+            st = hold(st, s, s + 2 * b, inflated);
+            assert_eq!(st.last_good_e6, prev * 2, "window {k}: exactly one doubling");
+            // more held liquidity inside the same 9,000 slots adds nothing
+            st = hold(st, s + 2 * b + 10, s + 4_000, inflated);
+            assert_eq!(st.last_good_e6, prev * 2, "window {k}: no second rise");
             prev = st.last_good_e6;
+            // the rise was stamped at `s`: the next window opens at <= s + 9,063
+            s += 9_064;
         }
-        // tier 3 ($500k) from the seed ($25k) needs >= 5 epochs of continuous presence
-        assert!(prev >= th[2] && prev / 64 < th[2]);
-        // a real 0 takes it to 0 at once; recovery restarts at the tier-0 level
-        let zr = depth_push_update(st, a, 0, 9_000 * 9, seed);
-        assert_eq!(zr.last_good_e6, 0);
-        let p1 = depth_push_update(zr, a, inflated, 9_000 * 9 + 1, seed);
-        let p2 = depth_push_update(p1, a, inflated, 9_000 * 9 + 2, seed);
-        assert_eq!(p2.last_good_e6, seed / DEPTH_BOOTSTRAP_DIV, "out of a real 0: the bootstrap floor");
-        // a thin market cannot jump to the tier-0 ceiling: $2k doubles to $4k one epoch later
-        let (t, _) = depth_rate_limited(true, real, 0, inflated, 63 + 9_000, seed);
-        assert_eq!(t, 2 * real);
-        // MUTANT (the proposed 2^e for e quiet epochs): a steady market accepts one huge jump
-        let mutant = |lg: u64, e: u32| lg.saturating_mul(1u64 << e.min(63));
-        assert!(mutant(seed, 20) >= th[2], "2^e: tier 3 from one push after 20 quiet epochs");
-        let (one, _) = depth_rate_limited(true, seed, 0, inflated, 9_000 * 21, seed);
-        // D-L2 straddle: a rise at slot 8,999 (stamp 140), then 8,999 -> 9,000 crosses a calendar
-        // boundary; round 2 doubled again there. Now the window opens at 140 * 64 + 63 + 9,000.
-        let (a1, s1) = depth_rate_limited(true, seed, 0, inflated, 63 + 9_000, seed);
+        // an honest reading takes it down at once (min-of-two, then the window)
+        let h = up(up(st, a, real, s, seed), a, real, s + 1, seed);
+        assert_eq!(usable_of(h, s + 1), Some(real));
+        assert_eq!(h.last_good_e6, real, "down at once");
+        // D2: a real 0 caps at 0 AT ONCE but last_good is HELD (not zeroed) ...
+        let deep = 150_000 * USD_ATOMS;
+        let mut d = DepthState { last_good_e6: deep, last_good_slot: 50_000, rise_slot64: 0, depth_source: DEPTH_EVER | a | DEPTH_PREV_REAL, depth_e6: deep, depth_prev_e6: deep, depth_slot: 50_000, tw: DepthWindow { cur_tokens: 150_000, prev_tokens: 150_000, bucket_p1: depth_tw_bucket_p1(50_000) } };
+        d = up(d, a, 0, 50_010, seed);
+        assert_eq!(usable_of(d, 50_010), Some(0), "fresh-zero: 0 at once");
+        assert_eq!((d.last_good_e6, d.last_good_slot), (deep, 50_000), "held through the zero");
+        assert_eq!(cap_depth_e6(d.depth_source, None, d.last_good_e6, d.last_good_slot, 50_300, depth_tw_min_atoms(d.tw, USD_ATOMS)), Some(0), "stale after a zero: still 0");
+        // ... honest readings again: 0 while the zero is inside the window, then the full depth
+        let r1 = hold(d, 50_020, 50_020 + 300, deep);
+        assert_eq!(usable_of(r1, 50_320), Some(0), "the zero is still in the window");
+        let r2 = hold(r1, 50_330, 50_000 + 3 * b, deep);
+        assert_eq!(usable_of(r2, r2.depth_slot), Some(deep), "D2: recovered within ~10 min, not ~7 h");
+        // round-2 rule (MUTANT): last_good = 0 at the zero, then T1/16 doubling per 9,000 slots
+        assert!(floor * 32 < deep, "round 2 needed > 6 doublings (~7 h) to get back");
+        // a zero lasting k epochs recovers only to last_good >> k (the held value decays)
+        let long = hold(d, 50_020, 50_000 + 9_000 * 2 + 500, 0);
+        let back = hold(long, 50_000 + 9_000 * 2 + 510, 50_000 + 9_000 * 2 + 510 + 3 * b, deep);
+        assert_eq!(back.last_good_e6, (deep >> 2) * 2, "two epochs of zero: back to a quarter, then one doubling (rise window open)");
+        // direct limiter checks (D-L2 kept): one doubling per 9,000 slots
+        // (last_good_slot = the slot before: no staleness decay)
+        let (a1, s1_, _) = depth_rate_limited(true, seed, 9_062, 0, inflated, true, 63 + 9_000, seed);
         assert_eq!(a1, 2 * seed);
-        let (a2, _) = depth_rate_limited(true, a1, s1, inflated, 63 + 9_001, seed);
+        let (a2, _, _) = depth_rate_limited(true, a1, 63 + 9_000, s1_, inflated, true, 63 + 9_001, seed);
         assert_eq!(a2, a1, "one slot later: no second doubling");
-        let calendar_mutant = |re_slot: u64, slot: u64| slot / 9_000 > re_slot / 9_000;
-        assert!(calendar_mutant(8_999, 9_000), "the round-2 gate would allow it");
+        let (a3, _, _) = depth_rate_limited(true, seed, 9_062, 0, inflated, false, 63 + 9_000, seed);
+        assert_eq!(a3, seed, "no full window: no rise");
         assert!(!depth_rise_window_open(depth_rise_stamp(8_999), 9_000));
         assert!(depth_rise_window_open(depth_rise_stamp(8_999), 8_999 / 64 * 64 + 63 + 9_000));
         // D-L1 belt and braces: a saturated threshold is never met
         assert_eq!(depth_tier_for(u64::MAX, [u64::MAX; 3]), 0);
         assert_eq!(depth_tier_for(u64::MAX, [1, 2, u64::MAX]), 2);
         assert_eq!(tier_thresholds([0; 3], 12)[2], 500_000 * 1_000_000_000_000);
-        assert_eq!(one, seed * 2, "here: one doubling only");
         // 6 and 9 decimals (R2-L2): thresholds are whole collateral tokens
         assert_eq!(tier_thresholds([0; 3], 9)[0], 25_000 * 1_000_000_000);
         assert_eq!(tier_thresholds([5_000, 20_000, 100_000], 6), [5_000_000_000, 20_000_000_000, 100_000_000_000]);
@@ -2684,45 +3421,39 @@ mod tests {
         let a = DEPTH_SOURCE_ATTESTED;
         let fresh = |x: DepthState, now: u64| fresh_depth_e6(x.depth_e6, x.depth_prev_e6, x.depth_slot, x.depth_source, now);
         // a healthy pair, then an attested 0: fresh Some(0) AT ONCE (no second sample needed)
-        let s = depth_push_update(DepthState::default(), a, 4 * t1, 100, u64::MAX);
-        let s = depth_push_update(s, a, 4 * t1, 101, u64::MAX);
+        let s = up(DepthState::default(), a, 4 * t1, 100, u64::MAX);
+        let s = up(s, a, 4 * t1, 101, u64::MAX);
         assert_eq!(fresh(s, 101), Some(4 * t1));
-        let z = depth_push_update(s, a, 0, 102, u64::MAX);
+        let z = up(s, a, 0, 102, u64::MAX);
         assert_eq!(fresh(z, 102), Some(0), "a real 0 takes effect at once");
-        assert_eq!((z.last_good_e6, z.last_good_slot), (0, 102), "last_good = 0");
-        assert_eq!(cap_depth_e6(z.depth_source, fresh(z, 102), z.last_good_e6, z.last_good_slot, 102), Some(0));
+        assert_eq!(usable_of(z, 102), Some(0));
+        assert_eq!((z.last_good_e6, z.last_good_slot), (4 * t1, 101), "round 3 D2: last_good held");
+        assert_eq!(cap_depth_e6(z.depth_source, usable_of(z, 102), z.last_good_e6, z.last_good_slot, 102, depth_tw_min_atoms(z.tw, USD_ATOMS)), Some(0));
         assert_eq!(venue_tier(0, z.depth_source, tier_thresholds([0; 3], 6), 3), 0);
         // DEX 0 too, and from a market that never had depth (sets DEPTH_EVER)
-        let d = depth_push_update(DepthState::default(), DEPTH_SOURCE_DEX, 0, 7, u64::MAX);
+        let d = up(DepthState::default(), DEPTH_SOURCE_DEX, 0, 7, u64::MAX);
         assert_eq!((fresh(d, 7), depth_ever(d.depth_source)), (Some(0), true));
         // a later positive reading: its previous sample is the real 0 -> min stays 0
-        let p1 = depth_push_update(z, a, 4 * t1, 103, u64::MAX);
+        let p1 = up(z, a, 4 * t1, 103, u64::MAX);
         assert_eq!(fresh(p1, 103), Some(0), "positive after a real 0: min(4t1, 0) = 0");
-        let p2 = depth_push_update(p1, a, 4 * t1, 104, u64::MAX);
+        let p2 = up(p1, a, 4 * t1, 104, u64::MAX);
         assert_eq!(fresh(p2, 104), Some(4 * t1), "its own min-of-two restores the fresh reading");
-        // R2-M1: the rate-limited depth does not rise again in the epoch of its last rise
-        assert_eq!(p2.last_good_e6, 0);
-        assert_eq!(usable_depth_e6(fresh(p2, 104), p2.last_good_e6), Some(0));
-        // D-L2: the window is 9,000 slots after the last rise (slot 101, stamp 1 -> 64..127)
-        let p3 = depth_push_update(p2, a, 4 * t1, 127 + 9_000 - 1, t1 - 1);
-        assert_eq!(p3.last_good_e6, 0, "one slot before the window: no rise");
-        let p3 = depth_push_update(p2, a, 4 * t1, 127 + 9_000, t1 - 1);
-        assert_eq!(p3.last_good_e6, (t1 - 1) / DEPTH_BOOTSTRAP_DIV, "window open: the bootstrap floor");
+        assert_eq!(usable_of(p2, 104), Some(0), "but the zero is still inside the window");
         // contrast: absent samples (35 B / mode 0) are NOT zero readings -> sticky last good
-        let ab = depth_push_update(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
+        let ab = up(s, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
         assert_eq!(fresh(ab, 102), None);
         assert_eq!(ab.last_good_e6, 4 * t1);
-        let ab2 = depth_push_update(ab, a, 4 * t1, 103, u64::MAX);
+        let ab2 = up(ab, a, 4 * t1, 103, u64::MAX);
         assert_eq!(fresh(ab2, 103), None, "first real sample after an absent one: one sample");
         // same slot: a real 0 beats an absent 0 (more conservative); an absent push cannot
         // undo a real 0 in the same slot
-        let x = depth_push_update(ab, a, 0, 102, u64::MAX);
+        let x = up(ab, a, 0, 102, u64::MAX);
         assert_eq!(fresh(x, 102), Some(0));
-        let y = depth_push_update(z, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
+        let y = up(z, DEPTH_SOURCE_NONE, 0, 102, u64::MAX);
         assert_eq!(fresh(y, 102), Some(0), "same-slot absent keeps the real 0");
-        // stale real 0 -> absent (sticky at last_good 0 -> still 0)
+        // stale real 0 -> absent; the sticky cap is still 0 (the window holds the zero)
         assert_eq!(fresh(z, 102 + DEPTH_MAX_AGE_SLOTS + 1), None);
-        assert_eq!(cap_depth_e6(z.depth_source, None, z.last_good_e6, z.last_good_slot, 102 + 200), Some(0));
+        assert_eq!(cap_depth_e6(z.depth_source, None, z.last_good_e6, z.last_good_slot, 102 + 200, depth_tw_min_atoms(z.tw, USD_ATOMS)), Some(0));
         // validator: bit 2 allowed, bits 3-6 not
         assert!(depth_source_byte_ok(DEPTH_EVER | DEPTH_PREV_REAL | DEPTH_SOURCE_DEX));
         assert!(!depth_source_byte_ok(0x08));
@@ -2774,41 +3505,53 @@ mod tests {
     fn g8_target_ceiling_ratchet_and_force_down() {
         let tab = tier_leverage([0; 3], 500, 2_000); // [5x, 5x, 10x, 20x]
         // off graduation / forced: launch
-        assert_eq!(target_ceiling_x100(false, false, 300, 1_000, 500), 300);
-        assert_eq!(target_ceiling_x100(true, true, 300, 1_000, 500), 300);
-        // R2.1: min(L_tier, max(L_launch, L_table(tier)))
-        assert_eq!(target_ceiling_x100(true, false, 500, 2_000, l_table_x100(2, tab)), 1_000);
-        assert_eq!(target_ceiling_x100(true, false, 500, 2_000, l_table_x100(3, tab)), 2_000);
-        assert_eq!(target_ceiling_x100(true, false, 300, 1_000, 2_000), 1_000, "L_tier");
-        assert_eq!(target_ceiling_x100(true, false, 800, 1_000, 500), 800, "never below launch");
+        assert_eq!(target_ceiling_x100(false, STRESS_NONE, 300, 1_000, 500, u16::MAX), 300);
+        assert_eq!(target_ceiling_x100(true, STRESS_HLOCK, 300, 1_000, 500, u16::MAX), 300, "h-lock: launch");
+        // R2.1: min(L_tier, max(L_launch, L_table(tier))) (no stress: no cap)
+        let n = u16::MAX;
+        assert_eq!(target_ceiling_x100(true, STRESS_NONE, 500, 2_000, l_table_x100(2, tab), n), 1_000);
+        assert_eq!(target_ceiling_x100(true, STRESS_NONE, 500, 2_000, l_table_x100(3, tab), n), 2_000);
+        assert_eq!(target_ceiling_x100(true, STRESS_NONE, 300, 1_000, 2_000, n), 1_000, "L_tier");
+        assert_eq!(target_ceiling_x100(true, STRESS_NONE, 800, 1_000, 500, n), 800, "never below launch");
+        // round 3 item 3: graded stress at tier 3 (20x): draw -> L_table(2) 10x; real ADL ->
+        // L_table(1) 5x; h-lock -> launch
+        assert_eq!(stress_cap_x100(STRESS_NONE, 3, tab), u16::MAX);
+        assert_eq!(stress_cap_x100(STRESS_DRAW, 3, tab), 1_000);
+        assert_eq!(stress_cap_x100(STRESS_ADL, 3, tab), 500);
+        assert_eq!(stress_cap_x100(STRESS_ADL, 1, tab), 500, "floored at tier 0");
+        assert_eq!(stress_cap_x100(STRESS_HLOCK, 3, tab), 500);
+        let l3 = l_table_x100(3, tab);
+        assert_eq!(target_ceiling_x100(true, STRESS_DRAW, 500, 2_000, l3, stress_cap_x100(STRESS_DRAW, 3, tab)), 1_000);
+        assert_eq!(target_ceiling_x100(true, STRESS_ADL, 500, 2_000, l3, stress_cap_x100(STRESS_ADL, 3, tab)), 500);
+        assert_eq!(stress_level(true, false, false), STRESS_DRAW);
+        assert_eq!(stress_level(true, true, false), STRESS_ADL);
+        assert_eq!(stress_level(true, true, true), STRESS_HLOCK);
+        assert_eq!(stress_level(false, false, false), STRESS_NONE);
+        // D1(a): A != 1 is not read; only a non-Normal side mode is ADL
+        assert!(!real_adl(0, 0) && real_adl(1, 0) && real_adl(0, 2));
         // ceiling in force: off clamp == launch whatever is stored
         assert_eq!(ceiling_in_force_x100(false, 900, 900, 300, 1_000), 300);
-        assert_eq!(ceiling_in_force_x100(true, 900, 400, 300, 1_000), 400);
-        assert_eq!(ceiling_in_force_x100(true, 400, 900, 300, 1_000), 400);
-        // ratchet writer: c_launch snapshot, no climb in that call
-        assert_eq!(
-            graduation_ratchet(500, 0, 0, 5_000_000_000, true, false, 500, 2_000, 1_000, 50_000),
-            (500, 0, 5_000_000_000)
-        );
-        assert_eq!(
-            graduation_ratchet(500, 0, 0, 1, true, false, 500, 2_000, 1_000, 50_000),
-            (500, 0, MIN_C_LAUNCH_ATOMS as u64),
-            "floored snapshot"
-        );
-        // +1x per 9,000 slots toward 10x, falls at once, unchanged keeps its stamp
-        let c = 1_000_000_000u64;
-        let cm = 1u128; // capital no longer enters the target (book tier does)
-        assert_eq!(graduation_ratchet(500, 0, c, cm, true, false, 500, 2_000, 1_000, 8_999), (500, 0, c));
-        assert_eq!(graduation_ratchet(500, 0, c, cm, true, false, 500, 2_000, 1_000, 9_000), (600, 9_000, c));
-        assert_eq!(graduation_ratchet(600, 9_000, c, cm, true, false, 500, 2_000, 1_000, 18_000), (700, 18_000, c));
-        assert_eq!(graduation_ratchet(1_000, 18_000, c, cm, true, false, 500, 2_000, 1_000, 40_000), (1_000, 18_000, c), "at target: stamp kept");
-        assert_eq!(graduation_ratchet(1_000, 18_000, c, cm, false, false, 500, 2_000, 500, 40_001), (500, 40_001, c), "depth gone: falls at once");
-        assert_eq!(graduation_ratchet(1_000, 18_000, c, cm, true, true, 500, 2_000, 1_000, 40_001), (500, 40_001, c), "force-down");
-        assert_eq!(graduation_ratchet(2_000, 18_000, c, cm, true, false, 500, 2_000, 1_000, 40_001), (1_000, 40_001, c), "tier 3 -> 2: down at once");
-        // fall-only (push): never rises
-        assert_eq!(graduation_fall_only(500, 7, true, false, 500, 2_000, 1_000, 99), (500, 7));
-        assert_eq!(graduation_fall_only(1_000, 7, false, false, 500, 2_000, 500, 99), (500, 99));
-        assert_eq!(graduation_fall_only(2_000, 7, true, false, 500, 2_000, 1_000, 99), (1_000, 99));
+        // F-1 fix A: min(stored, target) -- down at once, up only through the ratchet
+        assert_eq!(ceiling_in_force_x100(true, 900, 400, 300, 1_000), 400, "down at once");
+        assert_eq!(ceiling_in_force_x100(true, 900, 850, 300, 1_000), 850);
+        assert_eq!(ceiling_in_force_x100(true, 400, 900, 300, 1_000), 400, "up only via the ratchet");
+        // round 3 item 6: no c_launch snapshot any more; a climb waits a full epoch from the
+        // stamp (bind / I-1 reset stamp ceil_slot = now)
+        assert_eq!(graduation_ratchet(500, 50_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 50_000), (500, 50_000));
+        // +1x per 9,000 slots toward 10x; falls to the target at once; unchanged keeps its stamp
+        assert_eq!(graduation_ratchet(500, 0, true, STRESS_NONE, 500, 2_000, 1_000, n, 8_999), (500, 0));
+        assert_eq!(graduation_ratchet(500, 0, true, STRESS_NONE, 500, 2_000, 1_000, n, 9_000), (600, 9_000));
+        assert_eq!(graduation_ratchet(600, 9_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 18_000), (700, 18_000));
+        assert_eq!(graduation_ratchet(1_000, 18_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_000), (1_000, 18_000), "at target: stamp kept");
+        assert_eq!(graduation_ratchet(1_000, 18_000, false, STRESS_NONE, 500, 2_000, 500, n, 40_001), (500, 40_001), "depth gone: launch at once");
+        assert_eq!(graduation_ratchet(1_000, 18_000, true, STRESS_HLOCK, 500, 2_000, 1_000, n, 40_001), (500, 40_001), "h-lock: launch at once");
+        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_DRAW, 500, 2_000, 2_000, 1_000, 40_001), (1_000, 40_001), "draw: L_table(tier 3 - 1) = 10x at once");
+        assert_eq!(graduation_ratchet(2_000, 18_000, true, STRESS_NONE, 500, 2_000, 1_000, n, 40_001), (1_000, 40_001), "tier 3 -> 2: at once");
+        // fall-only (push): never rises; falls to the bound at once (the h-lock too)
+        assert_eq!(graduation_fall_only(500, 7, true, STRESS_NONE, 500, 2_000, 1_000, n, 99), (500, 7));
+        assert_eq!(graduation_fall_only(1_000, 7, false, STRESS_NONE, 500, 2_000, 500, n, 99), (500, 99));
+        assert_eq!(graduation_fall_only(2_000, 7, true, STRESS_NONE, 500, 2_000, 1_000, n, 99), (1_000, 99));
+        assert_eq!(graduation_fall_only(2_000, 7, true, STRESS_HLOCK, 500, 2_000, 1_000, n, 99), (500, 99));
     }
 
     #[test]

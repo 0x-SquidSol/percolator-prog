@@ -857,7 +857,8 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
     assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (2_027_034_782, 2_027_034_782, 2 | growth_v19::DEPTH_PREV_REAL | growth_v19::DEPTH_EVER));
     assert_eq!(growth_v19::effective_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, env.slot), 2_027_034_782);
     assert_eq!(growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot), Some(2_027_034_782));
-    assert_eq!(g.depth_last_good_e6, 2_027_034_782);
+    // R2-M1 + round 3 D-I1: the market's first fresh reading is min(r, T1 / 16)
+    assert_eq!(g.depth_last_good_e6, (growth_v19::DEPTH_TIER1_E6 - 1) / 16);
     // 35 B afterwards: as today (zeroes, prev keeps the last depth, source 0)
     env.warp(1);
     let cu_35 = env.push(255, 0, &[]).expect("35 B push");
@@ -873,8 +874,9 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
     let g = env.growth();
     assert_eq!((g.depth_e6, g.depth_source), (30_000_000_000, 1 | growth_v19::DEPTH_EVER));
     // Coordinator ruling (merge): a REAL on-chain zero depth (mode 2, the pool's asset vault
-    // emptied: STATE POKE of the token amount) is a fresh reading of 0 at once: DEPTH_EVER,
-    // last good 0 (the κ cap is 0 on a clamp-enforced market), never "absent".
+    // emptied: STATE POKE of the token amount) is a fresh reading of 0 at once: DEPTH_EVER, every
+    // reader 0 through the time-weighted window (the κ cap is 0 on a clamp-enforced market),
+    // never "absent". Round 3 D2: the last good depth itself is held.
     let mut bv = env.svm.get_account(&pk(CHILL_BASE_VAULT)).unwrap();
     bv.data[64..72].copy_from_slice(&0u64.to_le_bytes());
     env.svm.set_account(pk(CHILL_BASE_VAULT), bv).unwrap();
@@ -883,7 +885,13 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
     let g = env.growth();
     assert_eq!((g.depth_e6, growth_v19::depth_source_of(g.depth_source)), (0, 2), "a real DEX 0");
     assert_eq!(growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot), Some(0));
-    assert_eq!((g.depth_last_good_e6, g.depth_source & growth_v19::DEPTH_EVER), (0, growth_v19::DEPTH_EVER));
+    assert_eq!((g.depth_last_good_e6, g.depth_source & growth_v19::DEPTH_EVER), ((growth_v19::DEPTH_TIER1_E6 - 1) / 16, growth_v19::DEPTH_EVER));
+    assert_eq!(g.depth_tw_min_e6(), Some(0), "the window holds the zero");
+    assert_eq!(
+        growth_v19::usable_depth_e6(growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot), g.depth_last_good_e6, g.depth_tw_min_e6()),
+        Some(0),
+        "every reader: 0 at once"
+    );
     // re-pin is allowed (replace) and keeps the same account
     env.set_source(chill()).expect("re-set");
     assert!(env.record().unwrap().is_active());
@@ -1203,8 +1211,9 @@ fn c_mode2_wrong_signer_is_refused_before_the_dex_accounts() {
 
 /// Security review R2-M1 on the DEX source (the reviewer's scenario): the pool's asset vault
 /// inflated 1,000x (STATE POKE of the token amount: balanced liquidity added) and held for two
-/// adjacent-slot mode-2 pushes. The rate-limited depth does not rise in the epoch of its last
-/// rise, rises at most 2x in the next epoch, and the honest pool takes it back down at once.
+/// adjacent-slot mode-2 pushes. Round 3: the first reading is T1/16 (D-I1); a spike inside one
+/// bucket adds nothing (the time-weighted window keeps the honest minimum); liquidity HELD over a
+/// full window rises at most 2x per 9,000 slots, and the honest pool takes it back down at once.
 /// Round 2 (no limiter) stored the inflated reading (tier 3 on a $500k+ read).
 #[test]
 fn c_mode2_flash_liquidity_is_rate_limited() {
@@ -1216,7 +1225,8 @@ fn c_mode2_flash_liquidity_is_rate_limited() {
     env.warp(1);
     env.push(2, 0, &dex).expect("mode 2 pair");
     let real = 2_027_034_782u64;
-    assert_eq!(env.growth().depth_last_good_e6, real);
+    let floor = (growth_v19::DEPTH_TIER1_E6 - 1) / 16;
+    assert_eq!(env.growth().depth_last_good_e6, floor, "D-I1: first reading T1 / 16");
     let honest = env.svm.get_account(&pk(CHILL_BASE_VAULT)).unwrap();
     let mut big = honest.clone();
     let amt = u64::from_le_bytes(big.data[64..72].try_into().unwrap());
@@ -1228,27 +1238,35 @@ fn c_mode2_flash_liquidity_is_rate_limited() {
     env.push(2, 0, &dex).expect("inflated 2");
     let g = env.growth();
     assert!(g.depth_e6 > 900 * real, "the pool reads ~1,000x");
-    assert_eq!(g.depth_last_good_e6, real, "same epoch: no rise");
+    assert_eq!(g.depth_last_good_e6, floor, "no rise");
+    assert_eq!(g.depth_tw_min_e6(), Some(real / 1_000_000 * 1_000_000), "the window keeps the honest minimum (whole tokens, floor)");
     assert_eq!(
         growth_v19::usable_depth_e6(
             growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot),
-            g.depth_last_good_e6
+            g.depth_last_good_e6,
+            g.depth_tw_min_e6(),
         ),
-        Some(real),
-        "every reader uses min(fresh, rate-limited)"
+        Some(floor),
+        "every reader uses min(fresh, rate-limited, window)"
     );
-    // held into the next epoch: one doubling
+    // held over a full window into the rise window: one doubling
     // D-L2: past the rise window (stamp * 64 + 63 + 9,000)
     let st = u32::from_le_bytes(env.growth().depth_rise_slot64_le) as u64;
     let next = st * 64 + 63 + 9_000;
+    while env.slot + 600 < next - 1 {
+        env.warp(600);
+        env.push(2, 0, &dex).expect("held inflated");
+    }
+    assert_eq!(env.growth().depth_last_good_e6, floor, "held, but the 9,000 slots are not over");
     env.warp(next - env.slot);
     env.push(2, 0, &dex).expect("inflated 3");
     env.warp(1);
     env.push(2, 0, &dex).expect("inflated 4");
-    assert_eq!(env.growth().depth_last_good_e6, 2 * real, "one doubling per epoch");
+    assert_eq!(env.growth().depth_last_good_e6, 2 * floor, "one doubling per window");
     // the liquidity leaves: down at once
     env.svm.set_account(pk(CHILL_BASE_VAULT), honest).unwrap();
     env.warp(1);
     env.push(2, 0, &dex).expect("honest 1");
-    assert_eq!(env.growth().depth_last_good_e6, real, "min(real, inflated) = real: down at once");
+    // down at once to the window minimum: the honest reading in whole tokens (floor)
+    assert_eq!(env.growth().depth_last_good_e6, real / 1_000_000 * 1_000_000, "min(real, inflated) = real: down at once");
 }
