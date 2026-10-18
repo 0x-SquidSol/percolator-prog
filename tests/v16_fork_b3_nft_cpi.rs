@@ -1269,10 +1269,11 @@ const PK: [u8; 32] = [2u8; 32]; // portfolio key
 const SG: [u8; 32] = [3u8; 32]; // signer / holder
 const MT: [u8; 32] = [4u8; 32]; // bound mint
 const X: [u8; 32] = [9u8; 32]; // a different key
+const GRP: [u8; 32] = [6u8; 32]; // market group
 
 /// A fully-valid holder. All gates satisfied.
 fn accept() -> bool {
-    nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 1, true)
+    nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 5, 5, MT, MT, SG, SG, 1, true)
 }
 
 #[test]
@@ -1288,39 +1289,52 @@ fn e2_auth_each_gate_is_load_bearing() {
     // Flip exactly one gate from the accepting baseline → must reject. Proves every
     // conjunct matters (not a constant-true predicate ignoring some check).
     assert!(
-        !nft_holder_auth_decision(A, X, true, PK, PK, true, MT, MT, SG, SG, 1, true),
+        !nft_holder_auth_decision(A, X, true, PK, PK, true, GRP, GRP, 5, 5, MT, MT, SG, SG, 1, true),
         "not escrowed"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, false, PK, PK, true, MT, MT, SG, SG, 1, true),
+        !nft_holder_auth_decision(A, A, false, PK, PK, true, GRP, GRP, 5, 5, MT, MT, SG, SG, 1, true),
         "fake PDA owner"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, true, X, PK, true, MT, MT, SG, SG, 1, true),
+        !nft_holder_auth_decision(A, A, true, X, PK, true, GRP, GRP, 5, 5, MT, MT, SG, SG, 1, true),
         "PDA binds other portfolio"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, true, PK, PK, false, MT, MT, SG, SG, 1, true),
+        !nft_holder_auth_decision(A, A, true, PK, PK, false, GRP, GRP, 5, 5, MT, MT, SG, SG, 1, true),
         "non-canonical PDA"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, X, SG, SG, 1, true),
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 5, 5, MT, X, SG, SG, 1, true),
         "wrong mint"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, X, 1, true),
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 5, 5, MT, MT, SG, X, 1, true),
         "ATA not owned by signer"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 0, true),
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 5, 5, MT, MT, SG, SG, 0, true),
         "amount 0"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 2, true),
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 5, 5, MT, MT, SG, SG, 2, true),
         "amount 2 (fungible)"
     );
     assert!(
-        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 1, false),
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 5, 5, MT, MT, SG, SG, 1, false),
         "uninitialized ATA"
+    );
+    // S1-2: incarnation binding.
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 4, 5, MT, MT, SG, SG, 1, true),
+        "NFT minted for an earlier incarnation (different portfolio_id)"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, X, GRP, 5, 5, MT, MT, SG, SG, 1, true),
+        "NFT stamped with another market group"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, GRP, GRP, 0, 0, MT, MT, SG, SG, 1, true),
+        "zero portfolio id"
     );
 }

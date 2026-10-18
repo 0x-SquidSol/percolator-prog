@@ -530,6 +530,13 @@ impl CrosscutEnv {
     fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
         let portfolio = Pubkey::new_unique();
+        self.init_portfolio_at(owner, portfolio);
+        portfolio
+    }
+
+    /// InitPortfolio into the (empty, wrapper-owned) account `portfolio`. Used both for a new
+    /// keypair and to RE-CREATE a closed one (S1-2).
+    fn init_portfolio_at(&mut self, owner: &Keypair, portfolio: Pubkey) {
         self.svm
             .set_account(
                 portfolio,
@@ -552,7 +559,26 @@ impl CrosscutEnv {
             &[owner],
         )
         .expect("init portfolio");
-        portfolio
+    }
+
+    /// ClosePortfolio by the signing owner (Live market, empty portfolio).
+    fn close_portfolio(&mut self, owner: &Keypair, portfolio: Pubkey) {
+        let (portfolio_id, expected_sequence, expected_position_epoch) =
+            self.portfolio_identity(portfolio);
+        self.try_wrapper(
+            ProgInstruction::ClosePortfolio {
+                portfolio_id,
+                expected_sequence,
+                position_epoch: expected_position_epoch,
+            },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[owner],
+        )
+        .expect("close portfolio");
     }
 
     /// TB-1b: read the account's CURRENT portfolio_id/sequence/position_epoch
@@ -1272,8 +1298,10 @@ fn x0_lp_vault_lifecycle_at_mainnet() {
 const EXTRA_METAS_SEED: &[u8] = b"extra-account-metas";
 const POSITION_NFT_SEED: &[u8] = b"position_nft";
 const POSITION_NFT_V16_MAGIC: u64 = 0x5045_5243_4E46_5400; // "PERCNFT\0"
-const POSITION_NFT_V16_VERSION: u8 = 2;
-const POSITION_NFT_V16_LEN: usize = 199;
+const POSITION_NFT_V16_VERSION: u8 = 3;
+const POSITION_NFT_V16_LEN: usize = 239;
+/// S1-2: portfolio incarnation id the fixtures stamp into crafted portfolios and NFT PDAs.
+const FIXTURE_PORTFOLIO_ID: u64 = 7;
 const EXTRA_META_ENTRY_LEN: usize = 35;
 const EXTRA_META_COUNT: usize = 7;
 const EXTRA_METAS_ACCOUNT_LEN: usize = 8 + 4 + 4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
@@ -1307,9 +1335,11 @@ fn nft_registry_pda(market: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[NFT_REGISTRY_SEED, market.as_ref()], &PERCOLATOR_MAINNET)
 }
 
-/// Craft PositionNftV16 state bytes (199 bytes) — exact on-chain layout.
+/// Craft PositionNftV16 state bytes (239 bytes) — exact on-chain layout.
 fn nft_pda_data(
     portfolio: &Pubkey,
+    market_group: &Pubkey,
+    portfolio_id: u64,
     nft_mint: &Pubkey,
     asset_index: u16,
     market_id: u64,
@@ -1329,6 +1359,8 @@ fn nft_pda_data(
     d[111..119].copy_from_slice(&market_id.to_le_bytes());
     d[119..127].copy_from_slice(&0u64.to_le_bytes());
     d[159..167].copy_from_slice(&1_700_000_000i64.to_le_bytes());
+    d[199..231].copy_from_slice(market_group.as_ref());
+    d[231..239].copy_from_slice(&portfolio_id.to_le_bytes());
     d
 }
 
@@ -1394,6 +1426,8 @@ fn portfolio_data(
     data[8..10].copy_from_slice(&VERSION.to_le_bytes());
     data[10] = KIND_PORTFOLIO;
     data[HEADER_LEN..HEADER_LEN + pod_len].copy_from_slice(bytemuck::bytes_of(&p));
+    data[percolator_prog::constants::PORTFOLIO_ID_OFF..percolator_prog::constants::PORTFOLIO_ID_OFF + 8]
+        .copy_from_slice(&FIXTURE_PORTFOLIO_ID.to_le_bytes());
     data
 }
 
@@ -1612,6 +1646,8 @@ fn place_nft_bundle(
             lamports: 2_000_000,
             data: nft_pda_data(
                 &portfolio_key,
+                market,
+                FIXTURE_PORTFOLIO_ID,
                 &nft_mint_key,
                 asset_index,
                 market_id,
@@ -2870,6 +2906,23 @@ fn attach_nft_to_portfolio(
     portfolio: Pubkey,
     market_id: u64,
 ) -> (Pubkey, Pubkey, Pubkey) {
+    // The NFT of the portfolio's CURRENT incarnation (what a real MintPositionNft stamps).
+    let (live_id, _, _) = env.portfolio_identity(portfolio);
+    let market = env.market;
+    attach_nft_with_incarnation(env, holder, portfolio, market_id, &market, live_id)
+}
+
+/// Like `attach_nft_to_portfolio`, but stamps an explicit `(market_group, portfolio_id)` into the
+/// crafted PositionNft PDA: the way a LEFTOVER NFT of an earlier incarnation of the same portfolio
+/// keypair looks on chain (S1-2).
+fn attach_nft_with_incarnation(
+    env: &mut CrosscutEnv,
+    holder: &Keypair,
+    portfolio: Pubkey,
+    market_id: u64,
+    market_group: &Pubkey,
+    portfolio_id: u64,
+) -> (Pubkey, Pubkey, Pubkey) {
     let nft_mint_kp = Keypair::new();
     let nft_mint = nft_mint_kp.pubkey();
     let (nft_pda, bump) = position_nft_pda(&portfolio, market_id);
@@ -2882,7 +2935,15 @@ fn attach_nft_to_portfolio(
             nft_pda,
             Account {
                 lamports: 2_000_000,
-                data: nft_pda_data(&portfolio, &nft_mint, 0, market_id, bump),
+                data: nft_pda_data(
+                    &portfolio,
+                    market_group,
+                    portfolio_id,
+                    &nft_mint,
+                    0,
+                    market_id,
+                    bump,
+                ),
                 owner: NFT_PROGRAM_ID,
                 executable: false,
                 rent_epoch: 0,
@@ -3462,4 +3523,172 @@ fn gh407_tradecpi_plain_owner_layout_unchanged() {
 #[test]
 fn gh407_batchtradecpi_plain_owner_layout_unchanged() {
     plain_owner_layout_unchanged(CpiKind::Batch);
+}
+
+// ── S1-2 (audit 2026-10-17): NFT <-> portfolio INCARNATION binding, real wrapper + Token-2022 ──
+//
+// The setups below craft the PositionNft PDA exactly as `percolator-nft` leaves it (the NFT
+// program's own mint/burn/hook/reconcile behaviour is covered with the real NFT binary in
+// tests/v16_nft_e2e.rs). Layout v3: [199..231] market group, [231..239] portfolio id.
+
+/// The escrowed victim portfolio P holds `amount`; the CURRENT NFT (live incarnation) is held by
+/// the victim, a LEFTOVER NFT stamped `(stale_group, stale_id)` by the attacker. Returns
+/// (env, registry, portfolio, victim, attacker, victim nft pda/ata, attacker nft pda/ata).
+struct StaleNftWorld {
+    env: CrosscutEnv,
+    registry: Pubkey,
+    portfolio: Pubkey,
+    victim: Keypair,
+    attacker: Keypair,
+    victim_nft: (Pubkey, Pubkey),
+    attacker_nft: (Pubkey, Pubkey),
+}
+
+fn stale_nft_world(stale_group: Option<Pubkey>, stale_id_delta: u64, amount: u128) -> StaleNftWorld {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let (mint_auth, _) = mint_auth_pda();
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    env.svm.airdrop(&victim.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let portfolio = env.create_portfolio(&victim);
+    env.deposit(&victim, portfolio, amount);
+    let (live_id, _, _) = env.portfolio_identity(portfolio);
+    let market = env.market;
+    // NFT2: the NFT of the CURRENT incarnation, sold to the victim.
+    let (n2_pda, _m2, v_ata) = attach_nft_with_incarnation(&mut env, &victim, portfolio, 7, &market, live_id);
+    // NFT1: left over from the seller's earlier incarnation of the same keypair.
+    let g1 = stale_group.unwrap_or(market);
+    let (n1_pda, _m1, a_ata) =
+        attach_nft_with_incarnation(&mut env, &attacker, portfolio, 3, &g1, live_id.wrapping_add(stale_id_delta));
+    reown_portfolio(&mut env, portfolio, &mint_auth.to_bytes());
+    StaleNftWorld {
+        env,
+        registry,
+        portfolio,
+        victim,
+        attacker,
+        victim_nft: (n2_pda, v_ata),
+        attacker_nft: (n1_pda, a_ata),
+    }
+}
+
+fn withdraw_with_nft(w: &mut StaleNftWorld, as_attacker: bool, amount: u128) -> (Result<(), TransactionError>, u64) {
+    let (signer, (nft_pda, ata)) = if as_attacker {
+        (w.attacker.insecure_clone(), w.attacker_nft)
+    } else {
+        (w.victim.insecure_clone(), w.victim_nft)
+    };
+    let dest = make_dest_ata(&mut w.env, signer.pubkey());
+    let (portfolio_id, expected_sequence, _) = w.env.portfolio_identity(w.portfolio);
+    let res = w.env.try_wrapper(
+        ProgInstruction::Withdraw { portfolio_id, expected_sequence, amount },
+        e2_withdraw_accounts(&w.env, &signer, w.portfolio, dest, w.registry, nft_pda, ata),
+        &[&signer],
+    );
+    (res, w.env.token_amount(dest))
+}
+
+// The PoC of the audit, now a regression: the stale NFT1 holder must NOT drain the current
+// holder's collateral. FAILS on 50d50f61 + af8660e (attacker received 1000 atoms).
+#[test]
+fn s1_stale_nft_of_a_previous_incarnation_must_not_authorize_the_current_portfolio() {
+    let mut w = stale_nft_world(None, 41, 1_000);
+    let (res, got) = withdraw_with_nft(&mut w, true, 1_000);
+    assert!(
+        res.is_err() && got == 0,
+        "S1 F-NFT-1: the stale NFT1 holder drained the current holder's collateral: {res:?}, attacker received {got} atoms"
+    );
+}
+
+#[test]
+fn s12_stale_nft_with_the_same_id_but_another_market_group_is_refused() {
+    let mut w = stale_nft_world(Some(Pubkey::new_unique()), 0, 1_000);
+    let (res, got) = withdraw_with_nft(&mut w, true, 1_000);
+    assert!(res.is_err() && got == 0, "{res:?} {got}");
+}
+
+#[test]
+fn s12_current_holder_still_withdraws_while_a_stale_nft_exists() {
+    let mut w = stale_nft_world(None, 41, 1_000);
+    let (res, got) = withdraw_with_nft(&mut w, false, 1_000);
+    assert!(res.is_ok() && got == 1_000, "the live incarnation's holder must still be authorized: {res:?} {got}");
+}
+
+#[test]
+fn s12_stale_nft_cannot_trade_the_current_portfolio() {
+    // Trade shares the same scalar auth core with Withdraw; assert at the verdict level that a
+    // stale NFT PDA bound to the same account key fails the holder conjunct set.
+    use percolator_prog::processor::nft_holder_auth_decision as d;
+    let a = [1u8; 32];
+    let pk = [2u8; 32];
+    let g = [6u8; 32];
+    let mt = [4u8; 32];
+    let sg = [3u8; 32];
+    assert!(d(a, a, true, pk, pk, true, g, g, 9, 9, mt, mt, sg, sg, 1, true));
+    assert!(!d(a, a, true, pk, pk, true, g, g, 5, 9, mt, mt, sg, sg, 1, true), "stale NFT");
+}
+
+// Real wrapper close + re-create of the SAME portfolio account: the wrapper does not touch the
+// PositionNft PDA (it cannot: the PDA is NFT-program-owned), the re-created account gets a NEW
+// permanent portfolio_id, and the leftover NFT stamped with the old id authorizes nothing.
+#[test]
+fn s12_close_then_recreate_same_keypair_gets_a_new_incarnation_and_the_old_nft_dies() {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let (mint_auth, _) = mint_auth_pda();
+    let seller = Keypair::new();
+    let buyer = Keypair::new();
+    env.svm.airdrop(&seller.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&buyer.pubkey(), 10_000_000_000).unwrap();
+
+    // Incarnation 1: portfolio P, NFT1 minted for it (crafted as the NFT program leaves it).
+    let portfolio = env.create_portfolio(&seller);
+    let (id1, _, _) = env.portfolio_identity(portfolio);
+    let market = env.market;
+    let (nft1_pda, _m1, seller_ata) = attach_nft_with_incarnation(&mut env, &seller, portfolio, 3, &market, id1);
+    let nft1_before = env.svm.get_account(&nft1_pda).unwrap();
+
+    // The wrapper closes P (empty) and never touches the NFT PDA.
+    env.close_portfolio(&seller, portfolio);
+    let closed = env.svm.get_account(&portfolio);
+    assert!(closed.map(|a| a.lamports == 0 || a.data.is_empty()).unwrap_or(true), "P is closed");
+    let nft1_after = env.svm.get_account(&nft1_pda).expect("the PositionNft PDA survives a wrapper close");
+    assert_eq!(nft1_after.data, nft1_before.data, "PDA bytes untouched");
+    assert_eq!(nft1_after.owner, NFT_PROGRAM_ID);
+
+    // Incarnation 2: the SAME account re-created by the same keypair; fresh id.
+    env.svm
+        .set_account(
+            portfolio,
+            Account { lamports: 1_000_000_000, data: vec![0u8; env.portfolio_len], owner: env.program_id, executable: false, rent_epoch: 0 },
+        )
+        .unwrap();
+    env.init_portfolio_at(&seller, portfolio);
+    let (id2, _, _) = env.portfolio_identity(portfolio);
+    assert_ne!(id1, id2, "a re-created portfolio keypair gets a new permanent id");
+
+    // The buyer buys NFT2 of incarnation 2 (escrow); the seller keeps NFT1.
+    env.deposit(&seller, portfolio, 1_000);
+    let (nft2_pda, _m2, buyer_ata) = attach_nft_with_incarnation(&mut env, &buyer, portfolio, 7, &market, id2);
+    reown_portfolio(&mut env, portfolio, &mint_auth.to_bytes());
+
+    let dest = make_dest_ata(&mut env, seller.pubkey());
+    let (pid, seq, _) = env.portfolio_identity(portfolio);
+    let res = env.try_wrapper(
+        ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount: 1_000 },
+        e2_withdraw_accounts(&env, &seller, portfolio, dest, registry, nft1_pda, seller_ata),
+        &[&seller],
+    );
+    assert!(res.is_err() && env.token_amount(dest) == 0, "old NFT1 must not authorize: {res:?}");
+
+    let dest_b = make_dest_ata(&mut env, buyer.pubkey());
+    let (pid, seq, _) = env.portfolio_identity(portfolio);
+    let res = env.try_wrapper(
+        ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount: 1_000 },
+        e2_withdraw_accounts(&env, &buyer, portfolio, dest_b, registry, nft2_pda, buyer_ata),
+        &[&buyer],
+    );
+    assert!(res.is_ok() && env.token_amount(dest_b) == 1_000, "the buyer's NFT2 works: {res:?}");
 }
