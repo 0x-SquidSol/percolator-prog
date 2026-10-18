@@ -2366,6 +2366,39 @@ fn bond_self_funding_attack_is_refused() {
     env.assert_conserved("self-funding");
 }
 
+/// AUD-S1-15 / L-4 (fix-all 2026-10-18): the junior (tag 97) is held to the same open-interest
+/// lock as a bond exit (`bond_lock_binds_with_a_flat_vault_lp_and_open_user_oi`). Two identical
+/// worlds (senior 10,000, junior 6,000, no bond): in A users hold open interest on both sides against
+/// a FLAT vault LP (3,000 open each side); B has no open interest. The largest junior withdrawal the program admits must
+/// be strictly smaller in A (its N_cap after the withdrawal must still cover 3,000). Before the
+/// fix A admitted at least as much as B (A4 only checks the LP's own inventory, and A's trades
+/// only added fee value), so the junior could pull the capacity backing open OI.
+#[test]
+fn s1_15_junior_withdraw_is_locked_by_open_user_oi() {
+    let world = |open: bool| {
+        let (mut env, lp, _d, _h) = bond_world(growth_params(), 10_000, 6_000, 0, 0);
+        env.hold(1, &[lp.portfolio]);
+        env.catch_up(lp.portfolio);
+        if open {
+            let long = env.new_trader(100_000 * U);
+            env.trade_signing_fee(&long, &lp, 3_000 * UQ, GROWTH_FEE).expect("long 3,000");
+            let short = env.new_trader(100_000 * U);
+            env.trade_signing_fee(&short, &lp, -3_000 * UQ, GROWTH_FEE).expect("short 3,000 (LP back to flat)");
+            assert_eq!(env.position(lp.portfolio), 0, "vault LP flat");
+        }
+        let _ = env.crank(lp.portfolio);
+        let _ = env.crank_fees_bond(lp.portfolio);
+        let out = env.max_junior_out_bond(lp.portfolio);
+        env.assert_conserved("junior OI lock");
+        out
+    };
+    let with_oi = world(true);
+    let without = world(false);
+    eprintln!("S1-15 max junior withdrawal: with open OI {with_oi}, without {without}");
+    assert!(without > 0, "control: the junior can withdraw something with nothing open");
+    assert!(with_oi < without, "the open-interest lock binds the junior: {with_oi} vs {without}");
+}
+
 /// The lock in isolation: the vault LP is FLAT (the engine's flat-only withdraw would let the
 /// capital out) but users' open interest, opened against the capacity the bond created, is still
 /// open on both sides. Only `bond_withdraw_lock_ok` refuses here: under mutant MB1 (lock off) the

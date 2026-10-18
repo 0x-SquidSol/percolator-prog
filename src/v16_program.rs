@@ -36968,6 +36968,31 @@ pub mod processor {
                 return Err(PercolatorError::VaultLpJuniorWithdrawRefused.into());
             }
             let c_m_before = p2b_c_m(&lp)?;
+            // AUD-S1-15 / L-4 (fix-all 2026-10-18): the open-interest lock tag 110 applies to a
+            // bond exit (I-T6, the self-funding attack) applies to the junior too: on a growth
+            // asset the vault LP's capacity AFTER this withdrawal must still cover the market's
+            // open interest on either side and the LP's own effective inventory. Before, the
+            // junior could pull the capital that backs open OI whenever the LP itself was flat
+            // (A4 checks only LP inventory). An asset with growth off has no capacity number and
+            // is unchanged (no lock there, as before). Same refusal code as the floor check.
+            {
+                let a = st.asset_index as usize;
+                if let Some(n_after) =
+                    growth_n_cap_for_view(&group, a, c_m_before.saturating_sub(amount))?
+                {
+                    let asset = &group
+                        .markets
+                        .get(a)
+                        .ok_or(PercolatorError::InvalidInstruction)?
+                        .engine
+                        .asset;
+                    let (oi_long, oi_short) = (asset.oi_eff_long_q.get(), asset.oi_eff_short_q.get());
+                    let lp_eff = effective_signed_position_for_asset_view(&group, &lp, a)?.unsigned_abs();
+                    if !bond_v20::bond_withdraw_lock_ok(Some(n_after), oi_long, oi_short, lp_eff) {
+                        return Err(PercolatorError::VaultLpJuniorWithdrawRefused.into());
+                    }
+                }
+            }
             group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
             // Phase 2b A4 lock (defence in depth: the engine withdraw above is flat-only).
             p2b_a4_capacity_check(&group, &lp, st.asset_index as usize, c_m_before)?;
