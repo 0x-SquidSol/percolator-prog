@@ -5906,6 +5906,10 @@ fn v16_bpf_permissionless_market_shutdown_force_closes_recovers_and_reuses_slot(
         before_timeout_short
     );
 
+    let long_epoch_before_force_close =
+        state::read_portfolio_position_epoch(&before_timeout_long).unwrap();
+    let short_epoch_before_force_close =
+        state::read_portfolio_position_epoch(&before_timeout_short).unwrap();
     env.svm.warp_to_slot(7);
     let force_close_cu = env.force_close_abandoned_asset_with_cu(
         &cranker,
@@ -5958,6 +5962,17 @@ fn v16_bpf_permissionless_market_shutdown_force_closes_recovers_and_reuses_slot(
     assert_eq!(liquidated_group.assets[1].oi_eff_short_q, 0);
     assert!(!has_active_leg_for_asset(&long_closed, 1));
     assert!(!has_active_leg_for_asset(&short_closed, 1));
+    // AUD-S1-23: the cranker's force-close reshaped both positions without their owners.
+    assert_eq!(
+        state::read_portfolio_position_epoch(&long_data).unwrap(),
+        long_epoch_before_force_close + 1,
+        "S1-23: force-close advances account a's position_epoch"
+    );
+    assert_eq!(
+        state::read_portfolio_position_epoch(&short_data).unwrap(),
+        short_epoch_before_force_close + 1,
+        "S1-23: force-close advances account b's position_epoch"
+    );
 
     let admin_key = env.admin.pubkey();
     // v17 convergence: WithdrawInsuranceDomain per-side removed. v17 uses per-asset insurance
@@ -11535,6 +11550,76 @@ fn v16_bpf_tradecpi_external_matcher_executes_on_added_asset() {
         "external matcher must echo the requested nonzero asset index"
     );
     assert_eq!(group.c_tot + group.insurance, group.vault);
+}
+
+/// AUD-S1-23 (fix-all 2026-10-18): a crank liquidation reshapes the position without its owner,
+/// so it advances `position_epoch`: an owner-signed retained action built against the
+/// pre-liquidation episode (here CureAndCancelClose, tag 42) is refused with
+/// EngineProvenanceMismatch (16). A crank that does not change a portfolio's positions (the
+/// counterparty's plain refresh) does not advance its epoch. Before the fix only Cure advanced it.
+#[test]
+fn s1_23_crank_liquidation_advances_position_epoch_and_refuses_a_stale_owner_action() {
+    let mut env = V16CuEnv::new();
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    env.deposit(&short_owner, short_account, 100);
+    env.configure_ewma_mark_with_cu(0, 100, 1, 0);
+    env.trade_with_cu(&long_owner, long_account, &short_owner, short_account, POS_SCALE as i128, 100, 0);
+    let epoch_of = |env: &V16CuEnv, k: Pubkey| {
+        state::read_portfolio_position_epoch(&env.svm.get_account(&k).unwrap().data).unwrap()
+    };
+    let short_id = state::read_portfolio_id(&env.svm.get_account(&short_account).unwrap().data).unwrap();
+    let short_epoch0 = epoch_of(&env, short_account);
+    let long_epoch0 = epoch_of(&env, long_account);
+    env.svm.warp_to_slot(1);
+    env.push_ewma_mark_with_cu(1, 999_999);
+    let mut closed = false;
+    for slot in 1..=20u64 {
+        env.svm.warp_to_slot(slot);
+        env.svm.expire_blockhash();
+        env.crank(
+            short_account,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+            },
+        );
+        let short = state::read_portfolio(&env.svm.get_account(&short_account).unwrap().data).unwrap();
+        if percolator::active_bitmap_is_empty(short.active_bitmap) {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "the bankrupt short is liquidated through the crank");
+    assert!(epoch_of(&env, short_account) > short_epoch0, "S1-23: liquidation advances position_epoch");
+    // The stale owner-signed action (bound to the pre-liquidation epoch) is refused.
+    env.svm.expire_blockhash();
+    let r = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::CureAndCancelClose {
+            portfolio_id: short_id,
+            position_epoch: short_epoch0,
+            optional_deposit: 0,
+        },
+        vec![
+            AccountMeta::new(short_owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(short_account, false),
+        ],
+        &[&short_owner],
+    );
+    assert_eq!(
+        r.as_ref().err().and_then(|e| custom_code(e)),
+        Some(PercolatorError::EngineProvenanceMismatch as u32),
+        "S1-23: a stale owner action after a liquidation is refused: {r:?}"
+    );
+    // The counterparty was only refreshed (its position vector did not change): not advanced.
+    assert_eq!(epoch_of(&env, long_account), long_epoch0, "a plain refresh does not advance");
 }
 
 #[test]

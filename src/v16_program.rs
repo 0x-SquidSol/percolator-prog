@@ -6054,6 +6054,33 @@ pub mod state {
         Ok(PortfolioV16ViewMut::new(header))
     }
 
+    /// AUD-S1-23 (ADOPT upstream `portfolio_position_vector_view`, b594bc21 / b40ffbd8):
+    /// the portfolio's position vector `(active, asset_index, market_id, side, basis_pos_q)` per
+    /// active leg, read-only. `None` when the bytes are not a readable portfolio (the caller
+    /// then skips the episode check; the handler itself rejects such an account).
+    pub fn portfolio_position_vector(data: &[u8]) -> Option<alloc::vec::Vec<(u32, u64, u8, i128)>> {
+        check_header(data, KIND_PORTFOLIO).ok()?;
+        let required = HEADER_LEN.checked_add(PORTFOLIO_STATE_LEN)?;
+        if data.len() < required || data.len() > PORTFOLIO_ACCOUNT_LEN {
+            return None;
+        }
+        let header =
+            bytemuck::try_from_bytes::<PortfolioAccountV16Account>(data.get(HEADER_LEN..required)?)
+                .ok()?;
+        let mut out = alloc::vec::Vec::new();
+        for leg in header.legs.iter() {
+            if leg.active != 0 {
+                out.push((
+                    leg.asset_index.get(),
+                    leg.market_id.get(),
+                    leg.side,
+                    leg.basis_pos_q.get(),
+                ));
+            }
+        }
+        Some(out)
+    }
+
     /// One genesis asset slot of `init_market_account_zero_copy`, in its OWN frame (v2.2 combined
     /// release: the 806 B engine header plus the 2.3 KB asset/slot temporaries in one frame took
     /// `init_market_account_zero_copy` to 3,968 B, over the 3,840 B budget of the SBF frame gate).
@@ -15232,12 +15259,19 @@ pub mod processor {
                 asset_index,
                 now_slot,
             } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
-            Instruction::SweepBandDustLeg { asset_index } => {
-                handle_sweep_band_dust_leg(program_id, accounts, asset_index)
-            }
-            Instruction::EvictAndTradeCpi { trade } => {
-                handle_evict_and_trade_cpi(program_id, accounts, &trade)
-            }
+            // AUD-S1-23: the swept victim's (account 2) position changed without its owner.
+            Instruction::SweepBandDustLeg { asset_index } => with_position_epoch_bumps(
+                accounts,
+                &[2],
+                || handle_sweep_band_dust_leg(program_id, accounts, asset_index),
+            ),
+            // AUD-S1-23: the evicted victim (account 0); the taker's own trade is not bumped
+            // (trades do not advance position_epoch in this fork).
+            Instruction::EvictAndTradeCpi { trade } => with_position_epoch_bumps(
+                accounts,
+                &[0],
+                || handle_evict_and_trade_cpi(program_id, accounts, &trade),
+            ),
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
                 portfolio_id,
@@ -15252,7 +15286,11 @@ pub mod processor {
             Instruction::PermissionlessCrank {
                 now_slot,
                 observations,
-            } => handle_permissionless_crank(program_id, accounts, now_slot, observations),
+            } => with_position_epoch_bumps(accounts, &[2], || {
+                // AUD-S1-23: a liquidation (incl. the F1 follow-on) or a Recovery step reshaped
+                // the target portfolio without its owner.
+                handle_permissionless_crank(program_id, accounts, now_slot, observations)
+            }),
             Instruction::TradeNoCpi {
                 account_a_portfolio_id,
                 account_a_position_epoch,
@@ -15700,13 +15738,16 @@ pub mod processor {
                 asset_index,
                 now_slot,
                 close_q,
-            } => handle_force_close_abandoned_asset(
-                program_id,
-                accounts,
-                asset_index,
-                now_slot,
-                close_q,
-            ),
+            } => with_position_epoch_bumps(accounts, &[2, 3], || {
+                // AUD-S1-23: a cranker closed both accounts' positions.
+                handle_force_close_abandoned_asset(
+                    program_id,
+                    accounts,
+                    asset_index,
+                    now_slot,
+                    close_q,
+                )
+            }),
             Instruction::RestartAssetOracle {
                 asset_index,
                 market_id,
@@ -16170,14 +16211,17 @@ pub mod processor {
                 asset_index,
                 portfolio_id,
                 position_epoch,
-            } => handle_adl_wind_down(
-                program_id,
-                accounts,
-                now_slot,
-                asset_index,
-                portfolio_id,
-                position_epoch,
-            ),
+            } => with_position_epoch_bumps(accounts, &[2], || {
+                // AUD-S1-23: a permissionless wind-down closed the target's leg.
+                handle_adl_wind_down(
+                    program_id,
+                    accounts,
+                    now_slot,
+                    asset_index,
+                    portfolio_id,
+                    position_epoch,
+                )
+            }),
             Instruction::SetAdlWindDownMaxSlots {
                 asset_index,
                 max_episode_slots,
@@ -30043,6 +30087,63 @@ pub mod processor {
         Ok(())
     }
 
+    /// AUD-S1-23 (ADOPT upstream b594bc21 / 7453c7cd / b40ffbd8, "bind retained actions to
+    /// position episodes", adapted): `position_epoch` binds the owner-signed retained actions
+    /// (trade family, Cure, ForfeitRecoveryLeg, RebalanceReduce, ConvertReleasedPnl, ...), but
+    /// it advanced only in Cure. A liquidation, a Recovery step, an ADL wind-down, a force-close,
+    /// a dust sweep or an eviction reshapes a position WITHOUT the owner, so a stale owner-signed
+    /// action built against the old position could still land. These paths now advance the
+    /// epoch of every portfolio whose position vector `(asset_index, market_id, side,
+    /// basis_pos_q)` of the active legs changed in the call; an unchanged vector (a plain
+    /// refresh) does not advance it. No wire, layout or error-code change.
+    /// Active legs' `(asset_index, market_id, side, basis_pos_q)` (AUD-S1-23).
+    type PositionVector = Vec<(u32, u64, u8, i128)>;
+
+    #[inline(never)]
+    fn snapshot_position_vector(ai: &AccountInfo<'_>) -> Option<PositionVector> {
+        let data = ai.try_borrow_data().ok()?;
+        state::portfolio_position_vector(&data)
+    }
+
+    #[inline(never)]
+    fn bump_position_epoch_if_reshaped(
+        ai: &AccountInfo<'_>,
+        before: Option<PositionVector>,
+    ) -> ProgramResult {
+        let Some(before) = before else {
+            return Ok(());
+        };
+        match snapshot_position_vector(ai) {
+            Some(after) if after != before => {
+                let mut data = ai.try_borrow_mut_data()?;
+                state::bump_portfolio_position_epoch(&mut data)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Run `f`, then advance `position_epoch` on each of `accounts[idxs]` whose position vector
+    /// it changed (AUD-S1-23). Snapshots are taken only when `f` will run; on an error nothing is
+    /// bumped (the instruction fails).
+    fn with_position_epoch_bumps<'a, F: FnOnce() -> ProgramResult>(
+        accounts: &'a [AccountInfo<'a>],
+        idxs: &[usize],
+        f: F,
+    ) -> ProgramResult {
+        let mut before: [Option<PositionVector>; 2] = [None, None];
+        for (k, &i) in idxs.iter().enumerate().take(2) {
+            before[k] = accounts.get(i).and_then(snapshot_position_vector);
+        }
+        f()?;
+        for (k, &i) in idxs.iter().enumerate().take(2) {
+            if let Some(ai) = accounts.get(i) {
+                bump_position_epoch_if_reshaped(ai, before[k].take())?;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn handle_permissionless_crank<'a>(
@@ -31252,6 +31353,8 @@ pub mod processor {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             for portfolio_ai in refresh.iter() {
+                // AUD-S1-23: the prelude refresh can liquidate (a Live crank step).
+                let positions_before = snapshot_position_vector(portfolio_ai);
                 match handle_permissionless_crank_zero_copy(
                     program_id,
                     cranker,
@@ -31264,7 +31367,7 @@ pub mod processor {
                     false, // S10: a redemption's inline refreshes carry no move budget
                 ) {
                     // v2.2 F1: the tag-77 prelude refreshes only; no follow-on liquidation here.
-                    Ok(_) => {}
+                    Ok(_) => bump_position_epoch_if_reshaped(portfolio_ai, positions_before)?,
                     Err(e) if e == ProgramError::from(PercolatorError::EngineNonProgress) => {}
                     Err(e) => return Err(e),
                 }

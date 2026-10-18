@@ -533,8 +533,14 @@ fn p2b_tag104_after_the_bound_winds_down_reopens_and_conserves_value() {
     let counter = shorts[0];
 
     for (i, k) in shorts.iter().enumerate() {
+        let epoch0 = state::read_portfolio_position_epoch(&f.data(k)).unwrap();
         f.wind_down_settled(k)
             .unwrap_or_else(|e| panic!("wind-down of short {i} ({k}): {e:?}"));
+        // AUD-S1-23: a permissionless wind-down reshaped the position without its owner.
+        assert!(
+            state::read_portfolio_position_epoch(&f.data(k)).unwrap() > epoch0,
+            "S1-23: tag 104 advances short {i}'s position_epoch"
+        );
         {
             let a = &f.group().assets[0];
             let l = f.limits();

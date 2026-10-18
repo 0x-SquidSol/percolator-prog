@@ -2435,7 +2435,14 @@ fn v22_tag118_bilateral_sweep_leaves_a_unchanged_and_the_market_open() {
     let equity_before = env.equity(long.1);
     let short_leg_before = env.portfolio_state(short.1).legs.iter().find(|l| l.active).cloned().unwrap();
     let long_pos_before = env.pos(long.1);
+    let pe = |env: &Env, k: Pubkey| state::read_portfolio_position_epoch(&env.svm.get_account(&k).unwrap().data).unwrap();
+    let (victim_epoch0, lp_epoch0) = (pe(&env, long.1), pe(&env, lp.account));
     env.sweep_dust(long.1, lp.account).expect("bilateral dust sweep");
+    // AUD-S1-23: the swept victim's position changed without its owner, so its position_epoch
+    // advances (a stale owner-signed action built before the sweep is refused); the vault LP
+    // (no owner-signed retained actions) is not advanced.
+    assert_eq!(pe(&env, long.1), victim_epoch0 + 1, "S1-23: sweep advances the victim's position_epoch");
+    assert_eq!(pe(&env, lp.account), lp_epoch0, "the vault LP's epoch is untouched");
     // v2.2 fill events: one REDUCE (reason 4, tag 118) closing the whole leg against the LP at P_last.
     assert_eq!(
         env.events(),
@@ -2497,7 +2504,11 @@ fn v22_tag119_eviction_lets_an_honest_trader_into_a_full_side() {
     assert_eq!(env.pos(a.1), 10 * Q, "nothing was evicted by the refused attempts");
     // The eviction.
     let equity_before = env.equity(a.1);
+    let pe = |env: &Env, k: Pubkey| state::read_portfolio_position_epoch(&env.svm.get_account(&k).unwrap().data).unwrap();
+    let victim_epoch0 = pe(&env, a.1);
     env.evict_and_trade(a.1, &honest.0, honest.1, &lp, 30 * Q).expect("evict + open");
+    // AUD-S1-23: the evicted victim's position changed without its owner.
+    assert_eq!(pe(&env, a.1), victim_epoch0 + 1, "S1-23: eviction advances the victim's position_epoch");
     // v2.2 fill events: REDUCE (the victim's whole leg, tag 119, reason 5) then the taker's FILL
     // (the inner TradeCpi reports its own tag 10), in execution order.
     let evs = env.events();
