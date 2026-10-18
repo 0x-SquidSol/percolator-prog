@@ -45398,13 +45398,28 @@ pub mod processor {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
         // 1. Crank-equivalent accrual (band-shaped, rent-bearing) to the authenticated slot.
-        let (_, obs) = adl_wind_down_refresh_asset_price_view(
+        let (caught_up, obs) = adl_wind_down_refresh_asset_price_view(
             &mut cfg,
             &mut group,
             asset_index,
             authenticated_now_slot,
             oracle_accounts,
         )?;
+        // AUD-S1-4 (fix-all 2026-10-18): the engine Refresh below ends with its own accrual of the
+        // asset to the request's `now_slot`, and that accrual is rent-free
+        // (`accrue_asset_to_not_atomic` passes rent 0). When the rent-bearing segment above was
+        // capped by `max_accrual_dt_slots` and did not reach `now`, refreshing "to now" would run
+        // a second capped window with no holding rent (lost to the vault LP) and process up to
+        // 2x `max_accrual_dt_slots` in one instruction (the envelope the crank's GATE-2 keeps).
+        // So the Refresh is pinned to the slot the rent-bearing segment reached: its accrual is
+        // then a zero-length no-op, the account is settled and certified against exactly the
+        // state just committed, and the remaining gap is accrued, WITH rent, by later calls
+        // (each one capped segment) or by the crank. When caught up this is `now` (unchanged).
+        let refresh_now_slot = if caught_up {
+            authenticated_now_slot
+        } else {
+            group.markets[asset_index].engine.asset.slot_last.get()
+        };
         // 2. Refresh the portfolio through the engine's permissionless Refresh (settles rent at
         //    the K/F settlement entry, certifies the band epoch; lapsed source backing is
         //    progress, as on the crank).
@@ -45415,7 +45430,7 @@ pub mod processor {
                 .permissionless_crank_not_atomic(
                     pf,
                     percolator::PermissionlessCrankRequestV16 {
-                        now_slot: authenticated_now_slot,
+                        now_slot: refresh_now_slot,
                         asset_index,
                         effective_price: obs.effective_price,
                         funding_rate_e9: obs.funding_rate_e9,

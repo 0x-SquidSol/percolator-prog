@@ -1229,6 +1229,18 @@ fn v22_rent_rate_kink_cap_monotone_exhaustive() {
 // ===========================================================================
 
 impl Env {
+    /// AUD-S1-4: tag 106 accrues at most one capped segment (`max_accrual_dt_slots`) per call, so
+    /// after a gap it is repeated until the asset is caught up (the keeper's catch-up sequence).
+    fn settle_rent_caught_up(&mut self, portfolio: Pubkey, vault_lp: Pubkey) {
+        for _ in 0..64 {
+            self.settle_rent(portfolio, vault_lp).expect("tag 106 (catch-up)");
+            if self.engine_asset().slot_last >= self.slot {
+                return;
+            }
+        }
+        panic!("tag 106 catch-up did not converge");
+    }
+
     fn settle_rent_at(&mut self, portfolio: Pubkey, vault_lp: Pubkey, now_slot: u64) -> Result<u64, String> {
         let (payer, m) = (self.payer.pubkey(), self.market);
         self.send(
@@ -1282,10 +1294,13 @@ fn sec_tag106_cannot_be_spoofed_double_charged_or_redirected() {
     let honest_slot_last = env.engine_asset().slot_last;
     assert!(honest_slot_last <= env.slot);
 
-    // (c) double charge: a second tag 106 in the same slot charges nothing more.
+    // (c) double charge: once caught up, a second tag 106 in the same slot charges nothing more.
+    // AUD-S1-4: a 2-slot gap is two capped segments (max_accrual_dt_slots = 1); both are
+    // rent-bearing, so the catch-up takes two calls (before the fix the second slot was accrued
+    // rent-free inside the first call, which is what this step used to rely on).
     env.warp(2);
     env.push(PRICE);
-    env.settle_rent(taker.1, lp.account).expect("first");
+    env.settle_rent_caught_up(taker.1, lp.account);
     let cap1 = env.portfolio_state(taker.1).capital;
     let idx1 = env.engine_asset().rent_index_long_num;
     let r2 = env.settle_rent(taker.1, lp.account);
@@ -1311,6 +1326,69 @@ fn sec_tag106_cannot_be_spoofed_double_charged_or_redirected() {
     assert!(charged <= one_shot + 1 && charged + 1 >= one_shot, "split settles drift: {charged} vs {one_shot}");
     // a third party never gains or loses: the attacker's capital is untouched throughout
     assert_eq!(attacker_cap, env.portfolio_state(attacker.1).capital);
+    env.assert_conservation();
+}
+
+/// AUD-S1-4 (fix-all 2026-10-18): after a gap longer than `max_accrual_dt_slots` (1 in this
+/// env), every slot that tag 106 accrues must be rent-bearing, and one call must process at most
+/// one capped segment. Before the fix the engine Refresh inside tag 106 accrued a SECOND capped
+/// segment with rent 0, so a catch-up driven by tag 106 alone charged rent for about half of the
+/// gap (the vault LP lost the rest) and advanced the asset two segments per instruction.
+#[test]
+fn s1_4_tag106_catch_up_accrues_rent_on_every_slot_one_segment_per_call() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let taker = env.trader(1_000 * USD);
+    env.trade_cpi(&taker.0, taker.1, &lp, 800 * Q).expect("crowd open");
+    for _ in 0..100 {
+        env.warp(1);
+        env.push(PRICE);
+        env.crank_current(taker.1);
+    }
+    // Caught up: one slot of rent through tag 106 is the per-slot rate.
+    env.warp(1);
+    env.push(PRICE);
+    let i0 = env.engine_asset().rent_index_long_num;
+    env.settle_rent(taker.1, lp.account).expect("tag 106, one slot");
+    assert_eq!(env.engine_asset().slot_last, env.slot, "a one-slot gap is caught up in one call");
+    let i1 = env.engine_asset().rent_index_long_num;
+    let per_slot = i1 - i0;
+    assert!(per_slot > 0, "the crowd side pays rent above the kink");
+    // A 10-slot gap (10x the accrual cap), caught up by tag 106 calls only.
+    const GAP: u64 = 10;
+    env.warp(GAP);
+    env.push(PRICE);
+    let cap0 = env.portfolio_state(taker.1).capital;
+    let mut calls = 0u64;
+    while env.engine_asset().slot_last < env.slot {
+        let before = env.engine_asset().slot_last;
+        env.settle_rent(taker.1, lp.account).expect("tag 106 during catch-up");
+        calls += 1;
+        let after = env.engine_asset().slot_last;
+        assert!(after > before, "every call makes progress");
+        assert!(after - before <= 1, "one capped segment per call: {before} -> {after}");
+        assert!(calls <= 2 * GAP, "catch-up did not converge");
+    }
+    assert_eq!(calls, GAP, "one call per capped segment");
+    let i2 = env.engine_asset().rent_index_long_num;
+    let accrued = i2 - i1;
+    // The rate is constant here (same price, same OI, same N_cap): allow one slot of drift for
+    // the per-slot rounding of the index and nothing more. Before the fix: about GAP/2 slots.
+    assert!(
+        accrued + per_slot >= GAP as u128 * per_slot,
+        "rent accrued on {} of {GAP} slots (index +{accrued}, per slot {per_slot})",
+        accrued / per_slot
+    );
+    // The taker's capital moved by exactly the rent the index says it owes over the gap.
+    let charged = cap0 - env.portfolio_state(taker.1).capital;
+    let q = 800 * POS_SCALE / 10;
+    let due = percolator::band_rent::rent_due_atoms(q, i2, i1).unwrap();
+    assert!(charged <= due + 1 && charged + 1 >= due, "charged {charged} vs due {due}");
+    // Caught up: a further call in the same slot charges nothing.
+    env.settle_rent(taker.1, lp.account).expect("tag 106, same slot");
+    assert_eq!(charged, cap0 - env.portfolio_state(taker.1).capital, "no double charge");
+    assert_eq!(i2, env.engine_asset().rent_index_long_num);
     env.assert_conservation();
 }
 
@@ -3347,7 +3425,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         let lp = env.lp(1_000 * USD);
         env.warp(1);
         env.depth_twice(600 * USD_E6);
-        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
         assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64);
         let taker = env.trader(1_000 * USD);
         env.trade_cpi(&taker.0, taker.1, &lp, 100 * Q).expect("open under the cap");
@@ -3358,7 +3436,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
             env.push_depth(PRICE, 1, 0).expect("attested 0");
         }
         let g = env.growth();
-        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
         if absent_control {
             assert_eq!(g.depth_last_good_e6, 600 * USD_E6, "35 B: absent, last good kept");
             assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "35 B: sticky $600");
@@ -3374,12 +3452,12 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         // a positive reading: min with the real 0 -> still 0
         env.warp(1);
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("positive after 0");
-        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
         assert_eq!(env.growth().rent_n_cap_q, 1, "first positive sample after a real 0: still cap 0");
         // its own min-of-two: fresh again, but R2-M1 allows no rise in the epoch of the last rise
         env.warp(1);
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("second positive");
-        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
         assert_eq!(env.growth().rent_n_cap_q, 1, "same epoch: the rate-limited depth stays 0");
         // the next epoch: back to min($600, T1/16), i.e. $600 at κ 0.5 -> 300 units
         let next = env.next_rise_slot();
@@ -3387,7 +3465,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         env.depth_twice(600 * USD_E6);
         env.crank_current(taker.1);
         env.crank_current(lp.account);
-        env.settle_rent(lp.account, lp.account).expect("tag 106");
+        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
         assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "next epoch: $600 at κ 0.5");
         env.assert_conservation();
     }
@@ -3397,7 +3475,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
     let lp = env.lp(1_000 * USD);
     env.warp(1);
     env.push_depth(PRICE, 1, 0).expect("attested 0 first");
-    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
     let g = env.growth();
     assert_eq!((g.rent_n_cap_q, g.depth_source & DEPTH_EVER), (1, DEPTH_EVER), "cap 0 (rent snapshot 1)");
     let t = env.trader(1_000 * USD);
