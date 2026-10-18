@@ -22954,6 +22954,54 @@ fn v16_bpf_update_asset_authority_rejects_stale_authority_epoch() {
     );
 }
 
+/// AUD-S1-9 (fix-all 2026-10-18): an asset-0 sub-authority (here the oracle key) rotating to
+/// the key it already holds must be refused and must NOT advance the asset-0 `authority_epoch`
+/// lane, which the market authority's own instructions bind. Before the fix this no-op rotation
+/// succeeded and bumped the lane, invalidating the market authority's held transactions.
+#[test]
+fn s1_9_self_rotation_to_the_same_key_is_refused_and_keeps_the_epoch_lane() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    let oracle = Keypair::new();
+    env.ensure_signer_account(oracle.pubkey());
+    let rotate = |env: &mut V16CuEnv, signer: &Keypair, new: &Keypair| {
+        let epoch = env.control_sequences(0).authority_epoch;
+        env.svm.expire_blockhash();
+        env.send(
+            ProgInstruction::UpdateAssetAuthority {
+                market_id: 1,
+                asset_index: 0,
+                kind: 4, // ASSET_AUTH_ORACLE
+                new_pubkey: new.pubkey().to_bytes(),
+                authority_epoch: epoch,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(new.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[signer, new],
+        )
+    };
+    // Hand the oracle authority to `oracle` (the admin, or the current holder, signs).
+    let profile = state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap();
+    let holder = if profile.oracle_authority == admin.pubkey().to_bytes() || profile.oracle_authority == [0u8; 32] {
+        admin.insecure_clone()
+    } else {
+        panic!("fixture: unexpected asset-0 oracle authority");
+    };
+    rotate(&mut env, &holder, &oracle).expect("hand the oracle authority to `oracle`");
+    let epoch_before = env.control_sequences(0).authority_epoch;
+    let err = rotate(&mut env, &oracle, &oracle).expect_err("a no-op self-rotation must be refused");
+    assert_eq!(custom_code(&err), Some(PercolatorError::InvalidInstruction as u32), "got {err}");
+    assert_eq!(env.control_sequences(0).authority_epoch, epoch_before, "the epoch lane did not move");
+    // A real handoff still works and advances the lane by exactly one.
+    let next = Keypair::new();
+    env.ensure_signer_account(next.pubkey());
+    rotate(&mut env, &oracle, &next).expect("a real rotation");
+    assert_eq!(env.control_sequences(0).authority_epoch, epoch_before + 1);
+}
+
 /// Gate-2 REJECT-WITH-DEFECT landmine regression -- the exact attack that
 /// got TB-2b's original uniform strictly-increasing-nonce binding for
 /// `authority_epoch` rejected: an authorized signer (or a since-revoked
@@ -25304,7 +25352,7 @@ fn v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_benefic
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawInsurance { amount: 100 },
+        ProgInstruction::WithdrawInsurance { amount: 1_000 },
         vec![
             AccountMeta::new_readonly(beneficiary, false), // NOT a signer
             AccountMeta::new(env.market, false),
@@ -25331,6 +25379,8 @@ fn v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_benefic
         "the rejected redirect must not move any funds to the attacker"
     );
 
+    // AUD-S1-11 (fix-all 2026-10-18): an unsigned settle pays the authority's WHOLE reserve
+    // (1,000 here); a partial unsigned amount is refused (see s1_11_* below).
     // LIVENESS + correct beneficiary: the SAME permissionless, unsigned submission
     // succeeds once the destination is owned by the true beneficiary -- the
     // beneficiary itself never has to be online or sign anything.
@@ -25339,7 +25389,7 @@ fn v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_benefic
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawInsurance { amount: 100 },
+        ProgInstruction::WithdrawInsurance { amount: 1_000 },
         vec![
             AccountMeta::new_readonly(beneficiary, false), // still NOT a signer
             AccountMeta::new(env.market, false),
@@ -25358,11 +25408,72 @@ fn v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_benefic
     println!("v16 W4-PAYOUT permissionless WithdrawInsurance CU: {cu}");
     assert_eq!(
         env.token_amount(beneficiary_dest),
-        100,
+        1_000,
         "the payout must land exactly at the recorded beneficiary's own account"
     );
     assert_eq!(env.token_amount(attacker_dest), 0, "the attacker still receives nothing");
-    assert_eq!(env.token_amount(env.vault), vault_before - 100);
+    assert_eq!(env.token_amount(env.vault), vault_before - 1_000);
+}
+
+/// AUD-S1-11 (fix-all 2026-10-18): in Resolved, the unsigned (permissionless) terminal
+/// insurance settle can no longer restart the market-wide withdrawal cooldown. Before the fix a
+/// third party paid 1 atom to the authority and the cooldown (up to the policy maximum) blocked
+/// the authority's own withdrawal and CloseSlab. Now an unsigned call must settle the whole
+/// reserve and never stamps the cooldown; the signed path keeps the cooldown.
+#[test]
+fn s1_11_unsigned_terminal_insurance_settle_cannot_restart_the_cooldown() {
+    let mut env = V16CuEnv::new();
+    env.top_up_insurance(1_000);
+    let admin = env.admin.insecure_clone();
+    let authority_epoch = env.control_sequences(0).authority_epoch;
+    send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer.insecure_clone(),
+        ProgInstruction::UpdateInsuranceWithdrawPolicy { deposits_only: 0, cooldown_slots: 1_000, authority_epoch },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(env.market, false)],
+        &[&admin],
+    )
+    .expect("set a 1,000-slot cooldown");
+    env.resolve();
+    env.svm.warp_to_slot(100);
+    let beneficiary = admin.pubkey();
+    let dest = env.token_account(beneficiary, 0);
+    let send = |env: &mut V16CuEnv, amount: u128, signed: bool| {
+        env.svm.expire_blockhash();
+        let admin = env.admin.insecure_clone();
+        let signers: Vec<&Keypair> = if signed { vec![&admin] } else { vec![] };
+        send_tx(
+            &mut env.svm,
+            env.program_id,
+            &env.payer.insecure_clone(),
+            ProgInstruction::WithdrawInsurance { amount },
+            vec![
+                if signed { AccountMeta::new(beneficiary, true) } else { AccountMeta::new_readonly(beneficiary, false) },
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &signers,
+        )
+    };
+    let stamp = |env: &V16CuEnv| state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().0.last_insurance_withdraw_slot;
+    // The grief: a third party settles 1 atom (unsigned). Refused, and the cooldown is not stamped.
+    let r = send(&mut env, 1, false);
+    assert!(r.is_err(), "an unsigned partial settle must be refused: {r:?}");
+    assert_eq!(stamp(&env), 0, "the cooldown was not restarted by a third party");
+    // So the authority's own signed withdrawal still goes through ...
+    send(&mut env, 10, true).expect("the authority's signed withdrawal is not blocked");
+    assert_eq!(stamp(&env), 100, "a signed withdrawal stamps the cooldown");
+    // ... and the cooldown still binds the authority's next one.
+    assert!(send(&mut env, 10, true).is_err(), "the cooldown still applies to signed withdrawals");
+    // Past the window, an unsigned settle of the WHOLE remaining reserve works and does not stamp.
+    env.svm.warp_to_slot(100 + 1_000 + 1);
+    send(&mut env, 990, false).expect("unsigned settle of the whole reserve");
+    assert_eq!(env.token_amount(dest), 1_000);
+    assert_eq!(stamp(&env), 100, "an unsigned settle never stamps the cooldown");
 }
 
 /// WithdrawBackingBucket, upstream 82f44d11 + c162d7c7's shared

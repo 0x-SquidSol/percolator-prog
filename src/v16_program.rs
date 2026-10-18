@@ -22582,6 +22582,16 @@ pub mod processor {
                 cfg.last_insurance_withdraw_slot,
                 now_slot,
             )?;
+            // AUD-S1-11 (fix-all 2026-10-18): the unsigned (permissionless) settle exists so a cold
+            // or lost authority cannot strand its reserve. It must not be a lever on the market-wide
+            // cooldown: before, anyone could pay 1 atom to an authority and restart the cooldown
+            // (up to the policy maximum) for every authority, which also blocks CloseSlab. An
+            // unsigned call therefore settles the authority's WHOLE reserve (no chunking) and does
+            // not stamp the cooldown; the authority's own signed withdrawals are unchanged.
+            let authority_signed = authority.is_signer;
+            if !authority_signed && amount != available_insurance {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
             let mut ledger_data = if let Some(ledger_ai) = ledger_ai {
                 Some(ledger_ai.try_borrow_mut_data()?)
             } else {
@@ -22653,7 +22663,7 @@ pub mod processor {
             // decremented remaining (or the unchanged value when the ceiling is disabled).
             let policy_dirty = cfg.insurance_withdraw_cooldown_slots > 0
                 || cfg.insurance_withdraw_deposits_only != 0;
-            if cfg.insurance_withdraw_cooldown_slots > 0 {
+            if cfg.insurance_withdraw_cooldown_slots > 0 && authority_signed {
                 cfg.last_insurance_withdraw_slot = now_slot;
             }
             cfg.insurance_withdraw_deposit_remaining = apply_insurance_withdraw_ceiling(
@@ -26097,6 +26107,16 @@ pub mod processor {
         // authority can strand funds or oracle liveness during wind-down; only the cold-storage
         // asset_admin may be intentionally burned.
         if new_pubkey == [0u8; 32] && kind != ASSET_AUTH_ADMIN {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // AUD-S1-9 (fix-all 2026-10-18): a rotation to the key already stored is a no-op that
+        // still advanced the asset's `authority_epoch` lane. On asset 0 that lane is the one the
+        // market authority's own instructions bind (tags 19, 32, 60, 61, 86, 92, 40, 13), so any
+        // asset-0 sub-authority (e.g. the oracle hot key) could invalidate the market authority's
+        // signed-but-unsubmitted transactions at will, for free. Refuse it. (A holder rotating to
+        // a second key it controls still advances the lane: that is a real handoff, and the
+        // shared lane is the design; separate lanes would be a layout change.)
+        if new_pubkey == current_value {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         // ── #437/#439: the admin bypass is an allow-list of STATES, not of KINDS. ──
