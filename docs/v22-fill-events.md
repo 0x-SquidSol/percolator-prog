@@ -119,7 +119,7 @@ Which instructions emit it, and the tag in the header:
 | 126 | 8 | `price_e6` u64: the price used (the asset's `effective_price`; `P_last` for forced closes) |
 
 **The unit of `signed_reduced_q` depends on `reason`.** Reason 1 is in **basis** units (the leg's
-stored `basis_pos_q`, before ADL scaling). Reasons 2 and 3 are **ADL-effective** units (basis x A /
+stored `basis_pos_q`, before ADL scaling). Reasons 2, 3, 6 and 7 are **ADL-effective** units (basis x A /
 a_basis). Reasons 4 and 5 are the size traded against the vault LP (the leg's signed position as
 the trade path reads it). On a side that has never been ADL-scaled the two units coincide; after
 an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without converting.
@@ -131,6 +131,8 @@ an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without con
 | 3 | `LIQUIDATION` | 5 (the crank handler that liquidated; also when that crank runs as the pre-crank inside tag 77) | **ADL-effective units.** The change of the position on the liquidated asset across the call. Unilateral. An after-leg that is **absent** is a full close; an after-leg that is present but **unreadable** (a generation or ADL epoch the reader cannot interpret) suppresses the event rather than being read as zero. The after-leg is the active leg whose `asset_index` AND generation (`market_id`) match the asset; a leg of an older generation on the same index is passed over. Both cases are defensive: the engine keeps one active leg per asset index, of the current generation, with its ADL epoch snapshot bound to its side (the same epoch, or one behind while the side's reset is pending, which reads as size 0), so an unreadable after-leg cannot be produced through the program; the suppression is exercised natively over real account bytes (`liquidation_event_wiring_absent_unreadable_and_stale_generation`). Not emitted either when the before-leg is unreadable or the change is zero (best effort: an event never makes a liquidation fail) |
 | 4 | `DUST_SWEEP` | 118 | the whole leg, bilateral against the bound vault LP at `P_last`, no fee |
 | 5 | `EVICTION` | 119 | the victim's whole leg, bilateral against the bound vault LP at `P_last`, no fee; emitted before the taker's FILL |
+| 6 | `FORCE_CLOSE_ABANDONED` | 64 | **ADL-effective units.** prog#547: a permissionless cranker closed a Recovery-lifecycle pair against each other at the frozen mark (`ForceCloseAbandonedAsset`); neither owner signed. **Two events**, one per account, each naming the other account as `counterparty`, in account order (a, then b). Same best-effort rule as reason 3 |
+| 7 | `RESOLVED_CLOSE` | 30 | **ADL-effective units.** prog#547: `CloseResolved` settled the position at the resolved price (permissionless after the force-close delay, so the owner may not have signed). One event per asset whose position the call changed, in leg order. Unilateral. Same best-effort rule as reason 3 |
 
 A liquidation that happens inside a trade (`TradeNoCpi` / `TradeCpi` closing a liquidatable
 counterparty) is a fill and is reported as a FILL, not a REDUCE.
@@ -154,6 +156,7 @@ balance change.
 | 2 `G9` | 111 | insurance backstop draw (mode 0: insurance -> vault LP capital) or capital-only restore (mode 1: vault LP capital -> insurance) | amount moved | backstop receivable outstanding after | mode: 0 draw, 1 restore. Never 3 |
 | 3 `RENT_ROUTED` | 106 | unrouted holding rent credited to the bound vault LP by this call (an internal re-labelling, no token moves); not emitted when 0 | atoms routed | 0 | 0 |
 | 4 `G9_RESTORE_PNL` | 111 | insurance backstop restore, mode 3: repaid from the vault LP's released profit first, from its capital for the remainder | atoms from released profit | atoms from capital | backstop receivable outstanding after |
+| 5 `MARKET_RESOLVED` | 19, 39 | prog#547: the market resolved (`ResolveMarket` by the market authority, or `ResolveStalePermissionless`). Every open position now settles at the resolved price through `CloseResolved` (REDUCE reason 7). `asset_index` = `0xFFFF` | resolved slot | 0 | 0 |
 
 For `EARN_EXIT`, `a + b` equals the vault -> redeemer token transfer; `a` is also the fall of the
 backing ledger's principal. A G9 PROPOSE (mode 2) moves nothing and emits nothing.
@@ -179,6 +182,9 @@ given).
 | 118 SweepBandDustLeg | A | REDUCE |
 | 44 RebalanceReduce | A | REDUCE; the wire has only the request |
 | 104 AdlWindDown | A | REDUCE (effective size). 105 (setter) is B: its value is on the wire |
+| 64 ForceCloseAbandonedAsset | A | REDUCE reason 6, two events (prog#547) |
+| 19 ResolveMarket, 39 ResolveStalePermissionless | A | MOVE `MARKET_RESOLVED` (prog#547) |
+| 30 CloseResolved | A | REDUCE reason 7 per settled asset (prog#547). The payout is B (token transfer) |
 | liquidation (crank, tag 5; also the pre-crank inside 77, still reported as tag 5) | A | REDUCE reason 3. Liquidation **fee, insurance used, residual booked** are NOT logged (C): the engine drops them on the crank path and deriving them needs the engine's `LiquidationOutcomeV16`; an engine change is out of scope. They remain visible as the portfolio / insurance account diff |
 | engine ADL scaling of other accounts | B | no per-account amount exists; the market account's `a_long` / `a_short` and epochs are the state. Effective size = basis x A / a_basis |
 | 106 SettleHoldingRent | A | MOVE `RENT_ROUTED` (routed amount). Rent *charged* to a portfolio during any settle is C: it is inside engine settlement; the instruction's own portfolio capital diff shows it |

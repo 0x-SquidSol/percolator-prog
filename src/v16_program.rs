@@ -18668,6 +18668,9 @@ pub mod processor {
         // budget (`b_loss_atom_budget`, `2c38570a:src/v16.rs:21391`), letting any cranker spend
         // an owner's principal. Our fork keeps that case on the owner-signed tag 43
         // `ForfeitRecoveryLeg`.
+        // prog#547: the effective legs before the close, for the REDUCE events below.
+        let before_a = snapshot_effective_legs_view(&group, &account_a);
+        let before_b = snapshot_effective_legs_view(&group, &account_b);
         group
             .force_close_recovery_pair_not_atomic(
                 &mut account_a,
@@ -18682,7 +18685,33 @@ pub mod processor {
             .map_err(map_v16_error)?;
         account_b
             .validate_with_market(&group.as_view())
-            .map_err(map_v16_error)
+            .map_err(map_v16_error)?;
+        // prog#547 (fix-all 2026-10-18): v2.2 reduce events (tag 64, reason 6). A permissionless
+        // cranker closed both positions at the frozen mark; neither owner signed. One event per
+        // account, the other account as counterparty, ADL-effective units. Best effort (as the
+        // liquidation event): suppressed when a leg cannot be read or did not change. Log only.
+        let market_key = market_ai.key.to_bytes();
+        for (pf, before, me, other) in [
+            (&account_a, &before_a, account_a_ai.key, account_b_ai.key),
+            (&account_b, &before_b, account_b_ai.key, account_a_ai.key),
+        ] {
+            if let Some((asset, asset_gen, delta, price)) =
+                liquidation_event_view(&group, pf, before, asset_index_usize)
+            {
+                fill_events_v22::emit_reduce(
+                    fill_events_v22::TAG_FORCE_CLOSE_ABANDONED,
+                    &market_key,
+                    &me.to_bytes(),
+                    &other.to_bytes(),
+                    asset,
+                    asset_gen,
+                    fill_events_v22::REASON_FORCE_CLOSE_ABANDONED,
+                    delta,
+                    price,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// First matcher-tail account index of TradeCpi / BatchTradeCpi when the taker is the
@@ -25882,6 +25911,17 @@ pub mod processor {
         group
             .resolve_market_not_atomic(slot)
             .map_err(map_v16_error)?;
+        // prog#547 (fix-all 2026-10-18): v2.2 move event: the market resolved; every open
+        // position now settles at the resolved price through CloseResolved (reason 7). Log only.
+        fill_events_v22::emit_move(
+            fill_events_v22::TAG_RESOLVE_MARKET,
+            &market_ai.key.to_bytes(),
+            fill_events_v22::MOVE_MARKET_RESOLVED,
+            fill_events_v22::NO_ASSET,
+            group.header.resolved_slot.get(),
+            0,
+            0,
+        );
         Ok(())
     }
 
@@ -27758,6 +27798,16 @@ pub mod processor {
         group
             .resolve_market_not_atomic(authenticated_slot)
             .map_err(map_v16_error)?;
+        // prog#547 (fix-all 2026-10-18): the same market-resolved move event as tag 19. Log only.
+        fill_events_v22::emit_move(
+            fill_events_v22::TAG_RESOLVE_STALE_PERMISSIONLESS,
+            &market_ai.key.to_bytes(),
+            fill_events_v22::MOVE_MARKET_RESOLVED,
+            fill_events_v22::NO_ASSET,
+            group.header.resolved_slot.get(),
+            0,
+            0,
+        );
         Ok(())
     }
 
@@ -28786,9 +28836,33 @@ pub mod processor {
             let insurance_before = group.header.insurance.get();
             // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
+            // prog#547: the effective legs before the resolved close, for the REDUCE events.
+            let legs_before = snapshot_effective_legs_view(&group, &portfolio);
             let outcome = group
                 .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
                 .map_err(map_v16_error)?;
+            // prog#547 (fix-all 2026-10-18): v2.2 reduce events (tag 30, reason 7), one per asset
+            // whose position this resolved close settled at the resolved price. CloseResolved is
+            // permissionless after the force-close delay, so the owner may not have signed.
+            // Unilateral (zero counterparty), ADL-effective units, best effort. Log only.
+            let market_key = market_ai.key.to_bytes();
+            for &(asset, _) in legs_before.iter() {
+                if let Some((asset, asset_gen, delta, price)) =
+                    liquidation_event_view(&group, &portfolio, &legs_before, asset as usize)
+                {
+                    fill_events_v22::emit_reduce(
+                        fill_events_v22::TAG_CLOSE_RESOLVED,
+                        &market_key,
+                        &portfolio_ai.key.to_bytes(),
+                        &[0u8; 32],
+                        asset,
+                        asset_gen,
+                        fill_events_v22::REASON_RESOLVED_CLOSE,
+                        delta,
+                        price,
+                    );
+                }
+            }
             let receipt_only_after = portfolio_is_receipt_only(&portfolio)?;
             resolved_receipt_only_transition(&mut group, receipt_only_before, receipt_only_after)?;
             if let (Some(bound), percolator::ResolvedCloseOutcomeV16::Closed { payout }) = (reserved_residual, outcome) {

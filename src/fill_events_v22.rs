@@ -37,6 +37,11 @@ pub const TAG_SETTLE_HOLDING_RENT: u8 = 106;
 pub const TAG_INSURANCE_BACKSTOP: u8 = 111;
 pub const TAG_SWEEP_BAND_DUST: u8 = 118;
 pub const TAG_EVICT_AND_TRADE: u8 = 119;
+/// prog#547 (fix-all 2026-10-18): position closes the owner did not sign for.
+pub const TAG_RESOLVE_MARKET: u8 = 19;
+pub const TAG_CLOSE_RESOLVED: u8 = 30;
+pub const TAG_RESOLVE_STALE_PERMISSIONLESS: u8 = 39;
+pub const TAG_FORCE_CLOSE_ABANDONED: u8 = 64;
 
 /// FILL flags.
 /// The requested size was clipped to the LP's headroom before the matcher was called.
@@ -54,6 +59,12 @@ pub const REASON_ADL_WIND_DOWN: u8 = 2;
 pub const REASON_LIQUIDATION: u8 = 3;
 pub const REASON_DUST_SWEEP: u8 = 4;
 pub const REASON_EVICTION: u8 = 5;
+/// Tag 64 ForceCloseAbandonedAsset: a Recovery pair closed against each other at the frozen
+/// mark (one event per account, the other account as counterparty). ADL-effective units.
+pub const REASON_FORCE_CLOSE_ABANDONED: u8 = 6;
+/// Tag 30 CloseResolved: a position settled at the resolved price when the portfolio is closed
+/// after resolution (permissionless after the force-close delay). ADL-effective units.
+pub const REASON_RESOLVED_CLOSE: u8 = 7;
 
 /// MOVE subkinds.
 pub const MOVE_EARN_EXIT: u8 = 1;
@@ -62,6 +73,9 @@ pub const MOVE_RENT_ROUTED: u8 = 3;
 /// Tag 111 mode 3 (repay the backstop from released LP profit first, capital for the rest):
 /// a = atoms from released profit, b = atoms from capital, c = receivable outstanding after.
 pub const MOVE_G9_RESTORE_PNL: u8 = 4;
+/// Tags 19 / 39: the market resolved (every open position will settle at the resolved price
+/// through CloseResolved). a = resolved slot, b = 0, c = 0; asset_index = NO_ASSET.
+pub const MOVE_MARKET_RESOLVED: u8 = 5;
 
 pub const HEADER_LEN: usize = 35;
 /// FILL fixed part: header + taker portfolio + LP portfolio + record count.

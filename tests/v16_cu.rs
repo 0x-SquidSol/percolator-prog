@@ -5916,10 +5916,42 @@ fn v16_bpf_permissionless_market_shutdown_force_closes_recovers_and_reuses_slot(
         POS_SCALE,
     );
     println!("v16 abandoned asset force close BPF CU: {force_close_cu}");
+    // prog#547 (fix-all 2026-10-18): the force-close emits one REDUCE per account (tag 64,
+    // reason 6), each naming the other account as counterparty, at the frozen mark.
+    let force_close_events = fill_events::wrapper_events(&last_logs(), &env.program_id);
     let market_data = env.svm.get_account(&env.market).unwrap().data;
     let long_data = env.svm.get_account(&long_account).unwrap().data;
     let short_data = env.svm.get_account(&short_account).unwrap().data;
     let (_, liquidated_group) = state::read_market(&market_data).unwrap();
+    let gen1 = liquidated_group.assets[1].market_id;
+    assert_eq!(
+        force_close_events,
+        vec![
+            fill_events::Event::Reduce {
+                ix_tag: 64,
+                market: env.market,
+                portfolio: long_account,
+                counterparty: short_account,
+                asset_index: 1,
+                asset_gen: gen1,
+                reason: 6,
+                signed_reduced_q: -(POS_SCALE as i128),
+                price_e6: 100,
+            },
+            fill_events::Event::Reduce {
+                ix_tag: 64,
+                market: env.market,
+                portfolio: short_account,
+                counterparty: long_account,
+                asset_index: 1,
+                asset_gen: gen1,
+                reason: 6,
+                signed_reduced_q: POS_SCALE as i128,
+                price_e6: 100,
+            },
+        ],
+        "prog#547: tag 64 force-close events"
+    );
     let long_closed = state::read_portfolio(&long_data).unwrap();
     let short_closed = state::read_portfolio(&short_data).unwrap();
     assert_eq!(liquidated_group.assets[1].oi_eff_long_q, 0);
@@ -6086,6 +6118,72 @@ fn v16_bpf_permissionless_market_shutdown_force_closes_recovers_and_reuses_slot(
     assert_eq!(reused_group.assets[1].market_id, reuse_market_id);
     assert!(reused_group.assets[1].market_id > old_market_id);
     assert_eq!(reused_group.assets[1].effective_price, 250);
+}
+
+/// prog#547 (fix-all 2026-10-18): resolution and the per-account resolved close are visible on
+/// chain. ResolveMarket (tag 19) emits MOVE sub 5 (a = resolved slot); CloseResolved (tag 30)
+/// emits one REDUCE reason 7 per asset whose position it settled (unilateral, ADL-effective
+/// size, the asset's resolved price). Before the fix both instructions logged nothing.
+#[test]
+fn prog547_resolve_and_close_resolved_emit_events() {
+    let mut env = V16CuEnv::new();
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    env.deposit(&short_owner, short_account, 1_000_000);
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        (10 * POS_SCALE) as i128,
+        150,
+        100,
+    );
+    env.resolve();
+    let market_data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::read_market(&market_data).unwrap();
+    assert_eq!(group.mode, percolator::MarketModeV16::Resolved);
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs(), &env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 19,
+            market: env.market,
+            sub: 5,
+            asset_index: u16::MAX,
+            a: group.resolved_slot,
+            b: 0,
+            c: 0,
+        }],
+        "tag 19: market-resolved move event"
+    );
+    let gen0 = group.assets[0].market_id;
+    let price = group.assets[0].effective_price;
+    for (owner, account, q) in [
+        (&long_owner, long_account, -((10 * POS_SCALE) as i128)),
+        (&short_owner, short_account, (10 * POS_SCALE) as i128),
+    ] {
+        env.close_resolved(owner, account);
+        let pf = state::read_portfolio(&env.svm.get_account(&account).unwrap().data).unwrap();
+        assert!(!has_active_leg_for_asset(&pf, 0), "the resolved close settled the leg");
+        assert_eq!(
+            fill_events::wrapper_events(&last_logs(), &env.program_id),
+            vec![fill_events::Event::Reduce {
+                ix_tag: 30,
+                market: env.market,
+                portfolio: account,
+                counterparty: Pubkey::default(),
+                asset_index: 0,
+                asset_gen: gen0,
+                reason: 7,
+                signed_reduced_q: q,
+                price_e6: price,
+            }],
+            "tag 30: resolved-close reduce event"
+        );
+    }
 }
 
 #[test]
@@ -13536,6 +13634,19 @@ fn v16_bpf_permissionless_stale_resolve_is_bounded_and_oracle_free() {
     assert_eq!(cfg.force_close_delay_slots, 1);
     assert_eq!(group.mode, percolator::MarketModeV16::Resolved);
     assert_eq!(group.resolved_slot, 9000);
+    // prog#547: the permissionless resolve emits the same market-resolved move as tag 19.
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs(), &env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 39,
+            market: env.market,
+            sub: 5,
+            asset_index: u16::MAX,
+            a: 9000,
+            b: 0,
+            c: 0,
+        }]
+    );
 }
 
 #[test]
