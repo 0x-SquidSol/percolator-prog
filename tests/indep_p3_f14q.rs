@@ -3075,3 +3075,148 @@ fn anvil_probe_plain_market_trader_bankruptcy_close() {
     let (a_paid, nb, stuck, c_tot, mat) = plain_ttv(200_000);
     eprintln!("PLAIN SUMMARY: A paid {a_paid}; B stuck {stuck} after {nb}; terminal c_tot {c_tot} materialized {mat}");
 }
+
+// ═════════════ AUD-S1-5 (fix-all 2026-10-18): tag 100 must relabel the residual before converting ═════════════
+
+fn s15_residual(w: &P3) -> u128 {
+    let g = w.env.market_state().1;
+    let owned = g.c_tot + g.insurance + g.backing_provider_earnings_total + g.source_fresh_backing_total_num / percolator::BOUND_SCALE;
+    g.vault.saturating_sub(owned)
+}
+
+fn s15_dump(w: &P3, label: &str) {
+    let g = w.env.market_state().1;
+    let bs = percolator::BOUND_SCALE;
+    let sc: Vec<_> = g.source_credit.iter().take(2).map(|c| (c.credit_rate_num, c.positive_claim_bound_num / bs, c.fresh_reserved_backing_num / bs, c.spent_backing_num / bs)).collect();
+    let lp = w.env.portfolio_state(w.lp);
+    let st = w.env.svm.get_account(&w.state_pda).and_then(|a| state::read_vault_lp_state(&a.data).ok());
+    {
+        let mut data = w.env.svm.get_account(&w.env.market).unwrap().data;
+        let (_, g) = state::market_view_mut(&mut data).unwrap();
+        let d = state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap();
+        eprintln!("S15[{label}] draw rec: out_even {} out_odd {} mirror {} pending_moved {}", d.pending_out_even_atoms, d.pending_out_odd_atoms, d.outstanding_mirror_atoms, d.pending_moved_atoms);
+    }
+    if let Some(st) = st { eprintln!("S15[{label}] vault st: C {} drawn {} outstanding {} backstop {}", st.senior_claim_atoms, st.senior_drawn_atoms, st.senior_draw_outstanding_atoms, st.backstop_outstanding_atoms); }
+    eprintln!("S15[{label}] residual {} | sc (rate, claims, fresh_reserved, spent) {:?} | buckets {:?} | LP cap {} pnl {} reserved {} claim_bound {:?} legs {} | mode {:?}",
+        s15_residual(w), sc,
+        g.source_backing_buckets.iter().take(2).map(|b| (b.status, b.fresh_unliened_backing_num / bs)).collect::<Vec<_>>(),
+        lp.capital, lp.pnl, lp.reserved_pnl, lp.source_claim_bound_num.iter().map(|x| x / bs).collect::<Vec<_>>(), lp.legs.iter().filter(|l| l.active).count(), g.mode);
+}
+
+/// Build: T long wins big vs the vault LP (loss beyond the junior -> senior draw -> residual),
+/// T closes (its claim stays unconverted), then U shorts vs the vault LP and loses, so the vault
+/// LP ends FLAT holding its own positive claim on the same loser-short domain as T's.
+fn s15_build() -> (P3, (Keypair, Pubkey), (Keypair, Pubkey)) {
+    TL_IM.with(|c| c.set(1_000));
+    TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
+    let mut w = P3::new();
+    TL_FEE_SHARE.with(|c| c.set(None));
+    w.create_vault();
+    let s0 = Keypair::new();
+    let s1 = Keypair::new();
+    let senior: u64 = std::env::var("S15_SENIOR").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000);
+    w.earn_deposit_domain(&s0, senior, false, 0).expect("75 d0");
+    w.earn_deposit_domain(&s1, senior, false, 1).expect("75 d1");
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 50_000).unwrap_or_else(|e| panic!("99: {e}"));
+    w.junior_deposit(&admin, 300_000).unwrap_or_else(|e| panic!("96: {e}"));
+    let (t, tp) = w.trader(2_000_000);
+    let (u, upf) = w.trader(4_000_000);
+    let lp = w.lp;
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE); let _ = w.crank(lp);
+    w.trade_vs_lp_fee(&t, tp, 1_000_000, 30).expect("T opens long 1.0");
+    let mut m = PRICE;
+    for _ in 0..9 {
+        m = m * 10_450 / 10_000;
+        MARK.with(|c| c.set(m));
+        let s = w.slot() + 520; w.env.svm.warp_to_slot(s); w.push(m); let _ = w.crank(tp);
+    }
+    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); }
+    s15_dump(&w, "after T's win");
+    let refill: u64 = std::env::var("S15_REFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+    if refill > 0 { let r = w.junior_deposit(&admin, refill); eprintln!("S15 junior refill -> {:?}", r.as_ref().map_err(|e| code(e))); }
+    s15_dump(&w, "after refill");
+    // A second (small) junior op books the refill: the seniors-first restore clears the draw.
+    let payer = w.env.payer.pubkey();
+    let metas = vec![
+        AccountMeta::new(payer, true), AccountMeta::new(w.env.market, false), AccountMeta::new(w.registry, false),
+        AccountMeta::new(w.ledger0, false), AccountMeta::new(w.ledger1, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false), AccountMeta::new(w.state_pda, false),
+    ];
+    let r = w.send(ProgInstruction::LpVaultCrankFees { domain: 0 }, metas.clone(), &[]); eprintln!("S15 78 book -> {:?}", r.as_ref().map_err(|e| code(e)));
+    let s_ = w.slot() + 1; w.env.svm.warp_to_slot(s_);
+    let _ = metas;
+    let r = w.recall_to(1, 0); eprintln!("S15 98 restore -> {:?}", r.as_ref().map_err(|e| code(e)));
+    s15_dump(&w, "after book");
+    eprintln!("S15 T pos {} a {}/{}", w.pos(tp), w.env.market_state().1.assets[0].a_long, w.env.market_state().1.assets[0].a_short);
+    if w.pos(tp) != 0 {
+        let r = w.trade_vs_lp_fee(&t, tp, -w.pos(tp), 30);
+        eprintln!("S15 T close -> {:?}", r.as_ref().map_err(|e| code(e)));
+    }
+    // Leave the ADL reduce-only episode: finalize both side resets, cranking between.
+    let mk = w.env.market;
+    for round in 0..12 {
+        for side in 0..2u8 { let _ = w.send(ProgInstruction::FinalizeResetSide { asset_index: 0, side }, vec![AccountMeta::new(mk, false)], &[]); }
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(m); let _ = w.crank(tp); let _ = w.crank(lp);
+        let g = w.env.market_state().1;
+        if round == 11 || (g.assets[0].mode_long == percolator::SideModeV16::Normal && g.assets[0].mode_short == percolator::SideModeV16::Normal) { eprintln!("S15 reset round {round}: a {}/{} modes {:?}/{:?} T pos {}", g.assets[0].a_long, g.assets[0].a_short, g.assets[0].mode_long, g.assets[0].mode_short, w.pos(tp)); break; }
+    }
+    s15_dump(&w, "after T's close");
+    // U shorts vs the vault LP (the vault LP goes long) and the mark keeps rising: U loses.
+    let r = w.trade_vs_lp_fee(&u, upf, -300_000, 30);
+    eprintln!("S15 U short -> {:?}", r.as_ref().map_err(|e| code(e)));
+    for _ in 0..3 {
+        m = m * 10_300 / 10_000;
+        MARK.with(|c| c.set(m));
+        let s = w.slot() + 520; w.env.svm.warp_to_slot(s); w.push(m); let _ = w.crank(upf); let _ = w.crank(lp);
+    }
+    let r = w.trade_vs_lp_fee(&u, upf, -w.pos(upf), 30);
+    eprintln!("S15 U close -> {:?}", r.as_ref().map_err(|e| code(e)));
+    // Warm-up release of the vault LP's claim, cranking (no conversion by anyone).
+    for _ in 0..8 { let s = w.slot() + 250; w.env.svm.warp_to_slot(s); w.push(m); let _ = w.crank(lp); let _ = w.crank(tp); let _ = w.crank(upf); }
+    s15_dump(&w, "built");
+    (w, (t, tp), (u, upf))
+}
+
+/// AUD-S1-5: VaultLpConvertPnl (tag 100) is permissionless. Reached organically: T's win drives the
+/// vault LP through a senior draw (residual R > 0 sits unowned in the vault; the loser-short pot d1
+/// is under-backed, credit rate < 1), the draw is booked and restored (78, 98), then the vault LP
+/// wins vs U on the SAME loser-short domain and is flat with a released claim. Before the fix a
+/// third party's tag 100 converted that claim at the haircut (face burned: the vault LP's
+/// depositors lose it and the residual is later relabelled to the remaining claimants instead).
+/// Tag 28 relabels the residual first; tag 100 must too, so the claim converts at par.
+#[test]
+fn s1_5_tag100_relabels_the_residual_before_converting_the_vault_lp_claim() {
+    let (mut w, _t, _u) = s15_build();
+    let lp = w.lp;
+    let before = w.env.portfolio_state(lp);
+    let g = w.env.market_state().1;
+    let residual = s15_residual(&w);
+    let rate_d1 = g.source_credit[1].credit_rate_num;
+    let claims_d1 = g.source_credit[1].positive_claim_bound_num / percolator::BOUND_SCALE;
+    let backing_d1 = g.source_credit[1].fresh_reserved_backing_num / percolator::BOUND_SCALE;
+    // Vacuity: every precondition of the finding holds at once.
+    assert!(before.pnl > 0 && before.reserved_pnl == 0, "vault LP holds a released claim: pnl {} reserved {}", before.pnl, before.reserved_pnl);
+    assert!(before.legs.iter().all(|l| !l.active), "vault LP is flat");
+    assert!(before.source_claim_bound_num[1] > 0, "the vault LP's claim is on the loser-short pot");
+    assert!(residual > 0, "an unowned residual sits in the vault");
+    assert!(rate_d1 < 1_000_000_000_000, "the pot is haircut (rate {rate_d1})");
+    assert!(backing_d1 + residual.min(claims_d1) >= claims_d1, "the relabel would fully back the pot: backing {backing_d1} + residual {residual} vs claims {claims_d1}");
+    // A third party (the payer, not the vault's admin or any depositor) sends tag 100.
+    let m = w.env.market;
+    let sp = w.state_pda;
+    let payer = w.env.payer.pubkey();
+    let face = before.pnl as u128;
+    w.send(ProgInstruction::VaultLpConvertPnl { amount: face },
+        vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new_readonly(sp, false), AccountMeta::new(lp, false)], &[])
+        .expect("tag 100");
+    let after = w.env.portfolio_state(lp);
+    let gain = after.capital - before.capital;
+    s15_dump(&w, "after tag 100");
+    eprintln!("S15 tag100: face {face} -> capital +{gain}; residual {residual} -> {}", s15_residual(&w));
+    assert_eq!(after.pnl, 0, "the whole released claim converted");
+    assert!(gain + 1 >= face, "SECURITY (S1-5): a third-party tag 100 converted the vault LP's claim at a haircut: face {face}, credited {gain}");
+    assert!(s15_residual(&w) < residual, "the residual was relabelled into the pot");
+}

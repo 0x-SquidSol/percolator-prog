@@ -40765,6 +40765,17 @@ pub mod processor {
         let mut lp_data = lp_ai.try_borrow_mut_data()?;
         let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
         expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        // AUD-S1-5 (fix-all 2026-10-18): tag 100 is permissionless, so it must not convert at a
+        // worse rate than tag 28 would. Back the winners' claims with the vault LP's own settled
+        // loss (unowned residual) BEFORE converting, exactly as tag 28 does; otherwise a third
+        // party could force the vault LP's claim through the haircut (face burned, lost to its
+        // depositors) and leave the residual to be relabelled later to the other claimants.
+        if vault_lp_relabel_residual_to_claims(&mut group)? != 0 {
+            // The relabel moved the pot's credit epoch: re-certify before converting.
+            group
+                .full_account_refresh_not_atomic(&mut lp)
+                .map_err(map_v16_error)?;
+        }
         // v2.2 D-1 (re-review N-3): no conversion of PnL valued at a lagged mark (21).
         if portfolio_has_lagged_asset_view(&group, &lp)? {
             return Err(PercolatorError::EngineLockActive.into());
