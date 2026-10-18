@@ -3692,3 +3692,116 @@ fn s12_close_then_recreate_same_keypair_gets_a_new_incarnation_and_the_old_nft_d
     );
     assert!(res.is_ok() && env.token_amount(dest_b) == 1_000, "the buyer's NFT2 works: {res:?}");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// R12 (percolator-security review of S1-2) -- extra adversarial tests, NOT part of the fixer's
+// branch. Same crafted-PDA approach as the s12_* tests above.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn r12_rewrite_pda(env: &mut CrosscutEnv, pda: Pubkey, f: impl FnOnce(&mut Vec<u8>)) {
+    let mut a = env.svm.get_account(&pda).unwrap();
+    f(&mut a.data);
+    env.svm.set_account(pda, a).unwrap();
+}
+
+// A version-2 (199 B) PositionNft PDA -- what every pre-S1-2 mint left on chain -- must authorize
+// nothing, even when it is otherwise the live incarnation's NFT with a perfectly valid holder.
+#[test]
+fn r12_v2_199b_pda_authorizes_nothing_and_v3_control_does() {
+    for truncate in [false, true] {
+        // delta 0: the "attacker" NFT carries the LIVE id, i.e. it would be a valid holder NFT.
+        let mut w = stale_nft_world(None, 0, 1_000);
+        if truncate {
+            let pda = w.attacker_nft.0;
+            r12_rewrite_pda(&mut w.env, pda, |d| {
+                d.truncate(199);
+                d[8] = 2;
+            });
+        }
+        let (res, got) = withdraw_with_nft(&mut w, true, 1_000);
+        if truncate {
+            assert!(res.is_err() && got == 0, "v2 199B PDA must authorize nothing: {res:?} {got}");
+        } else {
+            assert!(res.is_ok() && got == 1_000, "control (v3, live id) must authorize: {res:?} {got}");
+        }
+    }
+}
+
+// Same, but the PDA is 239 B and only the version byte says 2 (mixed state): the wrapper ignores
+// the version byte (the NFT program checks it). Documents that wrapper-side authority rests on
+// length + incarnation fields, not on the version byte.
+#[test]
+fn r12_wrapper_does_not_read_version_byte_documented() {
+    let mut w = stale_nft_world(None, 0, 1_000);
+    let pda = w.attacker_nft.0;
+    r12_rewrite_pda(&mut w.env, pda, |d| d[8] = 2);
+    let (res, got) = withdraw_with_nft(&mut w, true, 1_000);
+    eprintln!("R12 version-byte-2 on a 239B PDA: wrapper result = {res:?}, received {got}");
+}
+
+// Deposit (trio at index 6) by a stale-NFT holder is refused; by the live holder it works.
+#[test]
+fn r12_stale_nft_cannot_deposit_but_live_holder_can() {
+    for as_attacker in [true, false] {
+        let mut w = stale_nft_world(None, 41, 1_000);
+        let (signer, (nft_pda, ata)) = if as_attacker {
+            (w.attacker.insecure_clone(), w.attacker_nft)
+        } else {
+            (w.victim.insecure_clone(), w.victim_nft)
+        };
+        let source = Pubkey::new_unique();
+        w.env
+            .svm
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(w.env.mint, signer.pubkey(), 500),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let (portfolio_id, expected_sequence, _) = w.env.portfolio_identity(w.portfolio);
+        let res = w.env.try_wrapper(
+            ProgInstruction::Deposit { portfolio_id, expected_sequence, amount: 500 },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(w.env.market, false),
+                AccountMeta::new(w.portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(w.env.vault, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+                AccountMeta::new_readonly(w.registry, false),
+                AccountMeta::new_readonly(nft_pda, false),
+                AccountMeta::new_readonly(ata, false),
+            ],
+            &[&signer],
+        );
+        if as_attacker {
+            assert!(res.is_err(), "stale NFT must not deposit-authorize: {res:?}");
+        } else {
+            assert!(res.is_ok(), "live holder deposit must work: {res:?}");
+        }
+    }
+}
+
+// TradeCpi / BatchTradeCpi by a stale-NFT holder (the GH#407 trio path) is refused (Custom(8)).
+fn r12_stale_trade(kind: CpiKind) {
+    let mut env = CrosscutEnv::new();
+    let t = escrowed_taker_env(&mut env);
+    // Make the holder's NFT a leftover of an earlier incarnation: id != live id.
+    let pda = t.nft_pda;
+    let (live_id, _, _) = env.portfolio_identity(t.taker);
+    r12_rewrite_pda(&mut env, pda, |d| d[231..239].copy_from_slice(&(live_id + 41).to_le_bytes()));
+    let size = (10 * POS_SCALE) as i128;
+    let before = env.account_data(t.taker);
+    let res = send_cpi_trade(&mut env, kind, &t.holder, t.taker, t.maker, t.ctx, t.delegate, size, trio(&t));
+    assert_err_contains(res, E_UNAUTHORIZED, "stale NFT must not trade the escrowed portfolio");
+    assert_eq!(env.account_data(t.taker), before, "taker portfolio untouched");
+}
+#[test]
+fn r12_tradecpi_stale_nft_refused() { r12_stale_trade(CpiKind::Single); }
+#[test]
+fn r12_batchtradecpi_stale_nft_refused() { r12_stale_trade(CpiKind::Batch); }

@@ -2778,4 +2778,66 @@ mod e2e {
             }
         }
     }
+
+    // ── R12 (percolator-security review of S1-2): extra adversarial tests ──
+
+    /// A version-2 (199 B) PositionNft PDA -- what every pre-S1-2 mint leaves -- has NO exit in the
+    /// new NFT program: Burn, EmergencyBurn and ReconcileBurnedNft all reject it, so a portfolio
+    /// escrowed under it stays owned by the mint-authority PDA. (Documents finding R12-2.)
+    #[test]
+    fn r12_v2_199b_pda_has_no_exit_in_the_new_nft_program() {
+        for tag in [1u8, 5u8] {
+            let Env { mut svm, payer } = base_env();
+            let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
+            let holder = Keypair::new();
+            svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
+            let mint_auth = mint_auth_pda().0.to_bytes();
+            let (portfolio_key, nft_pda_key, nft_mint_key, ata_key, extra_metas_key, (mint_auth_key, _)) =
+                place_nft_bundle_real_mint(
+                    &mut svm, &payer, &market, &registry, &holder, 0, 42, 0,
+                    |data| escrow_to_mint_auth(data),
+                );
+            // Make it a v2 PDA exactly as the old program left it: 199 bytes, version byte 2.
+            let mut a = svm.get_account(&nft_pda_key).unwrap();
+            a.data.truncate(199);
+            a.data[8] = 2;
+            svm.set_account(nft_pda_key, a).unwrap();
+            let res = send(
+                &mut svm, NFT_PROGRAM_ID, &payer, vec![tag],
+                emergency_burn_accounts(&market, &holder, nft_pda_key, nft_mint_key, ata_key, portfolio_key, mint_auth_key, extra_metas_key),
+                &[&holder],
+            );
+            eprintln!("R12 v2 PDA tag {tag}: {res:?}");
+            assert!(res.is_err(), "v2 PDA must be rejected by tag {tag}");
+            let port = svm.get_account(&portfolio_key).unwrap();
+            assert_eq!(read_portfolio_owner(&port.data), mint_auth, "escrow stays: no exit");
+        }
+    }
+
+    /// RESIDUAL (#110B fallback): when the live portfolio decodes with an UNKNOWN wrapper header
+    /// VERSION, EmergencyBurn skips BOTH the eligibility gate and the incarnation check and
+    /// proceeds to the tag-82 release. This test pins the current behaviour so a change is
+    /// noticed; it is not reachable on today's single-layout wrapper (see report R12-3).
+    #[test]
+    fn r12_emergency_burn_unknown_layout_fallback_skips_incarnation_check_documented() {
+        let Env { mut svm, payer } = base_env();
+        let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
+        let stale_holder = Keypair::new();
+        svm.airdrop(&stale_holder.pubkey(), 10_000_000_000).unwrap();
+        let (portfolio_key, nft_pda_key, nft_mint_key, ata_key, extra_metas_key, (mint_auth_key, _)) =
+            place_nft_bundle_real_mint(
+                &mut svm, &payer, &market, &registry, &stale_holder, 0, 42, 0,
+                |data| {
+                    escrow_to_mint_auth(data);
+                    set_live_portfolio_id(data, 9); // later incarnation than the NFT's 7
+                    data[8] = 0xEE; // unknown wrapper header VERSION (u16 at [8..10])
+                },
+            );
+        let res = send(
+            &mut svm, NFT_PROGRAM_ID, &payer, vec![5u8],
+            emergency_burn_accounts(&market, &stale_holder, nft_pda_key, nft_mint_key, ata_key, portfolio_key, mint_auth_key, extra_metas_key),
+            &[&stale_holder],
+        );
+        eprintln!("R12 unknown-layout fallback with a STALE nft: {res:?}");
+    }
 }
