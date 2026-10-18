@@ -14007,6 +14007,7 @@ pub mod processor {
             && !oracle_v16::profile_hybrid_soft_stale_matured(&profile, now_slot)
             && profile.last_good_oracle_slot != now_slot
         {
+            log_refresh_refused_asset_lags(asset_index, "hybrid_no_report_this_slot", group, now_slot);
             return Err(PercolatorError::EngineNonProgress.into());
         }
         if observations.iter().any(|o| o.asset_index == asset_index) {
@@ -14046,9 +14047,78 @@ pub mod processor {
             permissionless_funding_rate_e9_view(&profile, group, asset_index, now_slot, next)?
         };
         if next != current || funding_rate != 0 {
+            log_refresh_refused_asset_lags(asset_index, "unobserved_pending_progress", group, now_slot);
             return Err(PercolatorError::EngineNonProgress.into());
         }
         Ok(())
+    }
+
+    /// AUD-FC-A follow-up (fix-all 2026-10-18): a distinct log line for a refresh / liquidation
+    /// refused with `EngineNonProgress` (22) because an asset the account holds is behind the
+    /// clock, so a third-party liquidator can tell this refusal apart from every other 22. Log
+    /// only: the error code is unchanged (no new code, so the SDK error map is untouched).
+    ///
+    /// Line: `percolator: refresh_refused_asset_lags asset=<i> cause=<cause> slot_last=<s>
+    /// now=<n> max_accrual_dt=<d>`.
+    ///
+    /// Catch-up sequence for a lagging asset (what the keeper does; SDK
+    /// `buildCatchUpAndRefreshIxsV22`):
+    /// 1. Each accrual is capped at `max_accrual_dt_slots` per instruction (the per-instruction
+    ///    solvency envelope; the crank's GATE-2 stops after one capped segment and commits it).
+    ///    So send `ceil((now - slot_last) / max_accrual_dt_slots)` observe-cranks: tag 5
+    ///    `PermissionlessCrank` with an observation hint for the asset (and its oracle accounts
+    ///    for a Hybrid/external oracle), each of which returns `Ok` after committing one segment.
+    /// 2. Then, in the SAME transaction as the last observe-crank (so no slot passes between
+    ///    them), the refresh / liquidation crank of the target portfolio with the same hint. A
+    ///    Hybrid asset additionally needs an authenticated report IN THAT SLOT
+    ///    (`cause=hybrid_no_report_this_slot`) unless its soft-stale window has matured.
+    /// 3. A gap longer than what fits one transaction (about 30 observe-cranks of ~44k CU each)
+    ///    takes several transactions; only the last needs the refresh.
+    #[inline(never)]
+    fn log_refresh_refused_asset_lags(
+        asset_index: usize,
+        cause: &str,
+        group: &state::MarketViewMutV16<'_>,
+        now_slot: u64,
+    ) {
+        let slot_last = group
+            .markets
+            .get(asset_index)
+            .map(|m| m.engine.asset.slot_last.get())
+            .unwrap_or(0);
+        solana_program::log::sol_log(&alloc::format!(
+            "percolator: refresh_refused_asset_lags asset={} cause={} slot_last={} now={} max_accrual_dt={}",
+            asset_index,
+            cause,
+            slot_last,
+            now_slot,
+            group.header.config.max_accrual_dt_slots.get()
+        ));
+    }
+
+    /// AUD-FC-A follow-up: on the crank's plan fallthrough (the engine answered NonProgress and
+    /// this call committed no accrual), name every asset of the portfolio that is behind the
+    /// clock, with the same line as `log_refresh_refused_asset_lags`. Nothing is logged when no
+    /// held asset lags (the 22 then has another cause).
+    #[inline(never)]
+    fn log_portfolio_lagging_assets(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        now_slot: u64,
+    ) {
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = &portfolio.header.legs[slot];
+            if leg.active == 1 {
+                let i = leg.asset_index.get() as usize;
+                if let Some(m) = group.markets.get(i) {
+                    if m.engine.asset.slot_last.get() < now_slot {
+                        log_refresh_refused_asset_lags(i, "plan_no_progress", group, now_slot);
+                    }
+                }
+            }
+            slot += 1;
+        }
     }
 
     fn read_oracle_profile_for_asset(
@@ -29566,12 +29636,14 @@ pub mod processor {
                     if market_accrual_performed {
                         None
                     } else {
+                        log_portfolio_lagging_assets(&group, &portfolio, authenticated_now_slot);
                         return Err(PercolatorError::EngineNonProgress.into());
                     }
                 }
                 Ok(result) => Some(result),
                 Err(V16Error::NonProgress) if market_accrual_performed => None,
                 Err(V16Error::NonProgress) => {
+                    log_portfolio_lagging_assets(&group, &portfolio, authenticated_now_slot);
                     return Err(PercolatorError::EngineNonProgress.into());
                 }
                 Err(err) => return Err(map_v16_error(err)),

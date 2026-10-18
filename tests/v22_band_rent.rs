@@ -1238,7 +1238,7 @@ impl Env {
                 return;
             }
         }
-        panic!("tag 106 catch-up did not converge");
+        panic!("tag 106 catch-up did not converge: slot_last {} clock {} env.slot {}", self.engine_asset().slot_last, self.clock_slot(), self.slot);
     }
 
     fn settle_rent_at(&mut self, portfolio: Pubkey, vault_lp: Pubkey, now_slot: u64) -> Result<u64, String> {
@@ -1390,6 +1390,46 @@ fn s1_4_tag106_catch_up_accrues_rent_on_every_slot_one_segment_per_call() {
     assert_eq!(charged, cap0 - env.portfolio_state(taker.1).capital, "no double charge");
     assert_eq!(i2, env.engine_asset().rent_index_long_num);
     env.assert_conservation();
+}
+
+/// AUD-FC-A follow-up (fix-all 2026-10-18): a refresh/liquidation crank refused with
+/// EngineNonProgress (22) because a held asset lags the clock now says so in a distinct log line
+/// (the error code is unchanged), so a third-party liquidator can tell why and run the catch-up.
+#[test]
+fn fca_lagging_asset_refusal_logs_a_distinct_line() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let taker = env.trader(1_000 * USD);
+    env.trade_cpi(&taker.0, taker.1, &lp, 100 * Q).expect("open");
+    env.warp(5);
+    env.push(PRICE);
+    // A crank with NO observation hint: nothing can accrue the asset, so the engine refuses.
+    let (payer, m, slot) = (env.payer.pubkey(), env.market, env.slot);
+    let r = env.send(
+        ProgInstruction::PermissionlessCrank { now_slot: slot, observations: vec![] },
+        vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(taker.1, false),
+        ],
+        &[],
+    );
+    assert_err(&r, &code(PercolatorError::EngineNonProgress), "lagging asset, no observation");
+    let e = r.unwrap_err();
+    assert!(
+        e.contains("percolator: refresh_refused_asset_lags asset=0 cause="),
+        "the refusal names the lagging asset: {e}"
+    );
+    assert!(e.contains(&format!("now={}", env.clock_slot())), "and the clock: {e}");
+    // The documented catch-up (observe-cranks, one capped segment each) then succeeds.
+    for _ in 0..20 {
+        if env.engine_asset().slot_last >= env.slot {
+            break;
+        }
+        env.crank(taker.1).expect("observe-crank (one capped segment)");
+    }
+    assert_eq!(env.engine_asset().slot_last, env.slot);
 }
 
 #[test]
@@ -3425,7 +3465,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         let lp = env.lp(1_000 * USD);
         env.warp(1);
         env.depth_twice(600 * USD_E6);
-        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
         assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64);
         let taker = env.trader(1_000 * USD);
         env.trade_cpi(&taker.0, taker.1, &lp, 100 * Q).expect("open under the cap");
@@ -3436,7 +3476,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
             env.push_depth(PRICE, 1, 0).expect("attested 0");
         }
         let g = env.growth();
-        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
         if absent_control {
             assert_eq!(g.depth_last_good_e6, 600 * USD_E6, "35 B: absent, last good kept");
             assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "35 B: sticky $600");
@@ -3448,16 +3488,20 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         let t2 = env.trader(1_000 * USD);
         let r = env.trade_cpi(&t2.0, t2.1, &lp, 10 * Q);
         assert_eq!(env.pos(t2.1), 0, "cap 0: no open: {r:?}");
+        // AUD-S1-4: tag 106 no longer runs a second (rent-free) accrual segment inside the call,
+        // so the asset moved one segment since the taker was last refreshed: refresh the taker
+        // (tag 106 on the taker's own portfolio is the permissionless refresh) before it trades.
+        env.settle_rent(taker.1, lp.account).expect("tag 106: refresh the taker");
         env.trade_cpi(&taker.0, taker.1, &lp, -50 * Q).expect("a reduce at cap 0");
         // a positive reading: min with the real 0 -> still 0
         env.warp(1);
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("positive after 0");
-        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
         assert_eq!(env.growth().rent_n_cap_q, 1, "first positive sample after a real 0: still cap 0");
         // its own min-of-two: fresh again, but R2-M1 allows no rise in the epoch of the last rise
         env.warp(1);
         env.push_depth(PRICE, 1, 600 * USD_E6).expect("second positive");
-        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
         assert_eq!(env.growth().rent_n_cap_q, 1, "same epoch: the rate-limited depth stays 0");
         // the next epoch: back to min($600, T1/16), i.e. $600 at κ 0.5 -> 300 units
         let next = env.next_rise_slot();
@@ -3465,7 +3509,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
         env.depth_twice(600 * USD_E6);
         env.crank_current(taker.1);
         env.crank_current(lp.account);
-        env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
+        env.settle_rent(lp.account, lp.account).expect("tag 106");
         assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "next epoch: $600 at κ 0.5");
         env.assert_conservation();
     }
@@ -3475,7 +3519,7 @@ fn r2_attested_zero_reading_caps_at_zero_at_once() {
     let lp = env.lp(1_000 * USD);
     env.warp(1);
     env.push_depth(PRICE, 1, 0).expect("attested 0 first");
-    env.settle_rent_caught_up(lp.account, lp.account); // AUD-S1-4: one segment per call
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
     let g = env.growth();
     assert_eq!((g.rent_n_cap_q, g.depth_source & DEPTH_EVER), (1, DEPTH_EVER), "cap 0 (rent snapshot 1)");
     let t = env.trader(1_000 * USD);
