@@ -4525,6 +4525,67 @@ fn p2b_g6_fee_waterfall_cushion() {
     assert!(out_on + 2 >= out_off, "the lock must not trap the junior's own capital: {out_on} vs {out_off}");
 }
 
+/// AUD-S1-16 (fix-all 2026-10-18): the creator-fee vesting flag cannot go stale through a junior
+/// withdrawal. Junior 5,000 vs cushion target 40% of C (4,000): tag 78 clears the flag (vested);
+/// the junior then withdraws 2,000 (3,000 left, below target). Before the fix the flag stayed
+/// clear and tag 90 paid creator fees below the cushion target (96 -> 78 -> 97 -> 90 in one tx);
+/// now tag 97 re-arms it and tag 90 is refused. Control: without the 97, tag 90 is paid.
+#[test]
+fn s1_16_junior_withdraw_rearms_the_creator_fee_vesting_flag() {
+    let run = |withdraw_junior: bool| -> (u8, u8, Result<(), String>) {
+        let p = Params { fee_bps: 100, ..Params::default() };
+        let mut env = Env::new(p);
+        let d = env.new_depositor();
+        env.earn_deposit(&d, 10_000 * U, None).expect("senior");
+        let lp = env.bind(1_000);
+        let admin = env.admin.insecure_clone();
+        env.junior_deposit_as(&admin, lp.portfolio, 5_000 * U).expect("junior 5,000");
+        env.set_p2b_dials(&admin, [5_000, 3_000, 4_000, 5_000]).expect("dials (target 40%)");
+        let t = env.new_trader(5_000 * U);
+        for _ in 0..4 {
+            env.trade(&t, &lp, 1_000 * UQ).expect("open");
+            env.trade(&t, &lp, -1_000 * UQ).expect("close");
+        }
+        let _ = env.crank(lp.portfolio);
+        env.crank_fees_ext(lp.portfolio).expect("78");
+        let vest_after_78 = env.asset_rec().p2b_flags;
+        if withdraw_junior {
+            env.junior_withdraw_ext(&admin, lp.portfolio, 2_000 * U).expect("97: junior 5,000 -> 3,000");
+        }
+        let vest_before_90 = env.asset_rec().p2b_flags;
+        let epoch = state::read_asset_control_sequences(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .authority_epoch;
+        let dst = env.token_account(env.mint, admin.pubkey(), 0);
+        let (m, vt, va) = (env.market, env.vault_token, env.vault_authority);
+        let r90 = env.send(
+            ProgInstruction::WithdrawCreatorFee { amount: 1, asset_index: 0, authority_epoch: epoch },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(dst, false),
+                AccountMeta::new(vt, false),
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&admin],
+        );
+        if r90.is_ok() {
+            env.paid_out += 1;
+        }
+        env.assert_conserved("s1-16");
+        (vest_after_78, vest_before_90, r90)
+    };
+    let (v78_ctl, v90_ctl, r90_ctl) = run(false);
+    assert_eq!(v78_ctl & 1, 0, "fixture: junior 5,000 >= target 4,000, so tag 78 vests");
+    assert_eq!(v90_ctl & 1, 0);
+    r90_ctl.expect("control: the creator fee claim works while the junior is at target");
+    let (v78, v90, r90) = run(true);
+    assert_eq!(v78 & 1, 0, "tag 78 vested");
+    assert_eq!(v90 & 1, 1, "the junior withdrawal below target re-armed the vesting flag");
+    err_has(&r90, PercolatorError::VaultLpCreatorFeeVesting);
+}
+
 /// R-2 on an ALLOCATED vault (security requirement: "the R-2 PoC must cover an allocated vault").
 /// The R-2 round trip (a zero-sum pair against the vault LP; E deposits after the pair's first
 /// leg, redeems after the second) on a bound vault that carries 5,000 of allocated senior

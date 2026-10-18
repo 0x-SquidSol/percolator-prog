@@ -36996,6 +36996,28 @@ pub mod processor {
             group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
             // Phase 2b A4 lock (defence in depth: the engine withdraw above is flat-only).
             p2b_a4_capacity_check(&group, &lp, st.asset_index as usize, c_m_before)?;
+            // AUD-S1-16 (fix-all 2026-10-18): the creator-fee vesting flag is computed by tag 78
+            // and only read by tag 90, so 96 (junior in) -> 78 (flag cleared) -> 97 (junior out)
+            // -> 90 in one transaction withdrew creator fees while the junior sat below the
+            // cushion target. A junior withdrawal now re-arms the flag when the junior left behind
+            // is below the target (it never clears it: clearing stays tag 78's job).
+            if let Some((_, x)) = ext.as_ref() {
+                let junior_after =
+                    bond_v20::tranche_split3(v.saturating_sub(amount), c_eff, bond_claim).junior;
+                if !vault_lp_v18::creator_fee_vested(
+                    junior_after,
+                    c_eff,
+                    x.cushion_share_bps,
+                    x.cushion_target_bps,
+                ) {
+                    let a = st.asset_index as usize;
+                    let mut rec = read_asset_vault_lp_from_view(&group, a)?;
+                    if rec.p2b_flags & state::ASSET_VAULT_LP_P2B_CREATOR_FEE_VESTING == 0 {
+                        rec.p2b_flags |= state::ASSET_VAULT_LP_P2B_CREATOR_FEE_VESTING;
+                        write_asset_vault_lp_to_view(&mut group, a, &rec)?;
+                    }
+                }
+            }
         }
         let bump_arr = [vault_bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
