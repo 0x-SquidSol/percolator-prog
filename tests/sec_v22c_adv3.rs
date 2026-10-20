@@ -2738,17 +2738,21 @@ fn sec_c1_impaired_bond_earns_no_coupon() {
             cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
         };
         let c0 = env.vlp().senior_claim_atoms;
+        let k0 = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0);
         env.crank_fees_bond(lp.portfolio).expect("78");
         let coupon = env.tranche().c_b_atoms - tr0.c_b_atoms;
         let senior = env.vlp().senior_claim_atoms - c0;
-        eprintln!("SEC-C1 impaired={impaired}: leg {avail} coupon {coupon} senior-credit {senior}");
-        (avail, coupon, senior)
+        // Round 3 (GAP-8): the bond tranche's ext carries the default cushion (20% / 50%), so the
+        // Earn side of the leg is seniors + the junior cushion.
+        let cushion = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0) - k0;
+        eprintln!("SEC-C1 impaired={impaired}: leg {avail} coupon {coupon} senior-credit {senior} cushion {cushion}");
+        (avail, coupon, senior + cushion)
     };
     let (leg_i, coupon_i, senior_i) = run(true);
     let (leg_w, coupon_w, senior_w) = run(false);
     assert!(leg_i > 0 && leg_w > 0, "vacuity: fee legs");
     assert_eq!(coupon_i, 0, "M-1: an impaired tranche earns nothing");
-    assert_eq!(senior_i, leg_i, "the whole leg goes to Earn");
+    assert_eq!(senior_i, leg_i, "the whole leg goes to Earn's side (seniors + junior cushion), none to bonds");
     assert!(coupon_w > 0, "control: a whole tranche earns its coupon");
     assert_eq!(coupon_w + senior_w, leg_w);
 }

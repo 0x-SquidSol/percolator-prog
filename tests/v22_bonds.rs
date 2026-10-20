@@ -2814,17 +2814,21 @@ fn sec_c1_impaired_bond_earns_no_coupon() {
             cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
         };
         let c0 = env.vlp().senior_claim_atoms;
+        let k0 = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0);
         env.crank_fees_bond(lp.portfolio).expect("78");
         let coupon = env.tranche().c_b_atoms - tr0.c_b_atoms;
         let senior = env.vlp().senior_claim_atoms - c0;
-        eprintln!("SEC-C1 impaired={impaired}: leg {avail} coupon {coupon} senior-credit {senior}");
-        (avail, coupon, senior)
+        // Round 3 (GAP-8): the bond tranche's ext carries the default cushion (20% / 50%), so the
+        // Earn side of the leg is seniors + the junior cushion.
+        let cushion = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0) - k0;
+        eprintln!("SEC-C1 impaired={impaired}: leg {avail} coupon {coupon} senior-credit {senior} cushion {cushion}");
+        (avail, coupon, senior + cushion)
     };
     let (leg_i, coupon_i, senior_i) = run(true);
     let (leg_w, coupon_w, senior_w) = run(false);
     assert!(leg_i > 0 && leg_w > 0, "vacuity: fee legs");
     assert_eq!(coupon_i, 0, "M-1: an impaired tranche earns nothing");
-    assert_eq!(senior_i, leg_i, "the whole leg goes to Earn");
+    assert_eq!(senior_i, leg_i, "the whole leg goes to Earn's side (seniors + junior cushion), none to bonds");
     assert!(coupon_w > 0, "control: a whole tranche earns its coupon");
     assert_eq!(coupon_w + senior_w, leg_w);
 }
@@ -3094,9 +3098,12 @@ fn bond_coupon_gate_uses_the_lag_worse_value_like_108_110() {
         let c0 = env.vlp().senior_claim_atoms;
         let (cfg, _) = env.market_state();
         let leg = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+        let k0 = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0);
         env.crank_fees_bond(lp.portfolio).expect("78");
         let coupon = env.tranche().c_b_atoms - cb0;
-        assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0), leg);
+        // Round 3 (GAP-8): + the default junior cushion's share.
+        let cushion = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0) - k0;
+        assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0) + cushion, leg);
         let h2 = env.new_bond_holder();
         let r108 = env.bond_deposit(&h2, lp.portfolio, U, 1);
         eprintln!("LAG-WORSE lag={lag}: leg {leg} coupon {coupon} 108 -> {:?}", r108.as_ref().map_err(|e| e.chars().take(70).collect::<String>()));
@@ -3152,4 +3159,179 @@ fn wl1_band_bond_lock_uses_lambda_eff_not_the_stored_lambda() {
     let paid = env.bond_execute(&attacker, lp.portfolio, 0).expect("exit once nothing is open");
     assert_eq!(paid, 1_000 * U, "par (coupon 0)");
     env.assert_conserved("wl1");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// v2.2 round 3, item 1 (adaptive-controller design GAP-8 / LP-plan audit §4 item 8): Earn
+// allocation alpha <= 50% on EVERY market (band or not) until F3 is proven -- a protocol cap the
+// upgrade authority cannot exceed.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// GAP-8 on a CLAMP-ENFORCED band market (where round 2 let the UA set up to 70% on devnet):
+/// tag 99 refuses alpha 50.01% and 70% (InvalidInstruction) and accepts 50%. A record written
+/// before round 3 that already holds 70% (STATE POKE: the value the round-2 setter accepted)
+/// still validates (no read fails) but tag 103 allocates at most floor(50% * C_eff). Negative
+/// control (file copy): without `alloc_alpha_in_force_bps` the same allocate moves 7,000 (70%).
+#[test]
+fn r3_gap8_alpha_capped_at_50_on_a_band_market_until_f3_proven() {
+    use percolator_prog::growth_v19 as gv;
+    assert_eq!(gv::alloc_alpha_max_bps(true), 5_000, "F3 is not proven in this round");
+    let p = Params { band: Some(100), ..growth_params() };
+    let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+    {
+        let acc = env.svm.get_account(&env.market).unwrap();
+        let g = state::read_asset_growth(&acc.data, 0, 1_000).unwrap().expect("growth on");
+        assert_eq!(Some(g.r_gap_bps), gv::band_r_gap_bps(100), "clamp-enforced band market");
+    }
+    let admin = env.admin.insecure_clone();
+    err_has(&env.set_p2b_dials(&admin, [5_001, 3_000, 2_000, 5_000]), PercolatorError::InvalidInstruction);
+    err_has(&env.set_p2b_dials(&admin, [7_000, 3_000, 2_000, 5_000]), PercolatorError::InvalidInstruction);
+    env.set_p2b_dials(&admin, [5_000, 3_000, 2_000, 5_000]).expect("50% accepted on a band market");
+    // STATE POKE: the pre-round-3 band record at 70%.
+    {
+        let key = env.ext_key();
+        let mut acc = env.svm.get_account(&key).unwrap();
+        let mut x = state::read_vault_lp_ext(&acc.data).unwrap();
+        x.alloc_alpha_bps = 7_000;
+        state::write_vault_lp_ext(&mut acc.data, &x).unwrap();
+        env.svm.set_account(key, acc).unwrap();
+        assert_eq!(env.ext().unwrap().alloc_alpha_bps, 7_000, "a 70% record still validates");
+    }
+    let c = env.vlp().senior_claim_atoms;
+    env.allocate(lp.portfolio, u128::MAX).expect("103");
+    let a = env.allocated();
+    eprintln!("GAP-8: C {c} allocated {a}");
+    assert!(a > 0, "vacuity: something allocated");
+    assert!(a <= c / 2, "alpha in force is 50%: allocated {a} of C {c}");
+    assert_eq!(a, c / 2, "the alpha room binds (the buffer room is 70% of C here)");
+    env.assert_conserved("gap8 alpha");
+}
+
+impl Env {
+    /// Tag 63, 44 B attested form (PushAuthMarkDepth), price unchanged.
+    fn push_depth_attested(&mut self, depth_e6: u64) -> Result<(), String> {
+        let admin = self.admin.insecure_clone();
+        let px = self.market_state().1.assets[0].effective_price;
+        let seq = self.oracle_seq() + 1;
+        let (m, slot) = (self.market, self.slot);
+        self.send(
+            ProgInstruction::PushAuthMarkDepth { market_id: 1, asset_index: 0, now_slot: slot, mark_e6: px, observation_sequence: seq, depth_mode: 1, depth_e6 },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+}
+
+/// Round 3 item 7 (design GAP-13c): tag 94's bind-time guard. On a clamp-enforced band market
+/// that already has a measured depth, one minimum band leg must fit in the tier-0 depth capacity
+/// (κ0 = 0.5 x the usable depth), else the bind is refused (GrowthInvalidConfig) instead of
+/// creating a market that can never open a leg. This harness's collateral has 0 decimals, so T1
+/// = 25,000 atoms and a first reading is clamped to T1/16 = 1,562 atoms (D-I1); the minimum leg
+/// is set to 600 atoms (STATE POKE of the engine config). A 1,000-atom pool (capacity 500) is
+/// refused; a 5,000-atom pool (usable 1,562 -> capacity 781) binds. CONTROL: no depth measured
+/// yet binds.
+#[test]
+fn r3_item7_bind_guard_min_leg_fits_tier0_depth() {
+    let p = Params { band: Some(100), ..growth_params() };
+    let poke_min_leg = |env: &mut Env| {
+        let mut acc = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, g) = state::market_view_mut(&mut acc.data).unwrap();
+            g.header.config.band_min_leg_notional = percolator::V16PodU64::new(600);
+        }
+        env.svm.set_account(env.market, acc).unwrap();
+    };
+    for (depth, ok) in [(1_000u64, false), (5_000, true)] {
+        let mut env = Env::new(p);
+        poke_min_leg(&mut env);
+        let d = env.new_depositor();
+        env.earn_deposit(&d, 1_000 * U, None).expect("75 senior");
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        env.push_depth_attested(depth).expect("push 1");
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        env.push_depth_attested(depth).expect("push 2 (a fresh pair)");
+        let admin = env.admin.insecure_clone();
+        let m = env.matcher;
+        let r = env.init_vault_lp_full(&admin, 2_000, m, &[]);
+        if ok {
+            r.expect("usable 1,562 atoms: 781 of capacity fits a 600-atom leg");
+        } else {
+            err_has(&r.map(|l| l.portfolio), PercolatorError::GrowthInvalidConfig);
+            assert!(env.svm.get_account(&env.vault_lp).map(|a| a.data.is_empty()).unwrap_or(true), "the bind reverted");
+        }
+    }
+    // control: never measured -> binds
+    let mut env = Env::new(p);
+    poke_min_leg(&mut env);
+    let admin = env.admin.insecure_clone();
+    let m = env.matcher;
+    env.init_vault_lp_full(&admin, 2_000, m, &[]).expect("no depth yet: binds");
+}
+
+/// Security review F-2: the ratchet touch is BEST-EFFORT. With the growth record made invalid
+/// (flags byte 39 = 0x02, STATE POKE) the fee crank with the vault LP at [8] still harvests (Ok)
+/// and leaves the growth bytes untouched. Tag 78 reads the growth record ONLY through the touch,
+/// so this forces the touch's error path; both sites (tag 5 on the vault LP, tag 78) call the
+/// same `growth_ratchet_touch_best_effort`, so this covers the tag-5 site's code too. (Tag 5
+/// itself reads the growth record earlier, in the crank's own accrual / clamp checks, which
+/// still fail closed on a corrupt record: no state makes ONLY the tag-5 touch fail.)
+/// NEGATIVE CONTROL (file copy): with the round-3 `growth_ratchet_touch(..)?` the harvest reverts.
+#[test]
+fn f2_ratchet_touch_error_never_reverts_the_fee_crank() {
+    let p = Params { band: Some(100), growth: Some((400, 500)), fee_bps: 100, ..growth_params() };
+    let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+    let admin = env.admin.insecure_clone();
+    env.set_p2b_dials(&admin, [5_000, 3_000, 0, 0]).expect("ext");
+    let t = env.new_trader(5_000 * U);
+    env.trade_signing_fee(&t, &lp, 100 * UQ, GROWTH_FEE).expect("open");
+    env.trade_signing_fee(&t, &lp, -100 * UQ, GROWTH_FEE).expect("close");
+    let mut acc = env.svm.get_account(&env.market).unwrap();
+    let r = state::asset_growth_range(&acc.data, 0).unwrap();
+    acc.data[r.start + 39] = percolator_prog::growth_v19::GROWTH_FLAG_VOL_DATA;
+    let before = acc.data[r.clone()].to_vec();
+    env.svm.set_account(env.market, acc).unwrap();
+    assert!(state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, 1_000).is_err(), "vacuity: the record is refused");
+    let (cfg0, _) = env.market_state();
+    env.crank_fees_ext(lp.portfolio).expect("F-2: 78 with the LP succeeds despite the growth error");
+    let (cfg1, _) = env.market_state();
+    assert!(cfg1.lp_fee_withdrawn_atoms > cfg0.lp_fee_withdrawn_atoms, "the leg was harvested");
+    let after = env.svm.get_account(&env.market).unwrap().data[r].to_vec();
+    assert_eq!(after, before, "the touch wrote nothing");
+}
+
+/// Round 3 item 7 (GAP-15): tag 78 with the ext tail (vault LP at [8]) is a ratchet site. A
+/// band market (L_tier 10x, launch 5x) whose stored ceiling sits above its live target
+/// (STATE POKE: 8x stored, target = launch at tier 0) is lowered to the target AT ONCE (8x -> 5x;
+/// security review F-1 fix A) by the fee crank alone. CONTROL: the same crank without the ext tail (no LP account) does not touch it.
+#[test]
+fn r3_item7_fee_crank_is_a_ratchet_site() {
+    let p = Params { band: Some(100), growth: Some((400, 500)), fee_bps: 100, ..growth_params() };
+    for with_lp in [true, false] {
+        let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+        let admin = env.admin.insecure_clone();
+        if with_lp {
+            env.set_p2b_dials(&admin, [5_000, 3_000, 0, 0]).expect("ext");
+        }
+        let t = env.new_trader(5_000 * U);
+        env.trade_signing_fee(&t, &lp, 100 * UQ, GROWTH_FEE).expect("open");
+        env.trade_signing_fee(&t, &lp, -100 * UQ, GROWTH_FEE).expect("close");
+        {
+            let mut acc = env.svm.get_account(&env.market).unwrap();
+            let mut g = state::read_asset_growth(&acc.data, 0, 1_000).unwrap().expect("growth on");
+            assert_eq!((g.l_launch_x100, g.l_tier_x100), (500, 1_000));
+            g.ceil_x100 = 800;
+            state::write_asset_growth(&mut acc.data, 0, &g, 1_000).unwrap();
+            env.svm.set_account(env.market, acc).unwrap();
+        }
+        let r = if with_lp { env.crank_fees_ext(lp.portfolio) } else { env.crank_fees(true) };
+        r.expect("78");
+        let c = state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, 1_000).unwrap().unwrap().ceil_x100;
+        if with_lp {
+            assert_eq!(c, 500, "78 with the LP: down to the target at once");
+        } else {
+            assert_eq!(c, 800, "control: no LP account, no ratchet");
+        }
+    }
 }
