@@ -7732,8 +7732,8 @@ pub mod state {
         /// v2.2 growth overnight §1.3 (G8) + R2.1: bits 0-1 = the source of the stored
         /// `depth_e6` (0 none, 1 keeper-attested, 2 on-chain DEX pool); bit 7 = `DEPTH_EVER`
         /// (sticky: a fresh effective depth was seen once; cleared only by the I-1 reset); bit 2
-        /// `DEPTH_PREV_REAL`; bit 6 `DEPTH_DEX_PINNED` (F-3: tag 123 pin in force, mode-1 pushes
-        /// refused; preserved by every depth / graduation write, cleared only by tag 123 op 0).
+        /// `DEPTH_PREV_REAL`; bit 6 `DEPTH_DEX_PINNED` (F-3: tag 123 pin in force, mode-1 depth
+        /// ignored, the mark lands; preserved by every depth / graduation write, cleared only by tag 123 op 0).
         /// Bits 3-5 must be 0.
         pub depth_source: u8, // 44
         /// R2.1: the highest venue tier keeper-attested depth may earn (0 = protocol default 1,
@@ -28738,12 +28738,15 @@ pub mod processor {
         else {
             return Ok(());
         };
-        // v2.2 DEATH F-3 (SEC-RC L-2): a keeper-attested depth never lands on a DEX-pinned asset
-        // (fail closed: the whole push, mark included, is refused; the keeper sends mode 2, or
-        // the 35 B form when the pool is unreadable).
-        if !growth_v19::depth_push_mode_allowed(g.depth_source, depth.map(|(m, _)| m)) {
-            solana_program::log::sol_log("g8_depth_refused_attested_on_dex_pin");
-            return Err(PercolatorError::DepthSourceInvalid.into());
+        // v2.2 DEATH F-3 (SEC-RC L-2) + SEC-RC2 L-RC2-1: a keeper-attested depth never lands on a
+        // DEX-pinned asset (fail closed for DEPTH), but the push's mark still lands (fail open for
+        // the MARK: a stale or mis-shaped keeper must not freeze the price and let tag 39 resolve
+        // the market). The attested value is neither written nor read: the depth state is left
+        // exactly as it was (the last pool reading keeps its own slot, so it still goes stale after
+        // `DEPTH_MAX_AGE_SLOTS` if no mode-2 reading follows). The log line lets ops see the keeper.
+        let depth_ignored = !growth_v19::depth_push_mode_allowed(g.depth_source, depth.map(|(m, _)| m));
+        if depth_ignored {
+            solana_program::log::sol_log("g8_depth_attested_ignored_on_dex_pin");
         }
         // A mode-2 reading proves an active pin (checked by `dex_depth_reading`): record it, so a
         // pin made before the bit existed is covered from its first DEX reading on.
@@ -28780,16 +28783,18 @@ pub mod processor {
                 }
             }
         }
-        let seed = g.depth_seed_e6();
-        let unit = g.collateral_unit_atoms();
-        g.set_depth_state(growth_v19::depth_push_update(
-            g.depth_state(),
-            source,
-            depth_e6,
-            authenticated_slot,
-            seed,
-            unit,
-        ));
+        if !depth_ignored {
+            let seed = g.depth_seed_e6();
+            let unit = g.collateral_unit_atoms();
+            g.set_depth_state(growth_v19::depth_push_update(
+                g.depth_state(),
+                source,
+                depth_e6,
+                authenticated_slot,
+                seed,
+                unit,
+            ));
+        }
         let ctx = growth_g8_ctx_view(group, asset_index, &g, None)?;
         if ctx.clamp {
             let band_bps = group.header.config.band_bps.get();
@@ -38826,7 +38831,7 @@ pub mod processor {
     }
 
     /// v2.2 DEATH F-3 (SEC-RC L-2): mirror the pin into the market asset's growth record
-    /// (`DEPTH_DEX_PINNED`, byte 44 bit 6) so PushAuthMark refuses keeper-attested depth while
+    /// (`DEPTH_DEX_PINNED`, byte 44 bit 6) so PushAuthMark ignores keeper-attested depth while
     /// the pin is in force. No growth record (growth off, or an asset index past the configured
     /// slots): nothing is stored there, so nothing can be overridden; a no-op.
     #[inline(never)]
@@ -38955,7 +38960,7 @@ pub mod processor {
     ///
     /// v2.2 DEATH F-3: the market account is WRITABLE (both ops). op 1 sets `DEPTH_DEX_PINNED` in
     /// the pinned asset's growth record, op 0 clears it on the pin's own asset; while it is set
-    /// PushAuthMark refuses a keeper-attested (mode 1) depth with `DepthSourceInvalid`.
+    /// PushAuthMark ignores a keeper-attested (mode 1) depth (its mark still lands, L-RC2-1).
     #[inline(never)]
     fn handle_set_depth_source<'a>(
         program_id: &Pubkey,

@@ -1098,10 +1098,11 @@ pub const DEPTH_EVER: u8 = 0x80;
 /// Byte 44 bit 6 (v2.2 DEATH F-3 / SEC-RC L-2): the market asset's depth is PINNED to an
 /// on-chain DEX pool (tag 123 `SetDepthSource` op 1 sets it, op 0 clears it; every PushAuthMark
 /// mode-2 reading also sets it, which covers a pin made before this bit existed). While it is set
-/// a keeper-attested (mode 1) depth is REFUSED (`DepthSourceInvalid`), fail closed: an attested
-/// reading can never override or replace the pinned pool's reading. The 35 B form and mode 0
-/// (no depth: absent, the conservative direction) stay allowed. Sticky across the I-1 reset;
-/// only tag 123 op 0 clears it. Not a source: `depth_source_of` masks it out.
+/// a keeper-attested (mode 1) depth is IGNORED, fail closed for depth: an attested reading can
+/// never override or replace the pinned pool's reading. SEC-RC2 L-RC2-1: the push itself is not
+/// refused; the depth state is left untouched and the push's mark lands (fail open for the
+/// mark). The 35 B form, mode 0 and mode 2 are unchanged. Sticky across the I-1 reset; only
+/// tag 123 op 0 clears it. Not a source: `depth_source_of` masks it out.
 pub const DEPTH_DEX_PINNED: u8 = 0x40;
 
 /// Whether the asset's depth is pinned to the on-chain DEX source (`DEPTH_DEX_PINNED`).
@@ -1109,9 +1110,9 @@ pub fn depth_dex_pinned(depth_source_byte: u8) -> bool {
     depth_source_byte & DEPTH_DEX_PINNED != 0
 }
 
-/// F-3: may a PushAuthMark carrying depth `mode` (`None` = the 35 B form) land on an asset whose
-/// depth byte is `depth_source_byte`? Everything is allowed except a keeper-attested depth on a
-/// DEX-pinned asset.
+/// F-3: may the DEPTH of a PushAuthMark carrying depth `mode` (`None` = the 35 B form) be applied
+/// to an asset whose depth byte is `depth_source_byte`? Everything is applied except a
+/// keeper-attested depth on a DEX-pinned asset, which is ignored (L-RC2-1: the mark still lands).
 pub fn depth_push_mode_allowed(depth_source_byte: u8, mode: Option<u8>) -> bool {
     !(depth_dex_pinned(depth_source_byte) && mode == Some(DEPTH_MODE_ATTESTED))
 }

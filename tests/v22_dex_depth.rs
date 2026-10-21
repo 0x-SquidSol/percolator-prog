@@ -818,6 +818,27 @@ impl Env {
         vec![self.pda(), k.pool, k.base_vault, k.quote_vault]
     }
 
+    /// SEC-RC2 L-RC2-1: a mode-1 (attested) push on a DEX-pinned asset LANDS (was: refused 129
+    /// with nothing written, 4db44b69 / RC2 50a336d4). Its mark is applied (sequence consumed,
+    /// oracle target = the pushed mark), its attested depth is ignored (the depth state is
+    /// byte-identical before and after) and the pin bit is kept.
+    fn mode1_on_pin_lands_mark_ignores_depth(&mut self, depth_e6: u64, what: &str) {
+        let before = self.growth();
+        assert!(growth_v19::depth_dex_pinned(before.depth_source), "{what}: setup: pinned");
+        let seq = self.oracle_seq();
+        let profile0 = state::read_asset_oracle_profile(&self.svm.get_account(&self.market).unwrap().data, 0).unwrap();
+        let mark = if profile0.oracle_target_price_e6 == MARK + MARK / 100 { MARK + MARK / 50 } else { MARK + MARK / 100 };
+        let ix = self.push_ix(seq + 1, 1, depth_e6, mark, &[]);
+        let admin = self.admin.insecure_clone();
+        self.send_ixs(vec![ix], &[&admin]).unwrap_or_else(|e| panic!("{what}: mode 1 on a pinned asset must land (L-RC2-1): {e}"));
+        assert_eq!(self.oracle_seq(), seq + 1, "{what}: the push landed (sequence consumed)");
+        let profile = state::read_asset_oracle_profile(&self.svm.get_account(&self.market).unwrap().data, 0).unwrap();
+        assert_eq!(profile.oracle_target_price_e6, mark, "{what}: the mark landed");
+        let after = self.growth();
+        assert_eq!(after.depth_state(), before.depth_state(), "{what}: the attested depth is ignored (depth state untouched)");
+        assert!(growth_v19::depth_dex_pinned(after.depth_source), "{what}: the pin bit is kept");
+    }
+
     /// Snapshot of everything a refused push must not change.
     fn snapshot(&self) -> (u64, Vec<u8>) {
         (self.oracle_seq(), self.svm.get_account(&self.market).unwrap().data)
@@ -869,11 +890,10 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
     // top of the 35 B push (incl. the transaction's compute-budget instruction).
     eprintln!("CU mode2={cu_dex} 35B={cu_35} delta={}", cu_dex.saturating_sub(cu_35));
     assert!(cu_dex < cu_35 + 40_000, "mode 2 overhead bounded: {cu_dex} vs {cu_35}");
-    // F-3: mode 1 (keeper-attested) is refused on the pinned market; nothing is written
+    // F-3 + L-RC2-1: mode 1 (keeper-attested) on the pinned market: OLD (4db44b69 / RC2) refused
+    // 129 with nothing written; NEW the mark lands and the attested depth is ignored.
     env.warp(1);
-    let before = env.snapshot();
-    assert_err(&env.push(1, 30_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 on a DEX-pinned market");
-    assert_eq!(env.snapshot(), before, "a refused attested push writes nothing");
+    env.mode1_on_pin_lands_mark_ignores_depth(30_000_000_000, "chillhouse: mode 1 on a DEX-pinned market");
     // Coordinator ruling (merge): a REAL on-chain zero depth (mode 2, the pool's asset vault
     // emptied: STATE POKE of the token amount) is a fresh reading of 0 at once: DEPTH_EVER, every
     // reader 0 through the time-weighted window (the κ cap is 0 on a clamp-enforced market),
@@ -1274,9 +1294,10 @@ fn c_mode2_flash_liquidity_is_rate_limited() {
 
 // ── v2.2 DEATH F-3 (= SEC-RC L-2) and SEC-RC L-1 ─────────────────────────────────────────────
 
-/// F-3: a keeper-attested (mode 1) depth push is refused (129) while the market is pinned to its
-/// DEX pool, with nothing written (sequence not consumed). Before the pin and after the UA clears
-/// it, mode 1 lands as before. The 35 B form, mode 0 and mode 2 stay allowed while pinned, and
+/// F-3 + SEC-RC2 L-RC2-1: while the market is pinned to its DEX pool a keeper-attested (mode 1)
+/// push LANDS its mark but its depth is ignored (depth state byte-identical; was: the whole push
+/// refused 129 on 4db44b69 / RC2 50a336d4). Before the pin and after the UA clears it, mode 1
+/// stores an attested depth as before. The 35 B form, mode 0 and mode 2 stay allowed while pinned, and
 /// none of them drops the pin bit. On 75fca911 the mode-1 push lands and replaces the pool's
 /// reading (source 2 -> 1), which is the finding.
 #[test]
@@ -1292,17 +1313,16 @@ fn f3_attested_depth_refused_while_dex_pinned() {
     env.set_source(chill()).expect("pin");
     assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "tag 123 op 1 sets DEPTH_DEX_PINNED");
     env.warp(1);
-    let before = env.snapshot();
-    assert_err(&env.push(1, 1_000_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 right after the pin");
-    assert_eq!(env.snapshot(), before, "nothing written, sequence not consumed");
+    // OLD: refused 129, nothing written. NEW (L-RC2-1): the mark lands, the $1M lie is ignored.
+    env.mode1_on_pin_lands_mark_ignores_depth(1_000_000_000_000, "mode 1 right after the pin");
     env.push(2, 0, &dex).expect("mode 2 while pinned");
     let g = env.growth();
     assert_eq!(growth_v19::depth_source_of(g.depth_source), growth_v19::DEPTH_SOURCE_DEX);
     assert!(growth_v19::depth_dex_pinned(g.depth_source));
     env.warp(1);
-    let before = env.snapshot();
-    assert_err(&env.push(1, 1_000_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 after a DEX reading (the ncc-liedex lie)");
-    assert_eq!(env.snapshot(), before);
+    let pool = env.growth().depth_state();
+    env.mode1_on_pin_lands_mark_ignores_depth(1_000_000_000_000, "mode 1 after a DEX reading (the ncc-liedex lie)");
+    assert_eq!(env.growth().depth_state(), pool, "the pool reading stands, byte for byte");
     assert_eq!(growth_v19::depth_source_of(env.growth().depth_source), growth_v19::DEPTH_SOURCE_DEX, "the pool reading stands");
     env.push(255, 0, &[]).expect("35 B while pinned (absent: the conservative direction)");
     assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "35 B keeps the bit");
@@ -1320,7 +1340,7 @@ fn f3_attested_depth_refused_while_dex_pinned() {
     // re-pin: refused again
     env.set_source(chill()).expect("re-pin");
     env.warp(1);
-    assert_err(&env.push(1, 30_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 after a re-pin");
+    env.mode1_on_pin_lands_mark_ignores_depth(30_000_000_000, "mode 1 after a re-pin");
     // tag 123 with the market read-only is refused (it must write the bit); nothing changes
     let (ua, pda) = (env.ua.insecure_clone(), env.pda());
     let before = (env.svm.get_account(&env.market).unwrap().data, env.record());
@@ -1354,7 +1374,7 @@ fn f3_mode2_reading_sets_the_pin_bit_for_an_older_pin() {
     env.push(2, 0, &dex).expect("mode 2");
     assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "a DEX reading sets the bit");
     env.warp(1);
-    assert_err(&env.push(1, 30_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 after the first DEX reading");
+    env.mode1_on_pin_lands_mark_ignores_depth(30_000_000_000, "mode 1 after the first DEX reading");
 }
 
 /// F-3: the pure decision, every (pinned, mode) pair; and the validator accepts the bit.
@@ -1408,4 +1428,55 @@ fn l1_flags0_with_a_window_is_refused_and_window_writes_migrate() {
     assert!(growth_v19::depth_tw_layout_ok(growth_v19::GROWTH_FLAG_R3_LAYOUT, g.depth_tw()));
     assert!(!growth_v19::depth_tw_layout_ok(0, g.depth_tw()));
     assert!(growth_v19::depth_tw_layout_ok(0, growth_v19::DepthWindow { cur_tokens: 0, prev_tokens: 0, bucket_p1: 0 }));
+}
+
+/// SEC-RC2 L-RC2-1: a stale keeper that sends ONLY mode-1 pushes to a DEX-pinned market keeps the
+/// price live (every mark lands, so the stale clock never runs) while depth fails closed by age:
+/// the last pool reading keeps its own slot, so after `DEPTH_MAX_AGE_SLOTS` it is no longer fresh,
+/// and the attested values never appear anywhere. On RC2 (cc720a0e) every one of these pushes is
+/// refused 129 and the mark freezes.
+#[test]
+fn l_rc2_1_mode1_on_pin_keeps_the_mark_live_and_depth_fails_closed_by_age() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    env.set_source(chill()).expect("pin");
+    env.warp(1);
+    let dex = env.dex_accounts(chill());
+    env.push(2, 0, &dex).expect("mode 2: the pool reading");
+    let pool = env.growth().depth_state();
+    let last_pool_slot = env.slot;
+    assert_eq!(pool.depth_e6, 2_027_034_782);
+    for i in 0..4 {
+        env.warp(50);
+        env.mode1_on_pin_lands_mark_ignores_depth(1_000_000_000_000 + i, "stale keeper push");
+    }
+    let g = env.growth();
+    assert_eq!(g.depth_state(), pool, "no attested value ever stored");
+    assert!(env.slot - last_pool_slot > growth_v19::DEPTH_MAX_AGE_SLOTS, "setup: past the freshness bound");
+    assert_eq!(
+        growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot),
+        None,
+        "with no mode-2 reading the pool depth goes stale (fail closed for depth)"
+    );
+    // CONTROL: an honest mode-2 push refreshes it
+    env.push(2, 0, &dex).expect("mode 2 again");
+    let g = env.growth();
+    assert!(growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot).is_some());
+}
+
+/// SEC-RC2 L-RC2-1 control: on an UNPINNED market mode 1 is unchanged (the attested depth is
+/// stored, source 1, and the mark lands).
+#[test]
+fn l_rc2_1_unpinned_mode1_unchanged() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    env.warp(1);
+    let seq = env.oracle_seq();
+    let mark = MARK + MARK / 100;
+    let ix = env.push_ix(seq + 1, 1, 30_000_000_000, mark, &[]);
+    let admin = env.admin.insecure_clone();
+    env.send_ixs(vec![ix], &[&admin]).expect("mode 1 on an unpinned market");
+    let g = env.growth();
+    assert_eq!((g.depth_e6, growth_v19::depth_source_of(g.depth_source)), (30_000_000_000, growth_v19::DEPTH_SOURCE_ATTESTED));
+    assert!(!growth_v19::depth_dex_pinned(g.depth_source));
+    assert_eq!(state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap().oracle_target_price_e6, mark);
+    assert_eq!(env.oracle_seq(), seq + 1);
 }
