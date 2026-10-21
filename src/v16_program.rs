@@ -32065,7 +32065,8 @@ pub mod processor {
     fn execute_redemption_oi_reservation_check(
         ledger: &state::BackingDomainLedgerAccountV16,
         // E3: the pot's AVAILABLE principal the payout was priced on (non-bound: the physical
-        // attribution; bound: the ledger reading, unchanged), so the guard and the payout agree.
+        // attribution; bound: the B24 owned reading `min(principal, held)`, P3U), so the guard
+        // and the payout agree.
         available_pre: u128,
         principal_portion: u128,
         gross_consumed: u128,
@@ -32794,10 +32795,22 @@ pub mod processor {
             let bound_resolved_withdraw = bound_tail.is_some() && group.header.mode == 1;
             if registry.oi_reservation_threshold_bps != 0 && !bound_resolved_withdraw {
                 // Out of line (SBF frame): tag 77 sits at 4,032 of the 4,096-byte frame.
+                // P3U (2026-10-20): a BOUND pot's available principal is the B24 reading the
+                // payout was priced on (`min(ledger principal, held backing)`, the per-pot term
+                // of `bound_vault_nav`), NOT `principal - booked impairment`. The ledger's
+                // impairment counters book every consumed lien (incl. the vault LP's settled loss
+                // routed into the pot), so after a loss that reading fell below a payout the
+                // gates above admit and the guard's `available_pre - principal_portion`
+                // underflowed: a full senior exit got 25 for as long as the counters stood.
                 execute_redemption_oi_reservation_check(
                     &ledger,
                     if bound_tail.is_some() {
-                        backing_ledger_available_principal_atoms(&ledger)
+                        vault_lp_v18::bound_pot_available_principal(
+                            ledger.total_principal_atoms,
+                            bucket.fresh_unliened_backing_num,
+                            bucket.valid_liened_backing_num,
+                            BOUND_SCALE,
+                        )
                     } else {
                         ledger_cap
                     },
