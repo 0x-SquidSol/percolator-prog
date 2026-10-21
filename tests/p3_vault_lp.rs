@@ -5508,3 +5508,72 @@ fn r3_gap8_tag94_pins_the_cushion_on_at_bind() {
     assert_eq!(vest_on, state::ASSET_VAULT_LP_P2B_CREATOR_FEE_VESTING, "creator fees vest only at target");
 }
 
+
+// SEC-RC S16AC (Sentinel, local only): b9 with every refusal logged, to see whether the
+// S1-6 (c) wait (EngineLockActive) fires on the wrapper's winners-vs-vault-LP path, and that
+// it always clears (every winner fully paid, same payouts in every order).
+fn sec_b9_logged(order: u8) -> (Vec<u64>, usize) {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 30_000_000).expect("junior");
+    let ts: Vec<Trader> = (0..3).map(|_| env.new_trader(5_000_000)).collect();
+    for (i, t) in ts.iter().enumerate() {
+        env.svm.expire_blockhash();
+        env.trade(t, &lp, (4 + i as i128) * POS).expect("open");
+    }
+    let ports: Vec<Pubkey> = std::iter::once(lp.portfolio).chain(ts.iter().map(|t| t.portfolio)).collect();
+    env.move_price(1_200_000, &ports);
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let mut paid = vec![0u64; 3];
+    let mut lock = 0usize;
+    let seq: Vec<i8> = match order {
+        0 => vec![-1, 0, 1, 2],
+        1 => vec![2, 1, 0, -1, 2, 1, 0],
+        2 => vec![1, -1, 2, 0, 1],
+        _ => vec![0, 2, -1, 1, 0, 2],
+    };
+    let lock_code = format!("Custom({})", PercolatorError::EngineLockActive as u32);
+    for step in seq.into_iter().chain([0i8, 1, 2, -1, 0, 1, 2, -1]) {
+        if step < 0 {
+            for topup in [0u8, 1u8] {
+                if let Err(e) = env.settle_resolved(&Keypair::new(), lp.portfolio, topup, junior_dest) {
+                    let short: String = e.chars().take(120).collect();
+                    println!("order {order} settle topup {topup}: ERR {short}");
+                    if e.contains(&lock_code) { lock += 1; }
+                }
+            }
+        } else {
+            let i = step as usize;
+            let p = env.portfolio(ts[i].portfolio);
+            if p.capital == 0 && p.pnl == 0 { continue; }
+            let (r, dest) = env.stranger_close_resolved(ts[i].portfolio, ts[i].kp.pubkey());
+            if let Err(e) = &r {
+                let short: String = e.chars().take(120).collect();
+                println!("order {order} close {i}: ERR {short}");
+                if e.contains(&lock_code) { lock += 1; }
+            }
+            paid[i] += env.tok(dest);
+        }
+    }
+    for (i, t) in ts.iter().enumerate() {
+        let p = env.portfolio(t.portfolio);
+        assert!(p.capital == 0 && p.pnl == 0, "order {order}: winner {i} not fully paid");
+    }
+    env.paid_out += paid.iter().map(|x| *x as u128).sum::<u128>();
+    env.assert_conserved("sec b9");
+    (paid, lock)
+}
+
+#[test]
+fn sec_s16ac_b9_winners_vs_vault_lp_logged() {
+    let (base, _) = sec_b9_logged(0);
+    for order in 0..4 {
+        let (p, lock) = sec_b9_logged(order);
+        println!("SEC-S16AC b9 order {order}: paid {p:?}, LockActive refusals {lock}");
+        assert_eq!(p, base, "payouts independent of order");
+    }
+}
