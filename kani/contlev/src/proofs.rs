@@ -621,32 +621,36 @@ fn kani_contlev_n_cap_q_monotone_lemma() {
 // (Here, not in kani/p3: that crate compiles vault_lp_v18.rs alone and no longer builds since
 // vault_lp_v18 reads growth_v19; this crate compiles both production files.)
 
-/// `vault_lp_v18::bound_pot_available_principal(principal, fresh, valid, BOUND_SCALE)` never
-/// falls below a payout principal the redemption's gates admit (`pp <= principal`,
+/// `vault_lp_v18::bound_pot_available_principal(principal, fresh, valid, scale)` never falls
+/// below a payout principal the redemption's gates admit (`pp <= principal`,
 /// `pp * scale <= fresh`), so the guard's `available - pp` cannot underflow; and it never exceeds
-/// the ledger principal or the held backing (it does not overstate the pot). Production scale
-/// (engine `BOUND_SCALE` = 1e12). BOUNDED: u64 principal / pp / valid / fresh surplus.
+/// the ledger principal or the held backing (it does not overstate the pot).
+/// BOUNDED and scale-generic: u8 inputs and a symbolic u8 `scale >= 1` (the kani/p3 `b()` bound for
+/// harnesses that multiply a symbolic value back up against a floor division). Earlier designs
+/// gave NO verdict and were killed: production scale 1e12 with u64 inputs (z3, one query 13.6 h /
+/// 800 CPU-min) and u16 inputs with a symbolic u16 scale (cadical, 60 min); P3U.md section 7.
 #[kani::proof]
-#[kani::solver(z3)]
+#[kani::solver(cadical)]
 fn kani_p3u_bound_pot_available_covers_gated_payout() {
     use crate::vault_lp_v18::bound_pot_available_principal;
-    const SCALE: u128 = 1_000_000_000_000;
-    let principal = kani::any::<u64>() as u128;
-    let pp = kani::any::<u64>() as u128;
-    let fresh_extra = kani::any::<u64>() as u128;
-    let valid = kani::any::<u64>() as u128;
+    let principal = kani::any::<u8>() as u128;
+    let pp = kani::any::<u8>() as u128;
+    let fresh_extra = kani::any::<u8>() as u128;
+    let valid = kani::any::<u8>() as u128;
+    let scale = kani::any::<u8>() as u128;
+    kani::assume(scale >= 1);
     kani::assume(pp <= principal);
     // the gate: the pot's fresh idle backing covers the payout principal (in num)
-    let fresh = pp * SCALE + fresh_extra;
-    let a = bound_pot_available_principal(principal, fresh, valid, SCALE);
-    let held = (fresh + valid) / SCALE;
+    let fresh = pp * scale + fresh_extra;
+    let a = bound_pot_available_principal(principal, fresh, valid, scale);
+    let held = (fresh + valid) / scale;
     assert!(a >= pp);
     assert!(a <= principal);
     assert!(a <= held);
     assert!(a == principal || a == held);
     kani::cover!(principal < held && pp > 0, "ledger principal binds");
     kani::cover!(held < principal && pp > 0, "held backing binds");
-    kani::cover!(a == pp && pp > 0, "tight: a full exit of the pot");
+    kani::cover!(a == pp && pp > 0 && scale > 1, "tight: a full exit of the pot");
     // scale 0 answers 0, never a division by zero
     assert!(bound_pot_available_principal(principal, fresh, valid, 0) == 0);
 }
