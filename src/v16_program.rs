@@ -31090,12 +31090,15 @@ pub mod processor {
                 // => 85, fail closed). A deposit never prices against it: the draw must run
                 // first (pass the vault LP writable, or crank it).
                 let c_eff = vault_lp_live_pricing_claim(&group, lp_ai, c_eff, nav)?;
+                // Both lag bounds from the same CURRENT certificate the undrawn check just
+                // required (same predicate, so this adds no new 85 case).
+                let (worse, better) =
+                    with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(&group, h))?;
                 // P3 fairness: an ENTRY is priced as if the pending oracle target were already the
                 // effective price whenever that is better for the vault LP: the recovery it would
                 // realise restores C seniors-first (`vault_lp_recover`, the booking rule) before
                 // the newcomer's shares are minted, so nobody buys in ahead of it.
                 let c_eff = if st.senior_draw_outstanding_atoms != 0 {
-                    let better = with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(&group, h))?.1;
                     let v_better = nav
                         .checked_add(better.max(0) as u128)
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
@@ -31120,18 +31123,26 @@ pub mod processor {
                 // Phase 4 item 6: the vault value seniors price against is net of the G9
                 // backstop receivable (senior to them in recovery).
                 let backstop = st.backstop_outstanding_atoms as u128;
-                if nav < c_eff.saturating_add(backstop) {
-                    // Backing alone does not cover the senior: the LP must be valued, and new
-                    // money is refused outright if the senior is impaired (tag 112 rescues).
-                    let lp_value =
-                        with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?;
-                    let v = nav
-                        .checked_add(lp_value)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                    let v = crate::p4_rescue_ins::vault_value_net_of_backstop(v, backstop);
-                    if vault_lp_v18::senior_impaired(v, c_eff) {
-                        return Err(PercolatorError::VaultLpSeniorImpaired.into());
-                    }
+                // #570 (entry-side mirror of E-1): value the vault at the price WORSE for it,
+                // ALWAYS (no `nav >= C` shortcut: the pending loss can exceed the junior cushion
+                // while backing alone still covers C), the same `vault_value_worse` tag 108
+                // gates on, net of the backstop as tag 77 prices. New money is refused outright
+                // if the senior is impaired at that price (tag 112 rescues); an admitted entry
+                // still mints at par (`c_eff`). With no lagging leg the bounds collapse to the
+                // certified equity (flat LP: its conservative equity, the reading tag 77 already
+                // pays on), so with inventory this is the old `nav + lp_value - backstop < c_eff`
+                // check.
+                let lp_value = if worse >= 0 {
+                    with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?
+                } else {
+                    0
+                };
+                let v = crate::p4_rescue_ins::vault_value_net_of_backstop(
+                    bond_v20::vault_value_worse(nav, lp_value, worse),
+                    backstop,
+                );
+                if vault_lp_v18::senior_impaired(v, c_eff) {
+                    return Err(PercolatorError::VaultLpSeniorImpaired.into());
                 }
                 vault_lp_v18::senior_shares_for_deposit(
                     amount,

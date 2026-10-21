@@ -731,4 +731,53 @@ mod tests {
             }
         }
     }
+
+    /// #570: the tag-75 gate (`senior_impaired(vault_value_worse - backstop, C)`) refuses exactly
+    /// when a tag-77 exit (`live_exit_senior_value_net_backstop`) in the same state pays below
+    /// par. Over a grid of states: admitted <=> exit value >= C; an admitted entry minted at par
+    /// redeems at par in the same state, a refused one would have redeemed strictly below par.
+    #[test]
+    fn i570_entry_gate_iff_exit_pays_par() {
+        let navs = [0u128, 1, 499, 500, 1_000, 1_200, 1_500, 2_000, u128::MAX - 1];
+        let lpvs = [0u128, 1, 300, 1_000, 5_000];
+        let worses = [i128::MIN + 1, -2_000, -500, -1, 0, 1, 300, 1_000, 5_000];
+        let backstops = [0u128, 1, 200, 1_000];
+        let claims = [1u128, 999, 1_000, 1_500, 10_000];
+        let mut admitted_n = 0;
+        let mut refused_n = 0;
+        for &nav in &navs {
+            for &lpv in &lpvs {
+                for &worse in &worses {
+                    for &b in &backstops {
+                        for &c in &claims {
+                            let exit = live_exit_senior_value_net_backstop(c, nav, lpv, worse, b);
+                            // The tag-75 gate: the uncapped worse-price value, net of the backstop, covers C.
+                            let uncapped = vault_value_net_of_backstop(
+                                crate::bond_v20::vault_value_worse(nav, lpv, worse),
+                                b,
+                            );
+                            let admitted = !crate::vault_lp_v18::senior_impaired(uncapped, c);
+                            assert_eq!(admitted, exit >= c, "75 gate == 77 pays par {nav} {lpv} {worse} {b} {c}");
+                            // Par mint (S == C), then a 77 in the same state.
+                            let amount = c.min(7);
+                            let minted =
+                                crate::vault_lp_v18::senior_shares_for_deposit(amount, c, c).unwrap();
+                            assert_eq!(minted, amount, "par mint");
+                            let paid = crate::vault_lp_v18::senior_atoms_for_redemption(minted, c, exit)
+                                .unwrap();
+                            if admitted {
+                                assert_eq!(exit, c, "capped at C");
+                                assert_eq!(paid, amount, "admitted => exit pays par {nav} {lpv} {worse} {b} {c}");
+                                admitted_n += 1;
+                            } else {
+                                assert!(paid < amount, "refused => exit below par {nav} {lpv} {worse} {b} {c}");
+                                refused_n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(admitted_n > 100 && refused_n > 100, "grid vacuity {admitted_n} {refused_n}");
+    }
 }

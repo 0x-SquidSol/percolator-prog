@@ -5972,3 +5972,122 @@ fn sec_s16ac_b9_winners_vs_vault_lp_logged() {
         assert_eq!(p, base, "payouts independent of order");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Issue #570: tag 75 prices a senior ENTRY at the price WORSE for the vault (the E-1 rule tag
+// 77 already exits on), so nobody is admitted at par into a vault whose exit is below par.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/// One PushAuthMark to `target` at a fresh slot, then one crank per listed portfolio.
+fn i570_push_once(env: &mut Env, target: u64, crank: &[Pubkey]) {
+    env.slot += 1;
+    env.svm.warp_to_slot(env.slot);
+    let admin = env.admin.insecure_clone();
+    let seq = env.oracle_seq() + 1;
+    let (m, slot) = (env.market, env.slot);
+    env.send(
+        ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: slot, mark_e6: target, observation_sequence: seq },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    )
+    .expect("push");
+    for p in crank {
+        env.crank(*p).expect("crank");
+    }
+    let (_, g) = env.market_state();
+    assert_ne!(g.assets[0].raw_oracle_target_price, g.assets[0].effective_price, "the mark lags");
+}
+
+/// Seniors 10,000, junior `junior`, `allocate` of senior capital moved to the vault LP, the LP
+/// short 6,000 units at $1 on a 1%/slot-cap market; ONE push to `target` and one crank each.
+fn i570_lag_world(junior: u64, allocate: bool, target: u64) -> (Env, Lp, Depositor, Trader) {
+    let (mut env, lp, d1) = p2b_world(Params { move_bps: 100, ..Params::default() }, 10_000, junior);
+    if allocate {
+        env.allocate(lp.portfolio, u128::MAX).expect("103 allocate");
+        assert_eq!(env.allocated(), 5_000 * U as u128);
+    }
+    let t = env.new_trader(1_000 * U);
+    env.trade(&t, &lp, 3_000 * UQ).expect("open 1");
+    env.svm.expire_blockhash();
+    env.trade(&t, &lp, 3_000 * UQ).expect("open 2");
+    i570_push_once(&mut env, target, &[t.portfolio, lp.portfolio]);
+    (env, lp, d1, t)
+}
+
+/// Adverse lag past the junior cushion ($1.50: pending loss 3,000 > junior 2,000; nav < C): the
+/// exit pays below par, so the entry is refused (74) during the lag, and still after catch-up
+/// (no new information arrives: the target was already published).
+#[test]
+fn i570_entry_refused_while_exit_prices_below_par_under_adverse_lag() {
+    let (mut env, lp, d1, t) = i570_lag_world(2_000, true, 1_500_000);
+    env.earn_request(&d1, 1_000 * U as u128);
+    let paid = env.earn_execute(&d1, Some(lp.portfolio)).expect("77 during lag");
+    assert!(paid < 1_000 * U, "exit is priced below par at the pending price: {paid}");
+    // Liveness accounting: with inventory and a certificate the exit just made stale, 75 was
+    // ALREADY 85 (`vault_lp_live_pricing_claim`); the worse-price read adds no requirement.
+    let d2 = env.new_depositor();
+    err_has(&env.earn_deposit(&d2, 1_000 * U, Some(lp.portfolio)), PercolatorError::VaultLpValuationStale);
+    env.crank(lp.portfolio).expect("re-crank lp");
+    let (nav, _, c) = env.p2b_v(lp.portfolio);
+    assert!(nav < c, "nav {nav} < C {c}: the LP must be valued");
+    err_has(&env.earn_deposit(&d2, 1_000 * U, Some(lp.portfolio)), PercolatorError::VaultLpSeniorImpaired);
+    assert_eq!(env.lp_shares(&d2), 0, "nothing minted");
+    env.move_price(1_500_000, &[t.portfolio, lp.portfolio]);
+    err_has(&env.earn_deposit(&d2, 1_000 * U, Some(lp.portfolio)), PercolatorError::VaultLpSeniorImpaired);
+    env.assert_conserved("i570 adverse lag entry");
+}
+
+/// nav >= C is NOT a shortcut: with no allocation the pots alone cover C, but a pending loss
+/// that exceeds the vault LP's equity (junior 8,000, short 6,000 units, target $2.50) is a
+/// deficit the pots will fund, so the exit pays below par and the entry is refused (74).
+#[test]
+fn i570_entry_refused_when_pots_cover_c_but_worse_price_deficit_does_not() {
+    let (mut env, lp, d1, _t) = i570_lag_world(8_000, false, 2_500_000);
+    let (nav, _, c) = env.p2b_v(lp.portfolio);
+    assert!(nav >= c, "nav {nav} >= C {c}: the pots alone cover the senior");
+    env.earn_request(&d1, 1_000 * U as u128);
+    let paid = env.earn_execute(&d1, Some(lp.portfolio)).expect("77 during lag");
+    assert!(paid < 1_000 * U, "exit is priced below par at the pending price: {paid}");
+    let _ = env.crank(lp.portfolio);
+    let d2 = env.new_depositor();
+    err_has(&env.earn_deposit(&d2, 1_000 * U, Some(lp.portfolio)), PercolatorError::VaultLpSeniorImpaired);
+    env.assert_conserved("i570 nav>=C worse deficit");
+}
+
+/// Positive controls, each admitted at par and exiting at par during the lag: a FAVOURABLE lag
+/// ($0.50, the short LP is winning), an adverse lag inside the junior cushion ($1.10, pending
+/// loss 600 < junior 2,000), and an adverse lag on a vault whose pots cover C with the LP's
+/// equity still positive at the worse price ($1.50 against junior 8,000, no allocation).
+#[test]
+fn i570_favourable_or_covered_lag_still_admits_at_par() {
+    for (junior, allocate, target, what) in [
+        (2_000u64, true, 500_000u64, "favourable $0.50"),
+        (2_000, true, 1_100_000, "cushioned $1.10"),
+        (8_000, false, 1_500_000, "pots cover C, LP equity positive at the worse price"),
+    ] {
+        let (mut env, lp, _d1, _t) = i570_lag_world(junior, allocate, target);
+        let d2 = env.new_depositor();
+        env.earn_deposit(&d2, 1_000 * U, Some(lp.portfolio)).unwrap_or_else(|e| panic!("{what}: 75 refused: {e}"));
+        assert_eq!(env.lp_shares(&d2), 1_000 * U as u128, "{what}: minted at par");
+        let _ = env.crank(lp.portfolio);
+        env.earn_request(&d2, 1_000 * U as u128);
+        let paid = env.earn_execute(&d2, Some(lp.portfolio)).expect("77");
+        assert_eq!(paid, 1_000 * U, "{what}: exits at par during the lag");
+        env.assert_conserved(what);
+    }
+}
+
+/// Liveness: an EXPOSED vault LP whose mark has fully caught up (no pending target) takes a
+/// senior deposit at par with NO LP crank in the transaction, exactly as before the fix.
+#[test]
+fn i570_exposed_unlagged_lp_deposits_without_a_crank() {
+    let (mut env, lp, _d1, t) = i570_lag_world(2_000, true, 1_100_000);
+    env.move_price(1_100_000, &[t.portfolio, lp.portfolio]);
+    let (_, g) = env.market_state();
+    assert_eq!(g.assets[0].raw_oracle_target_price, g.assets[0].effective_price, "no lag");
+    assert!(g.assets[0].oi_eff_short_q != 0, "and the vault LP is exposed");
+    let d2 = env.new_depositor();
+    env.earn_deposit(&d2, 1_000 * U, Some(lp.portfolio)).expect("75 with no crank in the tx");
+    assert_eq!(env.lp_shares(&d2), 1_000 * U as u128, "minted at par");
+    env.assert_conserved("i570 unlagged liveness");
+}
