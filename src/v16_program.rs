@@ -32759,8 +32759,13 @@ pub mod processor {
                 }
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            // Earnings availability gate: earnings pool must cover the LP's earnings slice.
-            if earnings_portion > bucket.utilization_fee_earnings {
+            // Earnings availability gate: the pot must hold the GROSS chunk this exit consumes
+            // (`gross_consumed >= earnings_portion`; the decrements below take `gross_consumed`
+            // from the bucket, `backing_provider_earnings_total` and the ledger watermark).
+            // P3U-E1 (SEC-RC §P3U, 2026-10-21): gating on the LP slice let an exit with
+            // `earnings_portion <= pot earnings < gross_consumed` reach the checked decrement ->
+            // 25. Checked after the sibling earnings top-up (non-bound), as before.
+            if gross_consumed > bucket.utilization_fee_earnings {
                 if bound_live {
                     return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
                 }
