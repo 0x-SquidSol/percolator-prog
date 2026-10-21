@@ -2971,7 +2971,7 @@ pub fn p3_legacy_bind() -> bool {
 
 /// CANONICAL_VAULT_LP_MATCHER_PROGRAM (devnet) at 07a1d0eb — the live matcher id.
 pub fn p3_canonical_matcher() -> Pubkey {
-    "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse().unwrap()
+    percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM
 }
 
 pub fn p3_mode() -> bool {

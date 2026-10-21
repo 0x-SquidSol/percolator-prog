@@ -36,7 +36,10 @@ const DEAD: u128 = 1_000;
 fn p3_so() -> std::path::PathBuf {
     std::env::var_os("INDEP_WRAPPER_SO")
         .map(Into::into)
-        .unwrap_or_else(|| format!("{}/wt-indep/p3-so/current.so", std::env::var("HOME").unwrap()).into())
+        // v2.2 (security review, "fixture skew"): default to THIS tree's SBF build. The old
+        // default, a pinned prebuilt ~/wt-indep/p3-so/current.so, was a v2.1 program that
+        // correctly refuses the v2.2-sized market account this harness creates.
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/deploy/percolator_prog.so"))
 }
 
 struct P3 {
@@ -104,7 +107,7 @@ impl P3 {
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);

@@ -22,7 +22,7 @@ use solana_sdk::{
 
 // ───────────── copied harness (earn_drain_replay.rs @ b871b8a6) : begin ─────────────
 
-const CANONICAL_MATCHER: &str = "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam";
+const CANONICAL_MATCHER: Pubkey = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
 
 /// Live market + LP + Earn + trade parameters, all decoded from the market's own transactions.
 #[derive(Clone)]
@@ -145,7 +145,7 @@ fn walk_only(r: &mut Replay, target: u64, who: &[Pubkey]) {
 impl Replay {
     fn new(lm: LiveMarket) -> Self {
         let mut env = V16CuEnv::new_with_init_params(lm.params);
-        let matcher: Pubkey = CANONICAL_MATCHER.parse().unwrap();
+        let matcher: Pubkey = CANONICAL_MATCHER;
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
