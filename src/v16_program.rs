@@ -16416,6 +16416,10 @@ pub mod processor {
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
             || maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS
+            // Liveness Q4 (decision 2026-10-22): config is immutable after init and the
+            // LV-E2..E4 liquidation-totality proofs assume `min_nonzero_mm_req` is a
+            // representable notional. Cap it at the engine's account-notional ceiling.
+            || min_nonzero_mm_req > percolator::MAX_ACCOUNT_NOTIONAL
         {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }

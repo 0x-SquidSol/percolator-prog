@@ -7229,6 +7229,57 @@ fn v16_wrapper_init_and_account_meta_guards_fail_before_mutation() {
     assert_eq!(portfolio.data, before_portfolio);
 }
 
+/// Liveness Q4 (decision 2026-10-22): `min_nonzero_mm_req` is capped at the engine's
+/// `MAX_ACCOUNT_NOTIONAL` at InitMarket. Config is immutable after init and the LV-E2..E4
+/// totality proofs assume the bound. A floor above it is refused with `EngineInvalidConfig`
+/// and leaves the market untouched; the cap itself is still accepted.
+#[test]
+fn v16_wrapper_init_market_caps_min_nonzero_mm_req_at_max_account_notional() {
+    let cap = percolator::MAX_ACCOUNT_NOTIONAL;
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut mint = mint_account();
+    let before = market.data.clone();
+
+    let above = run_ix(
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                min_nonzero_mm_req,
+                min_nonzero_im_req,
+                ..
+            } = ix
+            {
+                *min_nonzero_mm_req = cap + 1;
+                *min_nonzero_im_req = cap + 2;
+            }
+        }),
+        &mut [&mut admin, &mut market, &mut mint],
+    );
+    assert_eq!(
+        above,
+        Err(percolator_prog::error::PercolatorError::EngineInvalidConfig.into()),
+        "a min_nonzero_mm_req above MAX_ACCOUNT_NOTIONAL must be refused as EngineInvalidConfig"
+    );
+    assert_eq!(market.data, before, "a refused InitMarket must not mutate the market");
+
+    // Boundary: exactly the cap is not refused by the new check (control that the check is `>`).
+    let at_cap = run_ix(
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                min_nonzero_mm_req,
+                min_nonzero_im_req,
+                ..
+            } = ix
+            {
+                *min_nonzero_mm_req = cap;
+                *min_nonzero_im_req = cap + 1;
+            }
+        }),
+        &mut [&mut admin, &mut market, &mut mint],
+    );
+    assert_eq!(at_cap, Ok(()), "min_nonzero_mm_req == MAX_ACCOUNT_NOTIONAL stays valid");
+}
+
 #[test]
 fn v16_wrapper_init_market_rejects_invalid_engine_params_without_mutation() {
     let mut admin = signer();
