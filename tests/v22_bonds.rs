@@ -3335,3 +3335,156 @@ fn r3_item7_fee_crank_is_a_ratchet_site() {
         }
     }
 }
+
+// ── GH#561: the G9 backstop receivable vs the bond tranche ───────────────────────────────────
+//
+// `VaultLpStateV18::backstop_outstanding_atoms` is insurance that G9 (tag 111) lent to the bound
+// vault LP. Its field doc makes it senior to the Earn seniors and the junior, and bonds sit
+// BETWEEN those two (`bond_v20.rs:7-8`), so it is senior to the bonds. Tags 97 / 98 / 102 add it
+// to their halt argument and every senior/junior valuation nets it off; the bond paths do neither,
+// which GH#561 fixes.
+//
+// READ THIS BEFORE TRUSTING THESE TESTS. They pass with AND without that fix, and that is not an
+// oversight: on the deployed bytes a bond exit with an outstanding backstop is already refused by
+// a SECOND-ORDER route. The backstop is netted off the LP's VALUE (`v16_program.rs:30519`,
+// `:34420`), so while it is outstanding the LP prices below its senior claim;
+// `vault_lp_draw_then_book` (called at `:41219`, before the halt) therefore re-books a senior draw
+// via `vault_lp_physical_draw` (`:34625`), and that re-arms the pre-existing
+// `senior_draw_outstanding` halt which bonds DO respect. Measured across 13 configurations,
+// including a 1-atom backstop against a junior cushion 20x the senior claim.
+//
+// So these are PROPERTY tests, not regression tests for the fix: they pin "an outstanding backstop
+// must not let bond value out", which currently holds by arithmetic coincidence in an unrelated
+// helper rather than by an explicit guard. If anyone changes how LP value is computed, the
+// second-order route stops firing and these tests are what catches the resulting hole.
+//
+// UPDATE (landing on feat/v22-rc2-2026-10-21): that has ALREADY happened on the RC2 line. Against
+// the RC2 base canonical .so (50a336d4, sha cc720a0e) both tests below FAIL: tag 110 pays 400
+// tokens at par with a 50-token backstop outstanding, and tag 108 admits a deposit. The line numbers
+// above are from aca02ba6. So on RC2 these are true REGRESSION tests for the netting and halts
+// added here, not only property tests.
+//
+// The backstop is set directly rather than driven through tag 111, the way `poke_senior_claim`
+// sets up a senior claim: reaching `backstop_due` needs an exhausted-pot senior draw this suite's
+// world does not build. The G9 flow itself is covered in `p4_wave_d.rs`.
+
+/// Set an outstanding G9 backstop CONSISTENTLY: the vault-LP state field AND the asset's fill-time
+/// halt mirror, which tag 111 keeps in lockstep (`v16_program.rs:38819-38820`). Setting only the
+/// state field leaves the mirror stale, and that mismatch alone books a draw — so a test built on
+/// it refuses for a reason unrelated to the subject under test.
+fn poke_backstop_consistent(env: &mut Env, b: u64) {
+    let mut acct = env.svm.get_account(&env.vault_lp).unwrap();
+    let mut st = state::read_vault_lp_state(&acct.data).unwrap();
+    st.backstop_outstanding_atoms = b;
+    let mirror = st.senior_draw_outstanding_atoms.saturating_add(b as u128);
+    state::write_vault_lp_state(&mut acct.data, &st).unwrap();
+    env.svm.set_account(env.vault_lp, acct).unwrap();
+
+    let mut m = env.svm.get_account(&env.market).unwrap();
+    {
+        let (_cfg, mut g) = state::market_view_mut(&mut m.data).unwrap();
+        let mut rec =
+            state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap();
+        rec.outstanding_mirror_atoms = mirror;
+        state::asset_vault_lp_draw_to_wrapper_bytes(&mut g.markets[0].wrapper[..], &rec).unwrap();
+    }
+    env.svm.set_account(env.market, m).unwrap();
+}
+
+/// Tag 110: no bond value leaves while a backstop is outstanding, and the exit pays par again once
+/// it is repaid. The second assertion is the one that makes the first meaningful — it shows the
+/// refusal is caused by the receivable and not by a broken world.
+#[test]
+fn gh561_no_bond_value_leaves_while_a_backstop_is_outstanding() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 2_000, 1_000, 0);
+    let all = [lp.portfolio];
+    env.bond_request(&h, 400 * U as u128).expect("109");
+    env.wait_cooldown(&all);
+
+    poke_backstop_consistent(&mut env, 50 * U);
+    err_has(
+        &env.bond_execute(&h, lp.portfolio, 0),
+        PercolatorError::VaultLpPausedForSeniorDraw,
+    );
+
+    poke_backstop_consistent(&mut env, 0);
+    let paid = env
+        .bond_execute(&h, lp.portfolio, 400 * U)
+        .expect("110 once nothing is owed to insurance");
+    assert_eq!(paid, 400 * U, "par once the backstop is repaid");
+    env.assert_conserved("gh561 exit");
+}
+
+/// Tag 108: no new bond is admitted while a backstop is outstanding — the tranche is impaired once
+/// the receivable is netted, so admitting at par would harm the depositor.
+#[test]
+fn gh561_no_bond_is_admitted_while_a_backstop_is_outstanding() {
+    let (mut env, lp, _d, _h) = bond_world(Params::default(), 10_000, 2_000, 0, 0);
+    let h = env.new_bond_holder();
+
+    poke_backstop_consistent(&mut env, 50 * U);
+    err_has(
+        &env.bond_deposit(&h, lp.portfolio, 100 * U, 1),
+        PercolatorError::VaultLpPausedForSeniorDraw,
+    );
+
+    poke_backstop_consistent(&mut env, 0);
+    env.bond_deposit(&h, lp.portfolio, 100 * U, 1)
+        .expect("108 once the backstop is repaid");
+    env.assert_conserved("gh561 deposit");
+}
+
+/// GH#561 review correction (REGRESSION, Resolved): the backstop halt on tag 110 is LIVE-only,
+/// exactly as tag 102's. In Resolved every vault-LP payout repays the backstop first at tag 101
+/// and whatever is never repaid stays a realised insurance loss that "blocks nothing in Resolved"
+/// (tag 101). A residual receivable left after the LP's terminal payout (STATE POKE: 1 token, the
+/// shape of a payout that fell short) must not lock the bond holders out of the pots.
+/// NEGATIVE CONTROL: with the halt counting the backstop in both modes (the #562 head as
+/// submitted) this exit is refused `VaultLpPausedForSeniorDraw` (89).
+#[test]
+fn gh561_resolved_bond_exit_is_not_halted_by_an_unrepaid_backstop() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 0);
+    let admin = env.admin.insecure_clone();
+    env.bond_request(&h, 2_000 * U as u128).expect("109");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    poke_backstop_consistent(&mut env, U);
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    let paid_b = env
+        .bond_execute(&h, lp.portfolio, 2_000 * U)
+        .expect("110 Resolved is not halted by a residual backstop");
+    assert_eq!(paid_b, 2_000 * U, "bonds whole from the pots");
+    let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
+    assert_eq!(st.backstop_outstanding_atoms, U, "vacuity: the receivable was outstanding during the exit");
+}
+
+/// GH#561 review (Resolved PRICING pin): the Resolved bond payout is NOT netted by a residual
+/// backstop. In Resolved, tag 101 repays the backstop first and anything left is a realised
+/// insurance loss; `bond_withdraw_resolved_core` prices on `resolved_bond_value(physical, C, C_b)`
+/// with no backstop term (the #562 netting sits only in `bond_withdraw_live_core`). The residual
+/// here (3,500) exceeds the junior cushion (physical 15,000 - C 10,000 - C_b 2,000 = 3,000), so a
+/// netted price would be min(C_b, 15,000 - 3,500 - 10,000) = 1,500, not par.
+/// NEGATIVE CONTROL (mutant build: `physical` netted by the backstop in the Resolved core): pays
+/// 1,500 and this test fails.
+#[test]
+fn gh561_resolved_bond_payout_is_not_netted_by_a_residual_backstop() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 0);
+    let admin = env.admin.insecure_clone();
+    env.bond_request(&h, 2_000 * U as u128).expect("109");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    poke_backstop_consistent(&mut env, 3_500 * U);
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    let paid_b = env.bond_execute(&h, lp.portfolio, 0).expect("110 Resolved");
+    assert_eq!(paid_b, 2_000 * U, "Resolved bonds priced on the un-netted tranche value (par)");
+    let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
+    assert_eq!(st.backstop_outstanding_atoms, 3_500 * U, "vacuity: the residual exceeded the junior cushion during the exit");
+}

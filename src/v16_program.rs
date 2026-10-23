@@ -34055,7 +34055,17 @@ pub mod processor {
             .checked_add(harvestable)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         let lp_pos = if lp_equity > 0 { lp_equity as u128 } else { 0 };
-        let v = bond_v20::vault_value_worse(nav_h, lp_pos, lp_equity).saturating_sub(available);
+        // GH#561: net the G9 backstop receivable off the vault value, as every senior and
+        // junior valuation does. Without it the M-1 coupon gate
+        // (`bond_v20::coupon_gate_open`, which requires `bond_value >= C_b`) can read a
+        // tranche as whole while an outstanding backstop senior to it makes it impaired,
+        // and pay a coupon off the top of a fee leg that belongs to the junior cushion and
+        // the Earn seniors.
+        let v = crate::p4_rescue_ins::vault_value_net_of_backstop(
+            bond_v20::vault_value_worse(nav_h, lp_pos, lp_equity),
+            st.backstop_outstanding_atoms as u128,
+        )
+        .saturating_sub(available);
         Ok(bond_v20::tranche_split3(v, c_eff, bond_claim).bond)
     }
 
@@ -39413,13 +39423,31 @@ pub mod processor {
                         u.g9_epoch_drawn_atoms,
                         crate::p4_rescue_ins::G9_EPOCH_CAP_BPS,
                     ));
+                    // GH#566: everything above is a PROTOCOL cap — the cumulative licence, the
+                    // senior-drawn room, the per-epoch cap. A draw clamped by one of those has been
+                    // honoured as far as the protocol permits, so it consumes the proposal, exactly
+                    // as before (pinned by `w2_g9_two_step_window_and_epoch_cap`).
+                    //
+                    // `max_amount` is different: it is caller-supplied instruction data, and tag 111
+                    // is permissionless. Consuming the proposal for a short-changed draw let anyone
+                    // spend an executable proposal on one atom and send the recapitalisation back to
+                    // a fresh PROPOSE plus another G9_DELAY_SLOTS — deniable indefinitely at one
+                    // transaction per window, while the one atom left outstanding keeps
+                    // `vault_lp_halt_mirror` armed (and mode-1 RESTORE cannot repay it while the LP
+                    // is in deficit, because `backstop_restore_equity_room` is 0 there).
+                    //
+                    // So the caller's cap now only limits how much moves; it does not spend the
+                    // proposal. A full draw still does.
+                    let uncapped_amt = amt;
                     if max_amount != 0 {
                         amt = amt.min(max_amount);
                     }
                     if amt == 0 {
                         return Err(PercolatorError::InsuranceBackstopRefused.into());
                     }
-                    u.g9_pending_slot = 0;
+                    if amt == uncapped_amt {
+                        u.g9_pending_slot = 0;
+                    }
                     u.g9_epoch_drawn_atoms = u
                         .g9_epoch_drawn_atoms
                         .checked_add(amt)
@@ -41697,7 +41725,10 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
-        if st.senior_draw_outstanding_atoms != 0 {
+        // GH#561: as on tag 110, an outstanding G9 backstop is senior to the bonds, so a
+        // new bond deposit must not be admitted while one is outstanding -- the tranche is
+        // impaired once the receivable is netted off the vault value.
+        if st.senior_draw_outstanding_atoms != 0 || st.backstop_outstanding_atoms != 0 {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
         let minted = bond_deposit_core(
@@ -41828,10 +41859,20 @@ pub mod processor {
         let lp_value = vault_lp_value_atoms(&group, lp.header)?;
         let worse = vault_lp_equity_lag_bounds_ro(&group, lp.header)?.0;
         let c_eff = st.senior_claim_atoms;
-        let v = nav
-            .checked_add(lp_value)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let v_worse = bond_v20::vault_value_worse(nav, lp_value, worse);
+        // GH#561: both value bases are net of the G9 backstop receivable, which is senior
+        // to the bonds. Defence in depth: the gate at the tag-108 entry already refuses
+        // while one is outstanding, so these two are correct-by-construction if that gate
+        // is ever relaxed to allow deposits during a backstop.
+        let backstop = st.backstop_outstanding_atoms as u128;
+        let v = crate::p4_rescue_ins::vault_value_net_of_backstop(
+            nav.checked_add(lp_value)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            backstop,
+        );
+        let v_worse = crate::p4_rescue_ins::vault_value_net_of_backstop(
+            bond_v20::vault_value_worse(nav, lp_value, worse),
+            backstop,
+        );
         if v_worse < c_eff || bond_v20::bond_impaired(v_worse, c_eff, t.c_b_atoms) {
             return Err(PercolatorError::BondTrancheImpaired.into());
         }
@@ -41979,8 +42020,20 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
+        // GH#561: the G9 backstop is senior to the bonds (`bond_v20.rs:7-8` puts bonds
+        // between the seniors and the junior; the field doc at the declaration of
+        // `backstop_outstanding_atoms` states it is senior to both). Tags 97 / 98 / 102
+        // already add it to this argument; bonds must too, or a redemption can exit
+        // while lent insurance is still outstanding and unrepayable.
+        //
+        // LIVE only, exactly as tag 102 (`backstop_halt = if resolved { 0 } ..`): in Resolved
+        // every vault-LP payout repays the backstop FIRST at tag 101, and whatever is never
+        // repaid stays a realised insurance loss that blocks nothing (tag 101 comment). Counting
+        // it here in Resolved would lock every bond holder out of the pots for good the moment
+        // the LP's terminal payout falls one atom short of the receivable.
+        let backstop_halt = if live { st.backstop_outstanding_atoms as u128 } else { 0 };
         if vault_lp_v18::vault_lp_draw_halts(
-            st.senior_draw_outstanding_atoms,
+            st.senior_draw_outstanding_atoms.saturating_add(backstop_halt),
             vault_lp_v18::DRAW_OP_BOND_WITHDRAW,
         ) {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
@@ -42119,7 +42172,15 @@ pub mod processor {
         }
         let lp_value = vault_lp_value_atoms(&group, lp.header)?;
         let worse = vault_lp_equity_lag_bounds_ro(&group, lp.header)?.0;
-        let v_worse = bond_v20::vault_value_worse(nav, lp_value, worse);
+        // GH#561: net the G9 backstop receivable off the vault value before the tranche
+        // split, exactly as the senior Live exit does
+        // (`p4_rescue_ins::live_exit_senior_value_net_backstop`, used at the tag-77 site).
+        // Without this the bond prices on -- and `withdraw_not_atomic` below physically
+        // removes -- insurance that G9 lent to this LP and that is senior to the bond.
+        let v_worse = crate::p4_rescue_ins::vault_value_net_of_backstop(
+            bond_v20::vault_value_worse(nav, lp_value, worse),
+            st.backstop_outstanding_atoms as u128,
+        );
         let bond_value = bond_v20::tranche_split3(v_worse, c_eff, t.c_b_atoms).bond;
         let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)
             .ok_or(PercolatorError::BondConfigInvalid)?;

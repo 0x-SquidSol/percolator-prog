@@ -3,7 +3,7 @@
 //! security review BLOCKERS (P3-H1 resolved exit, P3-H2 creator free option).
 //!
 //! Tags 94..101 are encoded as raw bytes per §0.3 so this file compiles against the BASE host
-//! lib (6377376a). Wrapper .so under test: INDEP_WRAPPER_SO (default ~/wt-indep/p3-so/current.so).
+//! lib (6377376a). Wrapper .so under test: INDEP_WRAPPER_SO (default: this tree's target/deploy/percolator_prog.so).
 //! Negative control: any pre-P3 .so (v18.2 / P1) must fail these tests at tag 94.
 //!
 //! Properties asserted (design §2.2):
@@ -31,7 +31,10 @@ const DEAD: u128 = 1_000;
 fn p3_so() -> std::path::PathBuf {
     std::env::var_os("INDEP_WRAPPER_SO")
         .map(Into::into)
-        .unwrap_or_else(|| format!("{}/wt-indep/p3-so/current.so", std::env::var("HOME").unwrap()).into())
+        // v2.2 (security review, "fixture skew"): default to THIS tree's SBF build. The old
+        // default, a pinned prebuilt ~/wt-indep/p3-so/current.so, was a v2.1 program that
+        // correctly refuses the v2.2-sized market account this harness creates.
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/deploy/percolator_prog.so"))
 }
 
 struct P3 {
