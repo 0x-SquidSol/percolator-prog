@@ -641,13 +641,30 @@ pub fn w1_target_q(c_m: u128, lambda_eff_bps: u32, price_e6: u64, pos_scale: u12
     crate::growth_v19::n_cap_q(c_m, lambda_eff_bps, price_e6, pos_scale).unwrap_or(0)
 }
 
-/// The per-round touched set: 8-byte key prefixes, one per opposing account already reduced in
-/// this round. An account is reduced at most once per round, so the keep-fraction applies once
-/// to each account whatever the order of the calls (rule 27 / v16.9.1 K/F order: the outcome per
-/// account does not depend on which other accounts a caller lists, or in what order).
-pub const W1_TOUCHED_CAP: usize = 512;
-pub fn key_tag(key: &[u8; 32]) -> u64 {
-    u64::from_le_bytes([key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]])
+/// The per-round touched set: `KEY_TAG_LEN`-byte key prefixes, one per opposing account already
+/// reduced in this round. An account is reduced at most once per round, so the keep-fraction
+/// applies once to each account whatever the order of the calls (rule 27 / v16.9.1 K/F order: the
+/// outcome per account does not depend on which other accounts a caller lists, or in what order).
+///
+/// The prefix is the account's IDENTITY in that set, so its width is a security parameter, not a
+/// space optimisation: two distinct portfolios sharing a prefix are ONE entry, and the second is
+/// skipped by `lev_guard_lp_stop` as already cut. Portfolio addresses are client-chosen
+/// (`handle_init_portfolio` takes any program-owned account of the right length), so an attacker
+/// picks both halves of such a pair in advance -- a BIRTHDAY search over addresses they control,
+/// not a targeted preimage against a victim. At 8 bytes that is ~2^32 candidates, which
+/// `createAccountWithSeed` reduces to ~2^32 SHA-256 hashes; at 16 it is ~2^64 and infeasible.
+///
+/// Halving the cap keeps `LEV_GUARD_TOUCHED_LEN` (and therefore the account length and its rent)
+/// bit-for-bit unchanged, so no guard has to be migrated and no client length check moves. 256
+/// accounts per round is well above the keeper's own default throughput, and a round with more
+/// opposing accounts than the cap is already handled by the F4 one-hour stale-round replacement
+/// below.
+pub const KEY_TAG_LEN: usize = 16;
+pub const W1_TOUCHED_CAP: usize = 256;
+pub fn key_tag(key: &[u8; 32]) -> [u8; KEY_TAG_LEN] {
+    let mut t = [0u8; KEY_TAG_LEN];
+    t.copy_from_slice(&key[..KEY_TAG_LEN]);
+    t
 }
 /// Night audit 2026-10-28 (F4): a W1 round lives at most one hour. While live it blocks every
 /// fill that grows the LP's net (F3); once stale the next W1 call closes it and, if the stop
@@ -658,8 +675,8 @@ pub const W1_ROUND_SLOTS: u64 = SLOTS_PER_HOUR;
 pub fn w1_round_live(round_active: u8, round_open_slot: u64, now: u64) -> bool {
     round_active == 1 && now.saturating_sub(round_open_slot) <= W1_ROUND_SLOTS
 }
-pub fn touched_contains(set: &[u64], n: usize, tag: u64) -> bool {
-    set.iter().take(n).any(|t| *t == tag)
+pub fn touched_contains(set: &[[u8; KEY_TAG_LEN]], n: usize, tag: &[u8; KEY_TAG_LEN]) -> bool {
+    set.iter().take(n).any(|t| t == tag)
 }
 
 // ── the λ fallback until W1 ships (D-c step 1, D-h) ──────────────────────────────────────────
@@ -815,11 +832,16 @@ pub struct LevGuardV22 {
     pub burst_peak_slot: u64,     // 352..360
 }
 /// The record proper (360 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
-/// in the account body as `W1_TOUCHED_CAP` LE u64 tags, read and written in place
-/// (`touched_has_in`, `touch_in`), never copied onto the stack.
+/// in the account body as `W1_TOUCHED_CAP` key prefixes of `KEY_TAG_LEN` bytes, read and written
+/// in place (`touched_has_in`, `touch_in`), never copied onto the stack.
 pub const LEV_GUARD_REC_LEN: usize = 360;
-pub const LEV_GUARD_TOUCHED_LEN: usize = 8 * W1_TOUCHED_CAP;
+pub const LEV_GUARD_TOUCHED_LEN: usize = KEY_TAG_LEN * W1_TOUCHED_CAP;
 pub const LEV_GUARD_BODY_LEN: usize = LEV_GUARD_REC_LEN + LEV_GUARD_TOUCHED_LEN;
+/// The touched region, and so the guard account and its rent, are UNCHANGED by the tag widening
+/// (16 x 256 == 8 x 512): nothing to migrate, and the SDK / keeper / app length checks still hold.
+const _: () = assert!(LEV_GUARD_TOUCHED_LEN == 4_096);
+const _: () = assert!(LEV_GUARD_BODY_LEN == 4_456);
+const _: () = assert!(W1_TOUCHED_CAP <= u16::MAX as usize);
 const _: () = assert!(core::mem::size_of::<LevGuardV22>() == LEV_GUARD_REC_LEN);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, rep_j_dump_bps) == 80);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, holder_dump_slot) == 104);
@@ -904,8 +926,8 @@ pub fn touched_has_in(region: &[u8], n: u16, key: &[u8; 32]) -> bool {
     let t = key_tag(key);
     (0..(n as usize).min(W1_TOUCHED_CAP)).any(|i| {
         region
-            .get(i * 8..i * 8 + 8)
-            .is_some_and(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) == t)
+            .get(i * KEY_TAG_LEN..i * KEY_TAG_LEN + KEY_TAG_LEN)
+            .is_some_and(|b| b == t.as_slice())
     })
 }
 
@@ -916,9 +938,9 @@ pub fn touch_in(region: &mut [u8], n: u16, key: &[u8; 32]) -> bool {
     if i >= W1_TOUCHED_CAP {
         return false;
     }
-    match region.get_mut(i * 8..i * 8 + 8) {
+    match region.get_mut(i * KEY_TAG_LEN..i * KEY_TAG_LEN + KEY_TAG_LEN) {
         Some(b) => {
-            b.copy_from_slice(&key_tag(key).to_le_bytes());
+            b.copy_from_slice(&key_tag(key));
             true
         }
         None => false,
@@ -993,6 +1015,42 @@ mod tests {
     use super::*;
     extern crate alloc;
     use alloc::vec::Vec;
+
+    /// The touched set must separate two portfolios that share an 8-byte address prefix. Such a
+    /// pair is cheap to obtain (a birthday search over client-chosen portfolio addresses), and
+    /// while they shared one entry the second account escaped `lev_guard_lp_stop`'s reduce for
+    /// the whole round -- repeatably, since the F4 stale-round replacement resets `touched_n`.
+    ///
+    /// Negative control: `a` and `b` differ ONLY at byte 8, so on an 8-byte tag `key_tag(&a) ==
+    /// key_tag(&b)` and the first assertion fails.
+    #[test]
+    fn touched_set_separates_keys_sharing_an_8_byte_prefix() {
+        let mut a = [7u8; 32];
+        let mut b = [7u8; 32];
+        a[8] = 1;
+        b[8] = 2;
+        assert_ne!(key_tag(&a), key_tag(&b), "an 8-byte prefix is not an identity");
+
+        let mut region = [0u8; LEV_GUARD_TOUCHED_LEN];
+        assert!(touch_in(&mut region, 0, &a));
+        assert!(touched_has_in(&region, 1, &a), "a was cut");
+        assert!(
+            !touched_has_in(&region, 1, &b),
+            "b was never cut, so it must still be reducible in this round"
+        );
+    }
+
+    /// The tag is a prefix, so anything beyond `KEY_TAG_LEN` still collides. Pinned so the bound
+    /// is explicit: 16 bytes puts a birthday search at ~2^64, not that collisions are impossible.
+    #[test]
+    fn key_tag_is_a_prefix_of_known_width() {
+        let mut a = [7u8; 32];
+        let mut b = [7u8; 32];
+        a[KEY_TAG_LEN] = 1;
+        b[KEY_TAG_LEN] = 2;
+        assert_eq!(key_tag(&a), key_tag(&b));
+        assert_eq!(key_tag(&[3u8; 32]), [3u8; KEY_TAG_LEN]);
+    }
 
     const H: u64 = SLOTS_PER_HOUR;
     const D: u64 = SLOTS_PER_DAY;
@@ -1486,8 +1544,8 @@ mod tests {
         assert!(w1_keep_q(u128::MAX, 9_999, 0) < u128::MAX);
         // touched set
         let set = [key_tag(&[1u8; 32]), key_tag(&[2u8; 32])];
-        assert!(touched_contains(&set, 2, key_tag(&[2u8; 32])));
-        assert!(!touched_contains(&set, 1, key_tag(&[2u8; 32])));
+        assert!(touched_contains(&set, 2, &key_tag(&[2u8; 32])));
+        assert!(!touched_contains(&set, 1, &key_tag(&[2u8; 32])));
     }
 
     #[test]
