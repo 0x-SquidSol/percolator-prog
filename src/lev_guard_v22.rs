@@ -738,7 +738,13 @@ pub const LEV_GUARD_VERSION: u8 = 1;
 /// `flags` bit 0 / 1: the pinned base mint was last proven to have a live mint / freeze authority.
 pub const GUARD_FLAG_MINT_AUTH: u8 = 1 << 0;
 pub const GUARD_FLAG_FREEZE_AUTH: u8 = 1 << 1;
-pub const GUARD_FLAGS_KNOWN: u8 = GUARD_FLAG_MINT_AUTH | GUARD_FLAG_FREEZE_AUTH;
+/// GH#614 bit 2: op 3 has read the pinned base mint's authorities at least once. Bits 0/1 alone
+/// cannot distinguish "proven clean" from "never looked", and `merge_overlay` is tighten-only, so
+/// an unproven mint silently takes the no-clamp path. A record written before this bit existed
+/// reads 0 = never proven, which is the conservative answer.
+pub const GUARD_FLAG_PERM_PROVEN: u8 = 1 << 2;
+pub const GUARD_FLAGS_KNOWN: u8 =
+    GUARD_FLAG_MINT_AUTH | GUARD_FLAG_FREEZE_AUTH | GUARD_FLAG_PERM_PROVEN;
 
 /// Tag 124 ops.
 pub const OP_INIT: u8 = 0;
@@ -849,6 +855,11 @@ impl LevGuardV22 {
             holder_dump_slot: self.holder_dump_slot,
         }
     }
+    /// GH#614: have the authority flags ever been written? `false` means the rule at
+    /// `merge_overlay` has never been evaluated for this market, NOT that the mint is clean.
+    pub fn perm_proven(&self) -> bool {
+        self.flags & GUARD_FLAG_PERM_PROVEN != 0
+    }
     pub fn price_band(&self) -> PriceBand {
         PriceBand {
             last_px_e6: self.pb_last_px,
@@ -938,6 +949,14 @@ pub fn validate_guard(g: &LevGuardV22) -> bool {
         && g._pad1 == [0; 2]
         && g._pad2 == [0; 6]
         && g._pad3 == [0; 4]
+}
+
+/// GH#614: may a risk-increasing open proceed given the build's policy and the record's proof
+/// bit? Kept as a predicate rather than written inline at the gate because the call site sits
+/// behind `cfg!(not(feature = "devnet"))`, and CI only ever builds `--features devnet`
+/// (`scripts/ci-test.sh`) -- inline, the mainnet arm would compile nowhere and be tested nowhere.
+pub fn perm_proof_blocks_open(required: bool, proven: bool) -> bool {
+    required && !proven
 }
 
 /// A fresh record for `market`.
@@ -1607,9 +1626,15 @@ mod tests {
         assert!(touched_has_in(&region, W1_TOUCHED_CAP as u16, &k1));
         g.touched_n = W1_TOUCHED_CAP as u16;
         assert!(validate_guard(&g));
+        // GH#614: bit 2 is now GUARD_FLAG_PERM_PROVEN, so it must VALIDATE -- a stored record
+        // carrying a proof is structurally sound. The refusal this used to pin (flags = 4) moves
+        // to bit 3, which is still unclaimed.
+        let mut b = g;
+        b.flags = GUARD_FLAG_PERM_PROVEN;
+        assert!(validate_guard(&b));
         // structural refusals
         let mut b = g;
-        b.flags = 4;
+        b.flags = 8;
         assert!(!validate_guard(&b));
         let mut b = g;
         b.rep_n_mult_bps = 10_001;
@@ -1620,6 +1645,61 @@ mod tests {
         let mut b = g;
         b._pad2 = [1, 0, 0, 0, 0, 0];
         assert!(!validate_guard(&b));
+    }
+
+    /// GH#614: a market as created cannot be told apart from one whose mint was proven clean,
+    /// which is why the clamp at `merge_overlay` never fires. Pins both the defect and the bit
+    /// that fixes it.
+    #[test]
+    fn fresh_guard_cannot_distinguish_unproven_from_clean() {
+        let now = 10 * SLOTS_PER_DAY;
+        let g = new_guard([3u8; 32], 0, 1, 255);
+        // the defect: zero flags, so `perm()` reports a revoked authority on a mint nobody read
+        assert_eq!(g.flags, 0, "new_guard leaves every flag clear");
+        assert!(!g.perm().mint_auth_live);
+        assert!(!g.perm().freeze_auth_live);
+        let rep = RiskReport::default();
+        let fresh = merge_overlay(AgeBand::Mature, &rep, &g.perm(), now);
+        let clean = merge_overlay(AgeBand::Mature, &rep, &PermFacts::default(), now);
+        let live = merge_overlay(
+            AgeBand::Mature,
+            &rep,
+            &PermFacts { mint_auth_live: true, ..Default::default() },
+            now,
+        );
+        assert_eq!(fresh, clean, "an unproven mint takes the SAME path as a proven-clean one");
+        assert_ne!(fresh, live, "and not the path decisions 12 / 13 ask for");
+        assert_eq!(fresh.l_cap_x100, u16::MAX, "no leverage clamp");
+        assert_eq!(fresh.n_mult_bps, 10_000, "no size clamp");
+        assert_eq!((live.l_cap_x100, live.n_mult_bps), (1, 0), "what the clamp would have been");
+
+        // the fix: the overlay is unchanged (it cannot express "unproven"), and the gate reads
+        // this bit instead. Only op 3 sets it, and it survives a round trip through validation.
+        assert!(!g.perm_proven(), "a fresh guard has proven nothing");
+        let mut proven = g;
+        proven.flags |= GUARD_FLAG_PERM_PROVEN;
+        assert!(proven.perm_proven());
+        assert!(validate_guard(&proven));
+        assert_eq!(
+            merge_overlay(AgeBand::Mature, &rep, &proven.perm(), now),
+            fresh,
+            "recording the proof does not itself move the overlay",
+        );
+        // the gate policy, both arms. CI builds only `--features devnet`, so the mainnet arm is
+        // unreachable at the call site and this is the only place it is exercised at all.
+        assert!(perm_proof_blocks_open(true, false), "mainnet: an unproven mint cannot open");
+        assert!(!perm_proof_blocks_open(true, true), "mainnet: a proven one can");
+        assert!(!perm_proof_blocks_open(false, false), "devnet: unproven still trades");
+        assert!(!perm_proof_blocks_open(false, true));
+        assert!(
+            !perm_proof_blocks_open(cfg!(not(feature = "devnet")), g.perm_proven()),
+            "this build is devnet, so a fresh guard is not blocked here",
+        );
+        // a proven-LIVE authority still clamps, i.e. the bit does not shadow bits 0/1
+        let mut live_proven = g;
+        live_proven.flags |= GUARD_FLAG_PERM_PROVEN | GUARD_FLAG_MINT_AUTH;
+        assert!(live_proven.perm_proven());
+        assert_eq!(merge_overlay(AgeBand::Mature, &rep, &live_proven.perm(), now), live);
     }
 
     #[test]

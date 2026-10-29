@@ -669,6 +669,13 @@ pub mod constants {
     /// bound guard (fail closed); devnet builds keep the guard opt-in (growth flag bit 2) so the
     /// existing devnet markets keep trading until the guard is created for them.
     pub const LEV_GUARD_REQUIRED_ON_EVERY_GROWTH_ASSET: bool = cfg!(not(feature = "devnet"));
+    /// GH#614: mainnet builds refuse a risk-increasing open until the pinned base mint's
+    /// mint/freeze authorities have been proven once (tag 124 op 3, permissionless). Devnet keeps
+    /// trading unproven so the existing armed markets are not bricked by this requirement.
+    /// NOTE: on mainnet this makes a `SetDepthSource` pin (tag 123, upgrade authority) plus one
+    /// op 3 call a prerequisite for opens on every guarded market -- op 3 cannot run without the
+    /// pin, because the pin is the only on-chain binding from the asset to its base mint.
+    pub const LEV_GUARD_PERM_PROOF_REQUIRED: bool = cfg!(not(feature = "devnet"));
     /// Tag 123 `op`: 0 = clear the pin (mode 2 refused afterwards), 1 = set / replace it.
     pub const DEPTH_SOURCE_OP_CLEAR: u8 = 0;
     pub const DEPTH_SOURCE_OP_SET: u8 = 1;
@@ -44783,6 +44790,13 @@ pub mod processor {
         if band == lg::AgeBand::NoOpen {
             return refuse("age_under_6h");
         }
+        // GH#614: decisions 12 / 13 ("should not get a market at all") live in `merge_overlay`,
+        // which can only TIGHTEN from a proof -- so an unproven mint authority is indistinguishable
+        // there from a revoked one. Refuse here instead, the way the age rule does, rather than
+        // trust a fact nobody has established.
+        if lg::perm_proof_blocks_open(constants::LEV_GUARD_PERM_PROOF_REQUIRED, gd.perm_proven()) {
+            return refuse("mint_auth_unproven");
+        }
         // Night audit 2026-10-28 (F3): while a W1 round is live, no fill may grow the LP's net.
         // Otherwise a user cut by the round (touched: never cut again in it) or a new account
         // re-opens against the LP right away and the round can never bring the LP to target.
@@ -45064,6 +45078,10 @@ pub mod processor {
         }
         let (mint_live, freeze_live) = lg::mint_authorities(&mint_ai.try_borrow_data()?).ok_or_else(bad)?;
         let mut flags = gd.flags & !(lg::GUARD_FLAG_MINT_AUTH | lg::GUARD_FLAG_FREEZE_AUTH);
+        // GH#614: the authorities have now been read from the pinned mint. Both flags below may
+        // legitimately come out clear, so record the proof itself -- it is what separates a clean
+        // mint from one nobody has looked at.
+        flags |= lg::GUARD_FLAG_PERM_PROVEN;
         if mint_live {
             flags |= lg::GUARD_FLAG_MINT_AUTH;
         }
