@@ -6091,3 +6091,329 @@ fn i570_exposed_unlagged_lp_deposits_without_a_crank() {
     assert_eq!(env.lp_shares(&d2), 1_000 * U as u128, "minted at par");
     env.assert_conserved("i570 unlagged liveness");
 }
+
+// ── v2.2 lev build, decision 7: the $500 minimum creator stake (500·10^decimals atoms) ──────
+// The test mint has 0 decimals, so the minimum is 500 atoms here (`min_creator_stake_atoms(0)`);
+// the decimals scaling is unit-tested in `lev_guard_v22::tests::min_stake_decimals`.
+
+const LEV_MIN_STAKE: u64 = 500;
+const LEV_STAKE_ERR: &str = "Custom(131)";
+
+#[test]
+fn lev_min_creator_stake_deposit_and_withdraw_boundaries() {
+    assert_eq!(percolator_prog::lev_guard_v22::min_creator_stake_atoms(0), Some(LEV_MIN_STAKE as u128));
+    let mut env = Env::new(growth_params());
+    assert!(growth_rec(&env).is_some(), "growth market");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    // below the minimum: refused, nothing booked
+    let r = env.junior_deposit_as(&admin, lp.portfolio, LEV_MIN_STAKE - 1);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "499: {r:?}");
+    assert_eq!(env.vlp().junior_deposited_atoms, 0);
+    // exactly the minimum: lands
+    env.junior_deposit_as(&admin, lp.portfolio, LEV_MIN_STAKE).expect("500 lands");
+    // a top-up of 1 atom once at the minimum: lands
+    env.junior_deposit_as(&admin, lp.portfolio, 100).expect("top-up");
+    assert_eq!(env.vlp().junior_deposited_atoms, 600);
+    // a withdrawal that would leave 499 (in (0, min)): refused
+    let r = env.junior_withdraw_as(&admin, lp.portfolio, 101);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "leave 499: {r:?}");
+    // leave exactly the minimum: lands
+    env.junior_withdraw_as(&admin, lp.portfolio, 100).expect("leave 500");
+    // full exit (net 0): the rule allows it (other locks decide)
+    let r = env.junior_withdraw_as(&admin, lp.portfolio, LEV_MIN_STAKE);
+    assert!(!r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "full exit is not a stake refusal: {r:?}");
+}
+
+#[test]
+fn lev_min_creator_stake_blocks_allocation_until_reached() {
+    let mut env = Env::new(growth_params());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, None).expect("senior");
+    let lp = env.bind(2_000);
+    // no creator stake: senior capital may not be allocated to the vault LP
+    let r = env.allocate(lp.portfolio, u128::MAX);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "no stake: {r:?}");
+    assert_eq!(env.allocated(), 0);
+    // sybil-style dust from the junior owner is refused too (the deposit itself fails)
+    let admin = env.admin.insecure_clone();
+    assert!(env.junior_deposit_as(&admin, lp.portfolio, 1).is_err());
+    let r = env.allocate(lp.portfolio, u128::MAX);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "still no stake: {r:?}");
+    // the minimum reached: the stake rule no longer refuses
+    env.junior_deposit_as(&admin, lp.portfolio, 2_000 * U).expect("stake");
+    let r = env.allocate(lp.portfolio, u128::MAX);
+    assert!(!r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "stake met: {r:?}");
+}
+
+/// Scope: a market with growth OFF (a pre-v2.2 vault-LP market) is not subject to the rule.
+#[test]
+fn lev_min_creator_stake_not_applied_off_growth() {
+    let mut env = Env::new(Params::default());
+    assert!(growth_rec(&env).is_none());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1).expect("growth off: 1 atom lands");
+}
+
+// ── v2.2 lev build: the LP stop W1 (tag 124 op 5) on a real tag-94 vault LP ─────────────────
+
+mod lev_w1 {
+    use super::*;
+    use percolator_prog::lev_guard_v22 as lg;
+
+    pub fn guard_key(env: &Env) -> Pubkey {
+        state::derive_lev_guard(&env.pid, &env.market).0
+    }
+
+    fn ix(op: u8) -> ProgInstruction {
+        ProgInstruction::LevGuard { op, t0: 0, key: [0; 32], report: [0; 4] }
+    }
+
+    /// The upgrade authority (the ProgramData mock points at `admin` after `bind`) binds the guard.
+    pub fn init(env: &mut Env) {
+        let admin = env.admin.insecure_clone();
+        let pd = Pubkey::find_program_address(&[env.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::id()).0;
+        let (m, g) = (env.market, guard_key(env));
+        env.send(
+            ix(lg::OP_INIT),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new(g, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect("guard init");
+    }
+
+    fn base_metas(env: &Env, lp: &Lp) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new_readonly(env.admin.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(guard_key(env), false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new_readonly(env.vault_lp, false),
+            AccountMeta::new_readonly(state::derive_vault_lp_ext(&env.pid, &env.market).0, false),
+        ]
+    }
+
+    pub fn poke(env: &mut Env, lp: &Lp) -> Result<(), String> {
+        env.svm.expire_blockhash(); // LiteSVM replays a byte-identical transaction's old result
+        let metas = base_metas(env, lp);
+        env.send(ix(lg::OP_POKE), metas, &[])
+    }
+
+    pub fn w1(env: &mut Env, lp: &Lp, victims: &[Pubkey]) -> Result<(), String> {
+        env.svm.expire_blockhash(); // LiteSVM replays a byte-identical transaction's old result
+        let mut metas = base_metas(env, lp);
+        for v in victims {
+            metas.push(AccountMeta::new(*v, false));
+        }
+        env.send(ix(lg::OP_LP_STOP), metas, &[])
+    }
+
+    pub fn guard(env: &Env) -> lg::LevGuardV22 {
+        state::read_lev_guard(&env.svm.get_account(&guard_key(env)).unwrap().data).unwrap()
+    }
+
+    /// State poke: the LP portfolio loses `(1 - num/den)` of its capital (a loss as far as the
+    /// NAV index can tell: no flow counter moves). Market totals follow, as `force_capital`.
+    pub fn lose_capital(env: &mut Env, lp: Pubkey, num: u128, den: u128) {
+        let mut market_account = env.svm.get_account(&env.market).unwrap();
+        let mut pd = env.svm.get_account(&lp).unwrap();
+        let (cfg, mut group) = state::read_market(&market_account.data).unwrap();
+        let mut p = state::read_portfolio(&pd.data).unwrap();
+        let old = p.capital;
+        let new = old * num / den;
+        group.c_tot -= old - new;
+        group.vault -= old - new;
+        p.capital = new;
+        p.health_cert.valid = false;
+        state::write_market(&mut market_account.data, &cfg, &group).unwrap();
+        state::write_portfolio(&mut pd.data, &p).unwrap();
+        env.svm.set_account(env.market, market_account).unwrap();
+        env.svm.set_account(lp, pd).unwrap();
+    }
+
+    /// A growth market, $10k creator stake, three users LONG (the LP short), the guard bound and
+    /// the NAV epoch started. Returns the users' portfolios.
+    pub fn world() -> (Env, Lp, Vec<Trader>) {
+        let mut env = Env::new(growth_params());
+        let lp = env.bind(2_000);
+        let admin = env.admin.insecure_clone();
+        env.junior_deposit_as(&admin, lp.portfolio, 10_000 * U).expect("creator stake");
+        let mut users = Vec::new();
+        for (cap, tokens) in [(5_000 * U, 4_000), (5_000 * U, 2_500), (5_000 * U, 1_500)] {
+            let t = env.new_trader(cap);
+            env.trade_signing_fee(&t, &lp, tok(GPRICE, tokens), GROWTH_FEE).expect("user long");
+            users.push(t);
+        }
+        // a same-side user (short, WITH the LP): users[3]
+        let same = env.new_trader(5_000 * U);
+        env.trade_signing_fee(&same, &lp, -tok(GPRICE, 500), GROWTH_FEE).expect("user short");
+        users.push(same);
+        init(&mut env);
+        poke(&mut env, &lp).expect("NAV epoch start");
+        (env, lp, users)
+    }
+}
+
+/// D-b / D-c / D-i: the stop does not fire on a healthy LP; after a 60 % loss (NAV/share 0.4 <
+/// 0.5 of the reference) a permissionless W1 round cuts every user opposite the LP to the same
+/// keep-fraction k = λ_eff·C_m_now / |LP net|, each ONCE per round, and closes the round (NAV
+/// reference reset) when the LP is within target. ORDER INDEPENDENCE: the same world cut in
+/// one call in reverse order ends with identical positions. Same-side users are skipped.
+#[test]
+fn lev_w1_lp_stop_round_cuts_opposing_users_once_and_order_independent() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let run = |order: &[usize], split: bool| -> (Vec<i128>, i128, lg::LevGuardV22) {
+        let (mut env, lp, users) = lev_w1::world();
+        let same = &users[3];
+        let r = lev_w1::w1(&mut env, &lp, &[users[0].portfolio]);
+        assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "healthy LP: {r:?}");
+        lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+        // the same-side user is listed FIRST (while the round is open): skipped, never cut
+        let keys: Vec<Pubkey> = [same.portfolio].into_iter().chain(order.iter().map(|&i| users[i].portfolio)).collect();
+        if split {
+            for k in &keys {
+                let r = lev_w1::w1(&mut env, &lp, &[*k]);
+                r.expect("w1 one account");
+                // a second listing in the same round is a no-op
+                let before = env.position(*k);
+                let _ = lev_w1::w1(&mut env, &lp, &[*k]);
+                assert_eq!(env.position(*k), before, "cut once per round");
+            }
+        } else {
+            lev_w1::w1(&mut env, &lp, &keys).expect("w1 all accounts");
+        }
+        assert_eq!(env.position(same.portfolio), -tok(GPRICE, 500), "same side untouched");
+        let pos: Vec<i128> = users.iter().take(3).map(|u| env.position(u.portfolio)).collect();
+        (pos, env.position(lp.portfolio), lev_w1::guard(&env))
+    };
+    let (a, lp_a, g_a) = run(&[0, 1, 2], true);
+    let (b, lp_b, g_b) = run(&[2, 1, 0], false);
+    eprintln!("W1 positions split/forward {a:?} lp {lp_a}; one call/reverse {b:?} lp {lp_b}");
+    assert_eq!(a, b, "order and grouping do not change any account's outcome");
+    assert_eq!(lp_a, lp_b);
+    // every opposing user kept the same fraction (within one lot of rounding)
+    let orig = [tok(GPRICE, 4_000), tok(GPRICE, 2_500), tok(GPRICE, 1_500)];
+    let k = g_a.round_keep_bps as i128;
+    assert!(k > 0 && k < 10_000, "a real cut: k {k}");
+    for (p, o) in a.iter().zip(orig) {
+        assert_eq!(*p, o * k / 10_000, "keep-fraction {k} of {o}");
+    }
+    // the round closed and the reference reset to the post-loss NAV/share
+    assert_eq!(g_a.round_active, 0);
+    let nav = g_a.nav();
+    assert_eq!(nav.ref_navps, nav.navps);
+    assert!(nav.navps < lg::NAV_ONE / 2, "post-loss NAV/share {}", nav.navps);
+    assert!(!lg::lp_stop_triggered(&nav), "a fresh 50 % fall is needed for the next stop");
+    assert_eq!((g_b.round_active, g_b.round_keep_bps), (0, g_a.round_keep_bps));
+}
+
+/// D-b: a creator deposit and withdrawal (flows) never trip the stop or move NAV/share.
+#[test]
+fn lev_w1_deposit_withdraw_cycle_does_not_trip() {
+    let (mut env, lp, users) = lev_w1::world();
+    let admin = env.admin.insecure_clone();
+    let n0 = lev_w1::guard(&env).nav().navps;
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000 * U).expect("deposit");
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    assert_eq!(lev_w1::guard(&env).nav().navps, n0, "deposit: NAV/share unchanged");
+    let r = lev_w1::w1(&mut env, &lp, &[users[0].portfolio]);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "no stop after a deposit: {r:?}");
+    assert_eq!(env.position(users[0].portfolio), tok(GPRICE, 4_000));
+}
+
+
+/// Night audit 2026-10-28 F1: a creator top-up (or an Earn allocation) followed, in the SAME
+/// sample interval, by a loss that is small against the post-flow equity must not trip the stop.
+/// On a0c1337d the whole loss was charged to the PRE-deposit equity: 10k + 20k deposited, then
+/// 20 % of 30k lost, read as NAV/share 0.4 and W1 force-cut every healthy opposing user.
+#[test]
+fn lev_w1_deposit_then_small_loss_does_not_trip_f1() {
+    let (mut env, lp, users) = lev_w1::world();
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000 * U).expect("top-up");
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 5); // -20 % of the post-deposit capital
+    let r = lev_w1::w1(&mut env, &lp, &[users[0].portfolio, users[1].portfolio]);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "no stop: {r:?}");
+    assert_eq!(env.position(users[0].portfolio), tok(GPRICE, 4_000), "healthy user untouched");
+    // the same 20 % with no flow in the interval reads as 20 %: still no stop; a real 60 % loss
+    // (no flow) still trips
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    let nav = lev_w1::guard(&env).nav();
+    assert!(nav.navps > percolator_prog::lev_guard_v22::NAV_ONE / 2, "navps {}", nav.navps);
+    lev_w1::lose_capital(&mut env, lp.portfolio, 3, 10);
+    lev_w1::w1(&mut env, &lp, &[users[0].portfolio]).expect("a real loss still fires W1");
+    assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
+}
+
+/// Night audit 2026-10-28 F2: the NAV sample REQUIRES the vault-LP ext at its PDA. On a0c1337d a
+/// permissionless poke could drop it: `flow_in` went backwards, the epoch restarted at 1.0 and
+/// the peak / reference were wiped (a loss masked), or pass a wrong account.
+#[test]
+fn lev_w1_nav_sample_requires_the_ext_pda_f2() {
+    // world() with Earn capital allocated into the vault LP (allocated_total != 0)
+    let mut env = Env::new(growth_params());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, None).expect("senior (pre-bind)");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000 * U).expect("creator stake");
+    env.allocate(lp.portfolio, 5_000 * U as u128).expect("allocate");
+    assert!(env.allocated() > 0);
+    let mut users = Vec::new();
+    for (cap, tokens) in [(5_000 * U, 4_000), (5_000 * U, 2_500)] {
+        let t = env.new_trader(cap);
+        env.trade_signing_fee(&t, &lp, tok(GPRICE, tokens), GROWTH_FEE).expect("user long");
+        users.push(t);
+    }
+    lev_w1::init(&mut env);
+    lev_w1::poke(&mut env, &lp).expect("poke with ext");
+    let before_raw = env.svm.get_account(&lev_w1::guard_key(&env)).unwrap().data;
+    // a real 60 % loss: the stop holds
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+    // poke WITHOUT the ext: refused, nothing reset
+    env.svm.expire_blockhash();
+    let mut metas = vec![
+        AccountMeta::new_readonly(env.admin.pubkey(), false),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(lev_w1::guard_key(&env), false),
+        AccountMeta::new(lp.portfolio, false),
+        AccountMeta::new_readonly(env.vault_lp, false),
+    ];
+    let ix = ProgInstruction::LevGuard { op: percolator_prog::lev_guard_v22::OP_POKE, t0: 0, key: [0; 32], report: [0; 4] };
+    let r = env.send(ix.clone(), metas.clone(), &[]);
+    assert!(r.is_err(), "poke without the ext: {r:?}");
+    // a wrong account in the ext slot: refused
+    metas.push(AccountMeta::new_readonly(Pubkey::new_unique(), false));
+    env.svm.expire_blockhash();
+    let r = env.send(ix, metas, &[]);
+    assert!(r.is_err(), "poke with a non-PDA ext: {r:?}");
+    assert_eq!(env.svm.get_account(&lev_w1::guard_key(&env)).unwrap().data, before_raw, "no epoch reset");
+    // the honest sample sees the loss and W1 fires
+    lev_w1::w1(&mut env, &lp, &[users[0].portfolio]).expect("W1 after a real loss");
+    assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
+}
+
+/// Night review K-1: a W1 call that OPENS the round without listing any account lands (the round is
+/// recorded: k, side, target, open slot), and later calls cut the accounts; a no-victim call on an
+/// ALREADY-open round is still refused (135). On a0c1337d the opening call reverted with 135.
+#[test]
+fn lev_w1_round_opens_without_victims_k1() {
+    let (mut env, lp, users) = lev_w1::world();
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+    lev_w1::w1(&mut env, &lp, &[]).expect("opening call with no victims lands");
+    let g = lev_w1::guard(&env);
+    assert_eq!(g.round_active, 1, "round recorded");
+    assert!(g.round_keep_bps > 0 && g.round_keep_bps < 10_000);
+    let r = lev_w1::w1(&mut env, &lp, &[]);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "no-op on an open round: {r:?}");
+    lev_w1::w1(&mut env, &lp, &[users[0].portfolio, users[1].portfolio, users[2].portfolio]).expect("cut");
+    assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
+    assert_eq!(lev_w1::guard(&env).round_active, 0, "round closed once every opposing account is cut");
+}

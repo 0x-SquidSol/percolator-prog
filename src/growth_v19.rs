@@ -2123,9 +2123,14 @@ pub const GROWTH_FLAG_R3_LAYOUT: u8 = 0x01;
 /// `flags` bit 1: the variance has at least one sample (requires bit 0).
 pub const GROWTH_FLAG_VOL_DATA: u8 = 0x02;
 
-/// Validator for the `flags` byte: only bits 0-1, and bit 1 only with bit 0.
+/// `flags` bit 2 (v2.2 lev build, 2026-10-27): the market's leverage guard (`LevGuardV22`, tag
+/// 124) is bound to this asset, so a risk-increasing fill must carry it. Set once by tag 124 op 0,
+/// never cleared; every writer of `flags` preserves it (`migrate_r3_layout`, `set_graduation`).
+pub const GROWTH_FLAG_LEV_GUARD: u8 = 0x04;
+
+/// Validator for the `flags` byte: only bits 0-2, and bit 1 only with bit 0.
 pub fn growth_flags_ok(flags: u8) -> bool {
-    flags & !(GROWTH_FLAG_R3_LAYOUT | GROWTH_FLAG_VOL_DATA) == 0
+    flags & !(GROWTH_FLAG_R3_LAYOUT | GROWTH_FLAG_VOL_DATA | GROWTH_FLAG_LEV_GUARD) == 0
         && (flags & GROWTH_FLAG_VOL_DATA == 0 || flags & GROWTH_FLAG_R3_LAYOUT != 0)
 }
 
@@ -3301,7 +3306,11 @@ mod tests {
         assert_eq!(l_signal_with_vol(2_000, None, 500), 500, "no data: launch");
         assert_eq!(l_signal_with_vol(2_000, Some(1_748), 500), 1_748);
         assert!(growth_flags_ok(0) && growth_flags_ok(1) && growth_flags_ok(3));
-        assert!(!growth_flags_ok(2) && !growth_flags_ok(4));
+        assert!(!growth_flags_ok(2));
+        // v2.2 lev build: bit 2 (0x04) is now GROWTH_FLAG_LEV_GUARD (claimed in v22-allocations.md);
+        // valid alone and with the round-3 bits; every higher bit is still refused.
+        assert!(growth_flags_ok(GROWTH_FLAG_LEV_GUARD) && growth_flags_ok(GROWTH_FLAG_LEV_GUARD | 3));
+        assert!(!growth_flags_ok(GROWTH_FLAG_LEV_GUARD | 2) && !growth_flags_ok(8) && !growth_flags_ok(0x80));
     }
 
     /// Continuous leverage (2026-10-19): the log-interpolated depth curve.
